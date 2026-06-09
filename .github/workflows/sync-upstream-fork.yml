@@ -1,0 +1,111 @@
+name: Sync Fork with Upstream
+
+# Keeps this fork's main branch current with the upstream repository (the
+# parent of this fork). Runs daily and can be triggered manually from the
+# Actions tab via "Run workflow".
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-fork
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.event.repository.fork
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve upstream repository
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          upstream_repo="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name')"
+          if [[ -z "$upstream_repo" || "$upstream_repo" == "null" ]]; then
+            echo "::error::Could not resolve upstream parent repository for ${GITHUB_REPOSITORY}."
+            exit 1
+          fi
+          echo "repo=${upstream_repo}" >> "$GITHUB_OUTPUT"
+          echo "Upstream repository: ${upstream_repo}"
+
+      - name: Fetch upstream main
+        env:
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream main
+
+      - name: Merge upstream/main into main
+        id: merge
+        run: |
+          behind_count="$(git rev-list --count HEAD..upstream/main)"
+          if [[ "$behind_count" -eq 0 ]]; then
+            echo "status=already_up_to_date" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains upstream/main (${behind_count} commits behind)."
+            exit 0
+          fi
+
+          echo "Fork main is ${behind_count} commit(s) behind upstream/main."
+
+          if git merge upstream/main --no-edit -m "chore: sync fork with upstream main"; then
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+            echo "Merged upstream/main into fork main."
+            exit 0
+          fi
+
+          echo "status=conflict" >> "$GITHUB_OUTPUT"
+          echo "::error::Merge conflict while syncing upstream/main into main."
+          echo "::error::Resolve conflicts locally, then push or open a PR."
+          git merge --abort || true
+          exit 1
+
+      - name: Push updated main
+        if: steps.merge.outputs.status == 'merged'
+        run: git push origin main
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "# Fork upstream sync"
+            echo ""
+            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Upstream: \`${{ steps.upstream.outputs.repo }}\`"
+            echo "- Result: \`${{ steps.merge.outputs.status || 'failed' }}\`"
+            echo ""
+            if [[ "${{ steps.merge.outputs.status }}" == "already_up_to_date" ]]; then
+              echo "No changes were needed."
+            elif [[ "${{ steps.merge.outputs.status }}" == "merged" ]]; then
+              echo "Upstream changes were merged and pushed to \`main\`."
+            elif [[ "${{ steps.merge.outputs.status }}" == "conflict" ]]; then
+              echo "Sync stopped due to merge conflicts. Resolve manually:"
+              echo ""
+              echo "\`\`\`bash"
+              echo "git fetch origin main"
+              echo "git checkout main"
+              echo "git remote add upstream https://github.com/${{ steps.upstream.outputs.repo }}.git"
+              echo "git fetch upstream main"
+              echo "git merge upstream/main"
+              echo "\`\`\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
