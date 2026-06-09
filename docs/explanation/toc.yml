@@ -18,6 +18,8 @@
   href: documentation-mission.md
 - name: Multi-Agent Orchestration
   href: multi-agent-orchestration.md
+- name: Work Package Parallelization Scheduling
+  href: parallelization-scheduling.md
 - name: Runtime Loop
   href: runtime-loop.md
 - name: Pip vs pipx vs uv
