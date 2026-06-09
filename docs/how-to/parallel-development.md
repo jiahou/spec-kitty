@@ -107,6 +107,8 @@ Use the dashboard to monitor lane movement and agent activity in real time.
 
 ## Background
 
+- [Work Package Parallelization and Scheduling](../explanation/wp-parallelization-scheduling.md) - Full scheduling model and user touchpoints
+- [Orchestrator Integration Roadmap](../explanation/orchestrator-integration-roadmap.md) - Framework and native agent integration plan
 - [Multi-Agent Orchestration](../explanation/multi-agent-orchestration.md) - Coordination patterns
 - [Execution Workspace Model](../explanation/execution-lanes.md) - Isolation strategy
 - [Git Worktrees](../explanation/git-worktrees.md) - How worktrees work
