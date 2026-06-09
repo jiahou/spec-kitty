@@ -45,29 +45,43 @@ are no longer the form produced by `implement`. Upgrade via the
 
 ## Why This Replaced Per-WP Worktrees
 
-Per-work-package worktrees allowed overlapping work packages to run in parallel and collide at merge time. Execution lanes eliminate that by forcing dependent or overlapping work packages into the same lane, branch, and worktree.
+Per-work-package worktrees allowed overlapping work packages to run in parallel and collide at merge time. Execution lanes eliminate that by forcing **write-scope overlapping** work packages into the same lane, branch, and worktree.
 
 ## Parallelism Preservation
 
-`finalize-tasks` assigns WPs to lanes based on two criteria:
+`finalize-tasks` assigns WPs to lanes using a union-find algorithm. Two WPs share a lane when:
 
-1. **File ownership overlap** — WPs that declare no files in common are placed in separate lanes and run in parallel.
-2. **Explicit dependencies** — If WP B lists WP A in its `dependencies` field, they are assigned to the same lane and run sequentially (A then B).
+1. **File ownership overlap** — their `owned_files` globs intersect (`write_scope_overlap`).
+2. **Surface heuristic** — they predict the same surface tag and ownership is not provably disjoint (`surface_heuristic`).
 
-When neither criterion forces a merge, the pipeline keeps WPs in separate lanes to maximise parallelism. When a merge is forced, it is recorded in `lanes.json` under the `collapse_report` field:
+**Explicit WP dependencies do not collapse lanes by themselves.** If WP B depends on WP A but they touch disjoint files, they remain in separate lanes. The dependency becomes a **lane-level edge** instead:
+
+- `depends_on_lanes` — upstream lanes that must complete before this lane starts.
+- `parallel_group` — lanes at the same depth in the lane DAG may run in parallel.
+
+This preserves parallel upstream workstreams that fan in at a later WP. Runtime claim gating still requires every dependency to reach `approved` or `done` before a downstream WP can be implemented.
+
+When union-find forces a merge, it is recorded in `lanes.json` under `collapse_report`:
 
 ```json
 {
-  "collapse_report": [
-    {
-      "merged_wps": ["WP02", "WP03"],
-      "reason": "overlapping owned files: src/foo.py"
-    }
-  ]
+  "collapse_report": {
+    "events": [
+      {
+        "wp_a": "WP02",
+        "wp_b": "WP03",
+        "rule": "write_scope_overlap",
+        "evidence": "overlapping owned_files: src/foo.py"
+      }
+    ],
+    "total_merges": 1,
+    "independent_wps_collapsed": 0,
+    "by_rule": { "write_scope_overlap": 1 }
+  }
 }
 ```
 
-Each entry in `collapse_report` lists the WPs that were merged into a single lane and the reason (file overlap or explicit dependency). Inspect this field after `finalize-tasks` to understand why two WPs share a lane.
+Inspect `collapse_report` after `finalize-tasks` to understand why two WPs share a lane. For the full scheduling model (lanes, dependencies, dispatch, and user touchpoints), see [Work Package Parallelization and Scheduling](wp-parallelization-scheduling.md).
 
 ## Lane-Specific Test Database Isolation (FR-006)
 

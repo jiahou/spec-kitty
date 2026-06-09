@@ -7,6 +7,8 @@ description: "Run multiple Spec Kitty agents in parallel while keeping work pack
 
 Parallel development lets you move independent work packages (WPs) at the same time while keeping each execution workspace isolated. Spec Kitty's lane-based worktree model makes this safe and predictable.
 
+For the full model — lane assignment, dependency gating, orchestrator styles, and where you shape the schedule — see [Work Package Parallelization and Scheduling](../explanation/wp-parallelization-scheduling.md).
+
 ## Why Parallel Development?
 
 - Shorten delivery time by running independent WPs concurrently.
