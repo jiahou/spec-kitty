@@ -54,6 +54,8 @@
   href: run-external-orchestrator.md
 - name: Build Custom Orchestrator
   href: build-custom-orchestrator.md
+- name: Integrate Parallel Orchestrators and Agent SDKs
+  href: integrate-parallel-orchestrators.md
 - name: Switch Missions
   href: switch-missions.md
 - name: Use the Dashboard
