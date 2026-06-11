@@ -69,6 +69,8 @@ Precise CLI and schema references.
 
 Understanding-oriented pages that explain why things work the way they do.
 
+- [Work Package Parallelization and Scheduling](../explanation/wp-parallelization-scheduling.md) — Lanes, dependency gating, orchestrators, and operator touchpoints
+- [Orchestrator Integration Roadmap](../explanation/orchestrator-integration-roadmap.md) — Plan for framework and native Cursor/Claude adapters
 - [How Charter Works](charter-overview.md) — Mental model: doctrine → DRG → governed context
 - [Understanding Charter: Synthesis, DRG, and Governed Context](../explanation/charter-synthesis-drg.md) — Deep dive into synthesis and the Directive Relationship Graph
 - [Understanding Governed Profile Invocation](../explanation/governed-profile-invocation.md) — The `(profile, action, governance-context)` triple

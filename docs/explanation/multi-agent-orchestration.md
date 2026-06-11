@@ -24,10 +24,12 @@ This replaces in-core orchestration commands. The core CLI does not provide `spe
 ## Core Principles
 
 1. Planning in main, implementation in worktrees.
-2. One worktree per WP.
+2. One worktree per **execution lane** (sequential WPs in the same lane reuse it).
 3. Lane transitions validated by the host state model.
 4. External providers drive automation through API calls, not direct file edits.
 5. Activity logs and run state are audit artifacts, not the source of truth.
+
+For how parallelism is computed (`lanes.json`, `parallel_group`, dependency gating) and how operators shape the schedule, see [Work Package Parallelization and Scheduling](wp-parallelization-scheduling.md). For the plan to integrate orchestrator frameworks and native Cursor/Claude capabilities, see [Orchestrator Integration Roadmap](orchestrator-integration-roadmap.md).
 
 ## Two orchestration styles
 

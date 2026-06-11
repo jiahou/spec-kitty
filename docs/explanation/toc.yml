@@ -4,6 +4,10 @@
   href: divio-documentation.md
 - name: Execution Lanes
   href: execution-lanes.md
+- name: Work Package Parallelization and Scheduling
+  href: wp-parallelization-scheduling.md
+- name: Orchestrator Integration Roadmap
+  href: orchestrator-integration-roadmap.md
 - name: Git Worktrees
   href: git-worktrees.md
 - name: Git Workflow

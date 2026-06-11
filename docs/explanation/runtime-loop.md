@@ -204,6 +204,8 @@ Certain mission steps (such as `discovery`) do not have command templates. When 
 ## See Also
 
 - [Multi-Agent Orchestration](multi-agent-orchestration.md) -- The coordination model for running multiple agents
+- [Work Package Parallelization and Scheduling](wp-parallelization-scheduling.md) -- How lanes, dependencies, and dispatch interact
+- [Orchestrator Integration Roadmap](orchestrator-integration-roadmap.md) -- Plan for framework and native agent adapters
 - [Mission System](mission-system.md) -- How missions define the workflow that the runtime follows
 - [Kanban Workflow](kanban-workflow.md) -- The lane-based status model that the runtime reads
 

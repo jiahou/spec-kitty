@@ -2490,6 +2490,13 @@
   current_target: true
   citation_refs: []
   notes: Explanation; provisional current — confirm in WP08 IA review.
+- path: docs/explanation/orchestrator-integration-roadmap.md
+  tag: current
+  divio_type: explanation
+  owning_workstream: C
+  current_target: true
+  citation_refs: []
+  notes: Explanation; orchestrator framework and native agent integration plan.
 - path: docs/explanation/org-doctrine-layer.md
   tag: current
   divio_type: explanation
@@ -2518,6 +2525,13 @@
   current_target: true
   citation_refs: []
   notes: Explanation; provisional current — confirm in WP08 IA review.
+- path: docs/explanation/wp-parallelization-scheduling.md
+  tag: current
+  divio_type: explanation
+  owning_workstream: C
+  current_target: true
+  citation_refs: []
+  notes: Explanation; lane assignment, dependency gating, and dispatch model.
 - path: docs/host-surface-parity.md
   tag: current
   divio_type: none
