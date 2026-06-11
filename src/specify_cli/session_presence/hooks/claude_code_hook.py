@@ -1,8 +1,9 @@
-"""ClaudeCodeHookRegistrar — manages SessionStart hooks in .claude/settings.json.
+"""ClaudeCodeHookRegistrar — manages lifecycle hooks in .claude/settings.json.
 
-Reads the existing settings.json (if any), merges the spec-kitty
-``SessionStart`` hook entry idempotently, and writes the result back
-atomically.  All unrelated keys and hook entries are preserved.
+Reads the existing settings.json (if any), merges the spec-kitty hook entry
+for a given lifecycle event (``SessionStart`` or ``Stop``) idempotently, and
+writes the result back atomically.  All unrelated keys and hook entries are
+preserved.
 
 Contract (from contracts/settings-json-hook.md):
 
@@ -10,7 +11,7 @@ Target structure after ``register()``::
 
     {
       "hooks": {
-        "SessionStart": [
+        "<event_key>": [
           {
             "hooks": [
               {"type": "command", "command": "<cmd>"}
@@ -25,7 +26,7 @@ Edge cases handled:
 - File exists but contains invalid JSON or non-object JSON → original content is
   copied to ``settings.json.invalid*`` before ``register()`` creates a valid
   structure.
-- File exists with other ``SessionStart`` entries → all preserved.
+- File exists with other entries for the same event → all preserved.
 - ``unregister()`` on a file where the command is not present → no-op, no
   write performed.
 """
@@ -34,24 +35,31 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from pathlib import Path
+from uuid import uuid4
 
-__all__ = ["ClaudeCodeHookRegistrar"]
+from specify_cli.core.utils import write_text_within_directory
+
+__all__ = ["ClaudeCodeHookRegistrar", "SESSION_START_EVENT", "STOP_EVENT"]
 
 _SETTINGS_PATH = ".claude/settings.json"
 _SETTINGS_PATH_PARTS = (".claude", "settings.json")
-_SESSION_START_KEY = "SessionStart"
+SESSION_START_EVENT = "SessionStart"
+STOP_EVENT = "Stop"
 _logger = logging.getLogger(__name__)
 
 
 class ClaudeCodeHookRegistrar:
-    """Read/merge/write ``.claude/settings.json`` for the SessionStart hook.
+    """Read/merge/write ``.claude/settings.json`` for one lifecycle hook event.
 
-    All writes are atomic: a sibling temp file is written and then swapped
-    into place with ``os.replace()``.
+    ``event_key`` selects the hook event this registrar manages
+    (``"SessionStart"`` by default, or ``"Stop"``).  All writes are atomic: a
+    sibling temp file is written and then swapped into place with
+    ``os.replace()``.
     """
+
+    def __init__(self, event_key: str = SESSION_START_EVENT) -> None:
+        self._event_key = event_key
 
     def _settings_path(self, project_root: Path) -> Path:
         root = project_root.expanduser().resolve()
@@ -63,39 +71,18 @@ class ClaudeCodeHookRegistrar:
             raise ValueError(msg) from exc
         return path
 
-    def _create_temp_file(
-        self,
-        path: Path,
-        *,
-        suffix: str = "",
-        prefix: str | None = None,
-    ) -> tuple[Path, int]:
-        fd, temp_path = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=path.name if prefix is None else prefix,
-            suffix=suffix,
-            text=True,
-        )
-        temp = Path(temp_path)
-        temp.relative_to(path.parent)
-        return temp, fd
-
-    def _write_fd_text(self, fd: int, text: str) -> None:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-
-    def _session_start_entries(self, data: dict[str, object]) -> list[object] | None:
+    def _event_entries(self, data: dict[str, object]) -> list[object] | None:
         hooks_section = data.get("hooks")
         if not isinstance(hooks_section, dict):
             return None
-        session_start = hooks_section.get(_SESSION_START_KEY)
-        if not isinstance(session_start, list):
+        entries = hooks_section.get(self._event_key)
+        if not isinstance(entries, list):
             return None
-        return session_start
+        return entries
 
-    def _iter_command_hooks(self, session_start: list[object]) -> list[dict[str, object]]:
+    def _iter_command_hooks(self, entries: list[object]) -> list[dict[str, object]]:
         command_hooks: list[dict[str, object]] = []
-        for entry in session_start:
+        for entry in entries:
             if not isinstance(entry, dict):
                 continue
             entry_hooks = entry.get("hooks")
@@ -133,38 +120,31 @@ class ClaudeCodeHookRegistrar:
 
     def _preserve_invalid(self, path: Path, text: str) -> None:
         """Copy invalid settings content to a sibling backup before overwrite."""
-        backup, fd = self._create_temp_file(path, prefix=f"{path.name}.invalid.")
-        try:
-            self._write_fd_text(fd, text)
-        except Exception:
-            backup.unlink(missing_ok=True)
-            raise
+        backup = path.parent / f"{path.name}.invalid.{uuid4().hex}"
+        write_text_within_directory(backup, text, root=path.parent)
         _logger.warning("Preserved invalid Claude settings JSON at %s", backup)
 
     def _save(self, path: Path, data: dict[str, object]) -> None:
         """Write *data* as JSON to *path* atomically."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp, fd = self._create_temp_file(path, suffix=".tmp")
-        try:
-            self._write_fd_text(fd, json.dumps(data, indent=2) + "\n")
-            os.replace(tmp, path)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
+        write_text_within_directory(
+            path,
+            json.dumps(data, indent=2) + "\n",
+            root=path.parent,
+        )
 
     def is_registered(self, project_root: Path, command: str) -> bool:
-        """Return ``True`` when *command* is present in any SessionStart entry."""
+        """Return ``True`` when *command* is present in any entry for the event."""
         data = self._load(self._settings_path(project_root))
-        session_start = self._session_start_entries(data)
-        if session_start is None:
+        entries = self._event_entries(data)
+        if entries is None:
             return False
         return any(
             hook.get("type") == "command" and hook.get("command") == command
-            for hook in self._iter_command_hooks(session_start)
+            for hook in self._iter_command_hooks(entries)
         )
 
     def register(self, project_root: Path, command: str) -> None:
-        """Add *command* as a SessionStart hook entry (idempotent).
+        """Add *command* as a hook entry for the configured event (idempotent).
 
         If the command is already registered, returns immediately without
         writing.  Otherwise appends a new entry and writes atomically.
@@ -173,22 +153,22 @@ class ClaudeCodeHookRegistrar:
             return
         path = self._settings_path(project_root)
         data = self._load(path, preserve_invalid=True)
-        # Ensure hooks → SessionStart list exists, then append.
+        # Ensure hooks → <event_key> list exists, then append.
         hooks_section = data.get("hooks")
         if not isinstance(hooks_section, dict):
             hooks_section = {}
             data["hooks"] = hooks_section
-        session_start = hooks_section.get(_SESSION_START_KEY)
-        if not isinstance(session_start, list):
-            session_start = []
-            hooks_section[_SESSION_START_KEY] = session_start
-        session_start.append(
+        entries = hooks_section.get(self._event_key)
+        if not isinstance(entries, list):
+            entries = []
+            hooks_section[self._event_key] = entries
+        entries.append(
             {"hooks": [{"type": "command", "command": command}]}
         )
         self._save(path, data)
 
     def unregister(self, project_root: Path, command: str) -> None:
-        """Remove the spec-kitty *command* entry from SessionStart hooks.
+        """Remove the spec-kitty *command* entry from the configured event hooks.
 
         Preserves all other entries and keys.  If the command is not present,
         returns without writing.  If removal empties the list, the key is kept
@@ -196,13 +176,13 @@ class ClaudeCodeHookRegistrar:
         """
         path = self._settings_path(project_root)
         data = self._load(path)
-        session_start = self._session_start_entries(data)
-        if session_start is None:
+        entries = self._event_entries(data)
+        if entries is None:
             return
 
         new_entries: list[object] = []
         found = False
-        for entry in session_start:
+        for entry in entries:
             if not isinstance(entry, dict):
                 new_entries.append(entry)
                 continue
@@ -233,5 +213,5 @@ class ClaudeCodeHookRegistrar:
         if not isinstance(hooks_section, dict):
             msg = "Expected hooks section to be a dict"
             raise TypeError(msg)
-        hooks_section[_SESSION_START_KEY] = new_entries
+        hooks_section[self._event_key] = new_entries
         self._save(path, data)
