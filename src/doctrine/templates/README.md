@@ -8,6 +8,7 @@ missions.
 
 | Directory | Purpose |
 |-----------|---------|
+| `agent-onboarding/` | External-agent onboarding evidence, decomposition, and handoff templates |
 | `architecture/` | Architectural design document templates (ADRs, stakeholder personas, user journeys) |
 | `command-templates/` | Prompt files for `/spec-kitty.*` slash commands |
 | `sets/` | Named bundles grouping related templates for coordinated deployment |
@@ -26,5 +27,5 @@ Mission content templates live under `src/doctrine/missions/<mission>/templates/
 
 ## Glossary Reference
 
-See [Template Set](../../../glossary/contexts/doctrine.md#template-set) in the
+See [Template Set](../../../docs/context/doctrine.md#template-set) in the
 doctrine glossary context.

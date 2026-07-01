@@ -18,7 +18,7 @@ Rules enforced:
 
 See also:
   - ``tests/architectural/test_status_module_boundary.py`` — template / pattern
-  - ADR ``architecture/3.x/adr/2026-06-07-1-execution-state-canonical-surface.md``
+  - ADR ``docs/adr/3.x/2026-06-07-1-execution-state-canonical-surface.md``
   - Contract ``kitty-specs/execution-state-canonical-surface-01KTG6P9/contracts/mission_runtime_api.md``
 """
 from __future__ import annotations
@@ -40,12 +40,42 @@ pytestmark = pytest.mark.architectural
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC = _REPO_ROOT / "src"
 _PACKAGE_DIR = _SRC / "mission_runtime"
-_PUBLIC_SURFACE = [
-    "ExecutionContext",
-    "ExecutionMode",
-    "resolve_action_context",
-    "ActionContextError",
-]
+# WP03 (execution-context-unification-01KTPKST) grows the surface with the
+# doc-09 fragment / op-composite value objects that the conversion WPs
+# (WP04/05/06/07) consume via the package root. ``__all__`` is sorted, so the
+# expected surface is sorted too.
+_PUBLIC_SURFACE = sorted(
+    [
+        "ActionContextError",
+        "ArtifactPlacementFragment",
+        "BranchRefFragment",
+        "CommitTarget",
+        "ExecutionContext",
+        "ExecutionMode",
+        "IdentityFragment",
+        "MissionArtifactContext",
+        "MissionArtifactHome",
+        "MissionArtifactKind",
+        "MissionContext",
+        "MissionTopology",
+        "StatusSurfaceFragment",
+        "WorkspaceFragment",
+        "artifact_home_for",
+        "classify_topology",
+        "is_coordination_artifact_residue_path",
+        "is_primary_artifact_kind",
+        # gate-read-surface-completion WP05 (FR-003): the self-bookkeeping allowlist
+        # predicate is a package-root public symbol consumed by the record-analysis
+        # dirty-tree preflight (DISJOINT from the coord-residue partition, G-5).
+        "is_self_bookkeeping_path",
+        "kind_for_mission_file",
+        "mission_context_for",
+        "resolve_action_context",
+        "resolve_placement_only",
+        "resolve_topology",
+        "routes_through_coordination",
+    ]
+)
 
 
 # ---------------------------------------------------------------------------

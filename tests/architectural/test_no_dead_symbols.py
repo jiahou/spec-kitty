@@ -76,7 +76,6 @@ _SRC_ROOT = _REPO_ROOT / "src"
 _CATEGORY_A_SLICE_F_DEFERRED: frozenset[str] = frozenset(
     {
         "charter._catalog_miss::CatalogMissCause",
-        "charter._catalog_miss::CatalogMissDiagnosis",
         "charter._catalog_miss::CharterCatalogMissError",
         "charter._catalog_miss::CharterCatalogMissWarning",
         "charter.activations::ALLOWED_MISSION_TYPES",
@@ -85,7 +84,8 @@ _CATEGORY_A_SLICE_F_DEFERRED: frozenset[str] = frozenset(
         "charter.compact::extract_section_anchors",
         "charter.synthesizer.provenance::ProvenanceEntry",
         "charter.synthesizer.write_pipeline::StagedArtifact",
-        "charter.synthesizer.write_pipeline::promote",
+        # promote: rescued by detector (a) — add_typer/app.command patterns
+        # now capture module-attr accesses (WP01 harden-dead-symbol-gate).
         "kernel._safe_re::is_re2_active",
     }
 )
@@ -128,10 +128,8 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "doctrine.shared::TermSurface",
         "doctrine.tactics::ArtifactKind",
         "specify_cli.acceptance::AcceptanceMode",
-        "specify_cli.acceptance::ArtifactEncodingError",
         "specify_cli.acceptance::WorkPackageState",
         "specify_cli.acceptance::detect_mission_slug",
-        "specify_cli.acceptance::normalize_feature_encoding",
         "specify_cli.auth.refresh_transaction::RefreshResult",
         "specify_cli.cli.commands._auth_doctor::DaemonSummary",
         "specify_cli.cli.commands._auth_doctor::DoctorReport",
@@ -143,37 +141,25 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "specify_cli.cli.commands._auth_doctor::compute_exit_code",
         "specify_cli.cli.commands._auth_doctor::render_report",
         "specify_cli.cli.commands._auth_doctor::render_report_json",
-        "specify_cli.cli.commands._branch_strategy_gate::ALREADY_CONFIRMED",
         "specify_cli.cli.commands._branch_strategy_gate::GateDecision",
         "specify_cli.cli.commands._branch_strategy_gate::GateOutcome",
-        "specify_cli.cli.commands.agent.config::app",
-        "specify_cli.cli.commands.agent::app",
-        "specify_cli.cli.commands.auth::app",
+        # agent.config::app, agent::app, auth::app, context::app,
+        # doctrine::app, mission::app, review::review_mission, sync::app,
+        # verify::verify_setup: rescued by detector (a) — add_typer(mod.app)
+        # and app.command()(mod.fn) accesses are now walked as module-attr
+        # accesses (WP01 harden-dead-symbol-gate-01KW0RJR).
         "specify_cli.cli.commands.charter.activate::charter_activate_app",
         "specify_cli.cli.commands.charter.deactivate::charter_deactivate_app",
-        "specify_cli.cli.commands.context::app",
-        "specify_cli.cli.commands.doctrine::app",
         "specify_cli.cli.commands.implement::_ensure_vcs_in_meta",
         "specify_cli.cli.commands.implement::detect_feature_context",
         "specify_cli.cli.commands.implement::find_wp_file",
-        "specify_cli.cli.commands.mission::app",
         "specify_cli.cli.commands.review::TestExtraMissing",
         "specify_cli.cli.commands.review::assert_pytest_available",
-        "specify_cli.cli.commands.review::review_mission",
-        "specify_cli.cli.commands.sync::app",
-        "specify_cli.cli.commands.verify::verify_setup",
         # _render_nag_if_needed and _should_suppress_nag removed from
         # allowlist: both now have live callers in the CLI startup readiness
         # coordinator path (Priivacy-ai/spec-kitty#1093).
-        "specify_cli.compat._adapters.detector::VersionDetector",
-        "specify_cli.compat._adapters.gate::_EXEMPT_COMMANDS",
-        "specify_cli.compat._adapters.gate::check_schema_version",
-        "specify_cli.compat._adapters.version_checker::MismatchType",
-        "specify_cli.compat._adapters.version_checker::compare_versions",
-        "specify_cli.compat._adapters.version_checker::format_version_error",
-        "specify_cli.compat._adapters.version_checker::get_cli_version",
-        "specify_cli.compat._adapters.version_checker::get_project_version",
-        "specify_cli.compat._adapters.version_checker::should_check_version",
+        # compat._adapters.{detector,gate,version_checker}::* removed: dead pure-shim
+        # files deleted (salvaged from closed #2159/#2049).
         "specify_cli.core.context_validation::CurrentContext",
         "specify_cli.core.context_validation::ExecutionContext",
         "specify_cli.core.context_validation::detect_execution_context",
@@ -194,7 +180,6 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "specify_cli.core.paths::resolve_with_context",
         "specify_cli.core.upgrade_probe::DEFAULT_TIMEOUT_S",
         "specify_cli.core.upgrade_probe::PYPI_JSON_URL",
-        "specify_cli.core.utils::ensure_within_directory",
         "specify_cli.core.worktree_topology::FeatureTopology",
         "specify_cli.core.worktree_topology::WPTopologyEntry",
         "specify_cli.core.worktree_topology::render_topology_text",
@@ -223,8 +208,8 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "specify_cli.dashboard.api_types::WorktreeInfo",
         "specify_cli.dashboard.lifecycle::_write_dashboard_file",
         "specify_cli.dashboard.templates::get_dashboard_html",
-        "specify_cli.decisions.emit::emit_decision_opened",
-        "specify_cli.decisions.emit::emit_decision_resolved",
+        # emit_decision_opened, emit_decision_resolved: rescued by detector (a)
+        # — decisions module accessed via module-attr pattern (WP01).
         "specify_cli.doctrine.org_charter::GovernancePolicy",
         "specify_cli.doctrine.org_charter::REQUIRED_KIND_FIELDS",
         "specify_cli.doctrine.org_charter::apply_org_charter_pre_fill",
@@ -251,7 +236,6 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "specify_cli.git.sparse_checkout_remediation::STEP_USER_DECLINED",
         "specify_cli.git.sparse_checkout_remediation::STEP_VERIFY_CLEAN",
         "specify_cli.git.sparse_checkout_remediation::SparseCheckoutRemediationReport",
-        "specify_cli.git.sparse_checkout_remediation::SparseCheckoutRemediationResult",
         "glossary.semantic_events::SemanticConflictRecord",
         "specify_cli.intake.brief_writer::CrossFilesystemWriteError",
         "specify_cli.intake.brief_writer::atomic_write_bytes",
@@ -270,7 +254,6 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "specify_cli.merge.ordering::display_merge_order",
         "specify_cli.merge.state::MergeAmbiguousStateError",
         "specify_cli.merge.state::detect_git_merge_state",
-        "specify_cli.merge.state::get_state_path",
         "specify_cli.migration::normalize_mission_lifecycle_repo",
         "specify_cli.mission_brief::IntakeFileMissingError",
         "specify_cli.mission_brief::IntakeFileUnreadableError",
@@ -279,8 +262,6 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "specify_cli.mission_v1::MissionProtocol",
         "specify_cli.mission_v1::load_mission",
         "specify_cli.mission_v1::load_mission_by_name",
-        "specify_cli.missions._legacy_aliases::LEGACY_FEATURE_HELP",
-        "specify_cli.missions._legacy_aliases::hidden_feature_option",
         "specify_cli.missions::PrimitiveExecutionContext",
         "specify_cli.missions::execute_with_glossary",
         "runtime.next._internal_runtime.emitter::RuntimeEventEmitter",
@@ -302,24 +283,9 @@ _CATEGORY_B_GRANDFATHERED_LEGACY: frozenset[str] = frozenset(
         "specify_cli.runtime::ResolutionResult",
         "specify_cli.runtime::ResolutionTier",
         "specify_cli.runtime::classify_asset",
-        "specify_cli.scripts.tasks.acceptance_support::AcceptanceError",
-        "specify_cli.scripts.tasks.acceptance_support::AcceptanceMode",
-        "specify_cli.scripts.tasks.acceptance_support::AcceptanceResult",
-        "specify_cli.scripts.tasks.acceptance_support::AcceptanceSummary",
-        "specify_cli.scripts.tasks.acceptance_support::ArtifactEncodingError",
-        "specify_cli.scripts.tasks.acceptance_support::WorkPackageState",
-        "specify_cli.scripts.tasks.acceptance_support::acceptance_lane_derivations",
-        "specify_cli.scripts.tasks.acceptance_support::choose_mode",
-        "specify_cli.scripts.tasks.acceptance_support::collect_feature_summary",
-        "specify_cli.scripts.tasks.acceptance_support::detect_mission_slug",
-        "specify_cli.scripts.tasks.acceptance_support::normalize_feature_encoding",
-        "specify_cli.scripts.tasks.acceptance_support::resolve_acceptance_actor",
-        "specify_cli.scripts.tasks.acceptance_support::perform_acceptance",
         "specify_cli.shims::SkillRegistry",
         "specify_cli.shims::generate_shims",
         "specify_cli.skills.manifest_store::SCHEMA_VERSION",
-        "specify_cli.skills.manifest_store::fingerprint",
-        "specify_cli.skills.manifest_store::fingerprint_file",
         "specify_cli.skills.manifest_store::load",
         "specify_cli.skills.manifest_store::save",
         "specify_cli.status.lifecycle_events::LIFECYCLE_EVENT_TYPES",
@@ -434,15 +400,13 @@ _CATEGORY_C_WP_IN_FLIGHT_WORKFLOW_REGISTRY: frozenset[str] = frozenset()
 
 # ---------- C. Charter command split legacy patch surface ----------
 # WP06 split ``cli.commands.charter`` from a monolithic module into a package.
-# These two package-level exports intentionally support legacy
-# package-level mock patch targets in tests and downstream
-# consumers while submodules resolve the values dynamically from the package.
-_CATEGORY_C_CHARTER_SPLIT_LEGACY_PATCH_SURFACE: frozenset[str] = frozenset(
-    {
-        "specify_cli.cli.commands.charter::_dm_service",
-        "specify_cli.cli.commands.charter::find_repo_root",
-    }
-)
+# WP01 (harden-dead-symbol-gate-01KW0RJR): both entries are now rescued by
+# detector (a) — charter submodules import the package as
+# ``import specify_cli.cli.commands.charter as _charter_pkg`` and access
+# ``_charter_pkg.find_repo_root()`` / ``_charter_pkg._dm_service`` via
+# module-attribute accesses that the new gate walks.  Emptied so the stale-
+# allowlist check does not fail.
+_CATEGORY_C_CHARTER_SPLIT_LEGACY_PATCH_SURFACE: frozenset[str] = frozenset()
 
 # ---------- C. Mission #1348 coordination-branch atomic event log ----------
 # Mission `mission-coordination-branch-atomic-event-log-01KSPTVW`
@@ -466,6 +430,37 @@ _CATEGORY_C_WP_IN_FLIGHT_COORDINATION_BRANCH: frozenset[str] = frozenset(
         # production callers route through the IO-shaped wrapper that
         # itself calls the pure helper internally.
         "specify_cli.missions._resolve_planning_branch::resolve_planning_branch_from_meta",
+    }
+)
+
+
+# ---------- C. WP-in-flight topology authority seam (mission 01KTYGTE) ----------
+# Mission ``name-vs-authority-remediation-01KTYGTE`` WP03 adds the topology
+# authority seam in ``coordination.surface_resolver``. The two structured types
+# below are genuinely public API but are reached transitively rather than by
+# name:
+#   * ``ResolvedStatusSurface`` is the return type of the already-wired
+#     ``resolve_status_surface_with_anchor`` (callers consume the value, not the
+#     name); it predates this WP and was opted into the gate by adding ``__all__``
+#     per C-007.
+#   * ``CoordinationBranchDeleted`` was previously allowlisted as a transitive-via-
+#     superclass consumer (the ``except StatusReadPathNotFound`` handlers catch it).
+#     Mission 01KVN754 WP05 (coord-deleted convergence / #1848 / FR-005) now imports
+#     it BY NAME into both ``status.aggregate._resolve_read_dir`` (a more-specific
+#     ``except CoordinationBranchDeleted: raise`` AHEAD of the superclass re-wrap, so
+#     the data-loss verdict is propagated, not masked) and
+#     ``missions._read_path_resolver`` (the read-path DELETED hard-fail). Those
+#     by-name importers make it a LIVE cross-module symbol, so its allowlist entry is
+#     removed (a removal-probe now PASSES the gate because the real callers exist).
+#   * ``CoordinationWorktreeEmpty`` was DELETED by mission 01KVN754 WP04 (coord-empty
+#     Option B / #1716 / FR-003): coord-empty no longer raises — the surface falls
+#     back to primary + emits a loud warning — so the carve-out is gone and its
+#     allowlist entry was removed.
+# Follow-up tracker: none — ``ResolvedStatusSurface`` is the lone remaining
+# transitive-consumption entry (callers consume the return value, not the name).
+_CATEGORY_C_WP_IN_FLIGHT_TOPOLOGY_AUTHORITY: frozenset[str] = frozenset(
+    {
+        "specify_cli.coordination.surface_resolver::ResolvedStatusSurface",
     }
 )
 
@@ -566,26 +561,6 @@ _CATEGORY_C_ORG_DOCTRINE_CLOSEOUT: frozenset[str] = frozenset(
 )
 
 
-# ---------- C. Upstream coordination status_service (pre-existing on main) ----------
-# These five public symbols in ``specify_cli.coordination.status_service``
-# predate this mission — they landed on ``upstream/main`` via #1614 and have
-# no live src/ caller there either. They surfaced in this WP's gate run only
-# because the upstream rebase brought the module into the close-out branch.
-# They are NOT this mission's code; the close-out must not patch upstream
-# coordination internals. Allowlisted-with-tracker so the gate is GREEN.
-# Follow-up tracker (DIRECTIVE_013): Priivacy-ai/spec-kitty#1622 tracks
-# wiring or pruning these upstream symbols and shrinking this baseline.
-_CATEGORY_C_UPSTREAM_STATUS_SERVICE: frozenset[str] = frozenset(
-    {
-        "specify_cli.coordination.status_service::EventLogWriteTarget",
-        "specify_cli.coordination.status_service::StatusContractError",
-        "specify_cli.coordination.status_service::StatusReadSource",
-        "specify_cli.coordination.status_service::append_event_log_batch",
-        "specify_cli.coordination.status_service::read_wp_lane_actor",
-    }
-)
-
-
 # ---------- C. Upstream session-presence public surface (pre-existing on main) ----------
 # Three public symbols in ``specify_cli.session_presence`` modules that were
 # added to ``upstream/main`` (#1756) ahead of callers that will land in a
@@ -600,15 +575,331 @@ _CATEGORY_C_UPSTREAM_SESSION_PRESENCE: frozenset[str] = frozenset(
         # by UpgradeChecker but have no import-site callers in src/ yet.
         "specify_cli.session_presence.upgrade_check::CACHE_PATH",
         "specify_cli.session_presence.upgrade_check::TTL_SECONDS",
-        # SESSION_START_CMD is a config-string constant referenced only within
-        # ClaudeCodeWriter; no other src/ module imports it directly.
-        "specify_cli.session_presence.writers.claude_code::SESSION_START_CMD",
-        # SESSION_STOP_CMD (do-dispatch-open-op-lifecycle-01KTSJ2H FR-009)
-        # mirrors SESSION_START_CMD exactly: a config-string constant consumed
-        # only within ClaudeCodeWriter (register/unregister/is_registered of
-        # the Stop hook); kept in __all__ for parity with SESSION_START_CMD
-        # and for test imports (test_claude_code_writer.py).
-        "specify_cli.session_presence.writers.claude_code::SESSION_STOP_CMD",
+    }
+)
+
+
+_CATEGORY_C_QUALITY_DEBT_1928: frozenset[str] = frozenset(
+    {
+        # PathValidationError is the public exception type raised by
+        # validate_mission_paths(..., strict=True). It is exercised by
+        # tests/agent/test_validators_unit.py (which imports it as a public
+        # symbol) and is part of the validator's documented public surface,
+        # but the sole runtime caller (acceptance/__init__.py) invokes the
+        # validator non-strict, so no src/ module imports the exception yet.
+        # Kept in __all__ as a deliberate public API. Tracked under the
+        # quality-debt epic #1928 (FR-303).
+        "specify_cli.validators.paths::PathValidationError",
+    }
+)
+
+
+_CATEGORY_C_BRANCH_NAMING_FAILOVER_SEAM: frozenset[str] = frozenset(
+    {
+        # Both symbols are LIVE — the gate only counts cross-file src/ `__all__`
+        # importers, so a test-only hook and an intra-module env read are invisible
+        # to it (NOT dead). Manufacturing a fake src/ importer is the exact
+        # anti-pattern this gate warns against, so they are allow-listed instead.
+        #
+        # reset_legacy_failover_warning: a pytest one-shot reset hook for the
+        # legacy-failover deprecation notice. Exercised by
+        # tests/lanes/test_branch_naming_seam.py and
+        # tests/merge/test_mid8_embedded_preflight.py. Part of the seam's public
+        # test surface; no src/ caller by design (resetting one-shot state is a
+        # test concern).
+        "specify_cli.lanes.branch_naming::reset_legacy_failover_warning",
+        # LEGACY_FAILOVER_SUPPRESS_ENV: the env-var name read INSIDE
+        # branch_naming._emit_legacy_failover_warning (runtime-exercised via
+        # _check_mission_branch -> resolve_branch_name). It is consumed in the
+        # same module that declares it, so no cross-file src/ import exists; it is
+        # exported so operators/tests can reference the canonical env name.
+        "specify_cli.lanes.branch_naming::LEGACY_FAILOVER_SUPPRESS_ENV",
+    }
+)
+
+
+# ---------- C. Test-facing agent.tasks re-export compatibility ----------
+_CATEGORY_C_BACKCOMPAT_SHIM_REEXPORT: frozenset[str] = frozenset(
+    {
+        # Mission decompose-agent-tasks-god-module-01KVWVAR (#2058) split the
+        # ``agent/tasks.py`` god-module into ``tasks_outline``,
+        # ``tasks_materialization``, ``tasks_finalize_validation``, and
+        # ``tasks_dependency_graph`` seams. These six names are RE-EXPORTED from
+        # ``agent.tasks.__all__`` (``from ...tasks_* import <name>`` + ``__all__``)
+        # purely to keep the existing test-facing import/patch surface stable:
+        # the suite imports them via ``from ...agent.tasks import <name>`` and
+        # patches them at ``...agent.tasks.<name>`` (see tests/agent/*,
+        # tests/contract/*). The dead-symbol gate counts only cross-file *src/*
+        # ``__all__`` importers, so a test-only re-export surface is invisible to
+        # it (NOT dead). Manufacturing a fake src/ importer is the anti-pattern
+        # this gate warns against, so they are allow-listed instead. ``app`` is
+        # the seam's Typer sub-app, registered (not src-imported), mirroring the
+        # already-grandfathered ``specify_cli.cli.commands.agent::app`` entry.
+        # Burns down if/when the re-export is collapsed into the seam modules.
+        "specify_cli.cli.commands.agent.tasks::_behind_commits_touch_only_planning_artifacts",
+        "specify_cli.cli.commands.agent.tasks::_check_dependent_warnings",
+        "specify_cli.cli.commands.agent.tasks::_lane_targets_for_emit",
+        "specify_cli.cli.commands.agent.tasks::_wp_lane_from_status_events",
+        # agent.tasks::app: rescued by detector (a) (WP01 harden-dead-symbol-gate).
+        "specify_cli.cli.commands.agent.tasks::compute_incomplete_dependents",
+    }
+)
+
+
+# ---------- C. Merge god-module decomposition shim re-exports (mission #2057) -
+# The ``cli/commands/merge.py`` god-module (3383 LOC, maxCC ~102) was
+# decomposed into cohesive seams under ``specify_cli/merge/`` (issue #2057,
+# behavior-preserving refactor). FR-006 mandates that the thin command shim
+# re-export every relocated symbol so the ~41 importing test files and external
+# back-compat consumers keep working with ZERO import edits and a byte-stable
+# ``__all__``. Each symbol below is LIVE runtime code defined in (and used by)
+# a ``merge/*`` seam; the shim re-export simply has no *src/* caller importing
+# it *via the shim* (the seams import siblings directly, one-way — C-006/INV-2;
+# tests import the relocated names from the shim, which this gate does not
+# count). On origin/main this gate passed because each symbol's canonical home
+# was already a seam with a cross-file src importer; the decomposition widened
+# the shim's re-export surface from 24 to ~57 names, so the proof-of-life that
+# previously covered them no longer reaches the new re-exports. Burn-down
+# (FR-303): when the importing test files are repointed to the seam homes, the
+# shim re-exports (and these entries) can be deleted.
+_CATEGORY_C_MERGE_DECOMP_SHIM_REEXPORT_2057: frozenset[str] = frozenset(
+    {
+        f"specify_cli.cli.commands.merge::{name}"
+        for name in (
+            "_assert_baseline_merge_commit_on_target",
+            "_assert_bookkeeping_snapshot_path_is_trusted",
+            "_assert_merged_wps_done_on_target",
+            "_assert_merged_wps_reached_done",
+            "_assert_status_path_within_target_surface",
+            "_assert_status_surface_path_is_trusted",
+            "_bake_mission_number_into_mission_branch",
+            "BaselineMergeCommitError",
+            "_branch_trees_equal",
+            "_capture_bookkeeping_snapshots",
+            "_check_mission_branch",
+            "_classify_porcelain_lines",
+            "_clear_merge_state_for_mission",
+            "_collect_hollow_review_warnings",
+            "_effective_push_requested",
+            "_emit_merge_diff_summary",
+            "_emit_remediation_hint",
+            "_enforce_canonical_status_history",
+            "_enforce_planning_artifact_target_branch",
+            "_enforce_review_artifact_consistency",
+            "_enforce_target_branch_sync_preflight",
+            "_has_branch_ref",
+            "_has_transition_to",
+            "HollowReviewWarnings",
+            "_is_git_repo",
+            "_is_linear_history_rejection",
+            "_lane_already_integrated",
+            "LINEAR_HISTORY_REJECTION_TOKENS",
+            "_load_merge_state_for_mission",
+            "_load_or_create_merge_state",
+            "MissionBranchBlocker",
+            "_paths_have_status_changes",
+            "_project_status_bookkeeping_to_target",
+            "_raw_porcelain_status",
+            "_read_committed_meta_json",
+            "_reconcile_completed_wps_for_resume",
+            "_record_baseline_merge_commit",
+            "_recorded_baseline_from_working_meta",
+            "_refresh_primary_checkout_after_merge",
+            "_resolve_merge_actor",
+            "_restore_final_bookkeeping_snapshots",
+            # _run_lane_based_merge: rescued by detector (a) (WP01).
+            "_run_lane_based_merge_locked",
+            "_STATUS_EVENTS_FILENAME",
+            "_STATUS_FILENAME",
+            "_target_bookkeeping_status_paths",
+            "TARGET_BRANCH_NOT_SYNCHRONIZED",
+            "_target_branch_still_at_baseline",
+            "TARGET_BRANCH_SYNC_INVARIANT",
+            "_target_branch_sync_payload",
+            "target_branch_sync_remediation",
+            "_validate_mission_slug_path_segment",
+            "_warn_or_confirm_hollow_reviews",
+        )
+    }
+    | {
+        # Seam-INTERNAL helpers / the phase-state dataclass that mission #2057
+        # exports from each new seam's own ``__all__`` as the FR-004 focused-test
+        # contract (the per-seam test files import these names directly to drive
+        # >=90% coverage of the moved code). Each is LIVE runtime code with
+        # multiple intra-module references; they lost their cross-file *src/*
+        # caller when the decomposition moved the consuming call out of
+        # ``cli/commands/merge.py`` into a sibling seam (so the gate's
+        # cross-file-src-importer proof-of-life no longer reaches them). They are
+        # not dead — only seam-private + test-exercised. Burn-down (FR-303): drop
+        # them from the seam ``__all__`` (leaving them as unexported internals)
+        # once the focused tests reference them without the public-contract
+        # expectation, or wire a runtime cross-seam caller.
+        "specify_cli.merge.bookkeeping_projection::_assert_status_surface_file_path_is_trusted",
+        "specify_cli.merge.bookkeeping_projection::_read_optional_bytes",
+        "specify_cli.merge.bookkeeping_projection::_restore_optional_bytes",
+        "specify_cli.merge.executor::_MergeRunState",
+        "specify_cli.merge.ordering::_already_baked",
+        "specify_cli.merge.ordering::_compute_next_mission_number_or_none",
+        "specify_cli.merge.ordering::_is_assigned_mission_number",
+        "specify_cli.merge.ordering::_mark_mission_number_baked",
+        "specify_cli.merge.ordering::_write_mission_number_to_branch",
+        "specify_cli.merge.push_preflight::check_push_safety",
+        "specify_cli.merge.resolve::_extract_mission_slug",
+        "specify_cli.merge.resolve::_iter_merge_states_for_slug",
+        "specify_cli.merge.resolve::_merge_state_key_candidates",
+    }
+)
+
+
+# ---------- B. T001-unblinded symbols (WP01 harden-dead-symbol-gate) ----------
+# The T001 bug in ``_extract_all_literal`` caused any module with a top-level
+# ``ast.AnnAssign`` (like ``MESSAGES: dict[...] = {...}``) BEFORE ``__all__``
+# to be silently zeroed, hiding those modules from the gate entirely.  WP01
+# fixes the parser; these symbols surfaced as offenders for the first time.
+# They are grandfathered at the same "investigate + wire/prune/delete" policy
+# as ``_CATEGORY_B_GRANDFATHERED_LEGACY``.  Burns down when each symbol is
+# wired from a runtime caller, removed from ``__all__``, or deleted (FR-303).
+_CATEGORY_B_T001_UNBLINDED: frozenset[str] = frozenset(
+    {
+        # auth.transport: public client classes and factory functions that
+        # external consumers (plugins, org-packs, SaaS integration — #2158
+        # SaaS-migration wave FR-006) use directly; no internal src/
+        # from-import callers because the SaaS migration is deferred.
+        "specify_cli.auth.transport::AuthenticatedClient",
+        "specify_cli.auth.transport::AsyncAuthenticatedClient",
+        "specify_cli.auth.transport::AuthRefreshFailed",
+        "specify_cli.auth.transport::get_client",
+        "specify_cli.auth.transport::get_async_client",
+        "specify_cli.auth.transport::reset_clients",
+    }
+)
+
+
+# ---------- C. Common Docs directive-id SSOT (scripts/-consumed) ----------
+# ``COMMON_DOCS_DIRECTIVE_ID`` is the single source of truth for the Common
+# Docs directive id (C-003 binding-must-resolve). Its only callers are the
+# anti-sprawl structure ratchet (``scripts/docs/anti_sprawl_ratchet.py``) and
+# that ratchet's self-test — both wired from scripts/ + tests/, not from any
+# src/ module — so the qualified-import scanner sees no src/ caller. The module
+# is correspondingly allowlisted in ``test_no_dead_modules._CATEGORY_2``.
+# Manufacturing a fake src/ caller is the anti-pattern this gate warns against;
+# allowlisted instead. (The dead-symbols gate is a separate file from the
+# dead-modules gate, so the module allowlist does not suppress this check.)
+_CATEGORY_C_COMMON_DOCS_RATCHET_CONSTANT: frozenset[str] = frozenset(
+    {
+        "doctrine.directives.common_docs::COMMON_DOCS_DIRECTIVE_ID",
+    }
+)
+
+
+# ---------- C. event-sync retention/delivery mission public surface ----------
+# Mission ``event-sync-retention-delivery-01KVYWRG`` (#2124) shipped two new
+# domains (``specify_cli.delivery.*`` + ``specify_cli.event_journal.*``) plus a
+# ``sync.migrate_journal`` migration. Their ACTIVE runtime callers are the CLI
+# event-sync surface (``cli/commands/sync.py`` imports EventSyncConfig, Mode,
+# DefaultReceiverFactory, dispatch, build_status_report, gc_payloads,
+# archive_payloads, SqliteDeliveryLedger, SqliteDeliveryTargetRegistry,
+# EventJournal/resolve_journal_path) and the capture path (``sync/emitter.py`` +
+# ``sync/migrate_journal.py``). The names below are the remaining mission public
+# surface: the locked per-WP test-contract (constants/dataclasses/protocols/
+# helpers exercised directly by tests under tests/delivery + tests/event_journal)
+# plus the C-008 OPT_OUT discard-safety machinery (FamilyClassification,
+# DiscardDecision[Kind], DiscardAuditRecord, AuditSink, JsonlAuditSink,
+# discard_decision). The discard machinery is implemented and unit-tested but its
+# LIVE runtime enforcement on the capture path is DEFERRED to the legacy-queue
+# retirement follow-up (mission-review-report DRIFT-1 / RISK-1): until the legacy
+# destructive ``queue.py`` drain is retired there is no single live capture-time
+# discard site to guard, and no production family-classification source exists
+# yet (the only honest classification is fail-closed UNKNOWN). Wiring it into the
+# per-event emit hot path now would be net-new design, not remediation. Tracked
+# as a deferred follow-up in
+# ``kitty-specs/event-sync-retention-delivery-01KVYWRG/issue-matrix.md``.
+# Burn-down (FR-303): the follow-up that retires the legacy drain wires the
+# discard guard + migration CLI + status/gc evaluators, shrinking this set.
+_CATEGORY_C_EVENT_SYNC_RETENTION_DELIVERY: frozenset[str] = frozenset(
+    {
+        # delivery.config — policy axes + C-008 discard-safety machinery
+        "specify_cli.delivery.config::AuditSink",
+        "specify_cli.delivery.config::Delivery",
+        "specify_cli.delivery.config::DiscardAuditRecord",
+        "specify_cli.delivery.config::DiscardDecision",
+        "specify_cli.delivery.config::DiscardDecisionKind",
+        "specify_cli.delivery.config::FamilyClassification",
+        "specify_cli.delivery.config::JsonlAuditSink",
+        "specify_cli.delivery.config::MissingExternalEndpointError",
+        "specify_cli.delivery.config::PolicyResolutionError",
+        "specify_cli.delivery.config::ReceiverFactory",
+        "specify_cli.delivery.config::ResolvedPolicy",
+        "specify_cli.delivery.config::ResolvedTarget",
+        "specify_cli.delivery.config::Retention",
+        "specify_cli.delivery.config::UnknownModeError",
+        "specify_cli.delivery.config::discard_decision",
+        # delivery.ledger — per-target ledger contract surface
+        "specify_cli.delivery.ledger::LEDGER_INDEX_NAME",
+        "specify_cli.delivery.ledger::LedgerRow",
+        "specify_cli.delivery.ledger::TERMINAL_STATUSES",
+        "specify_cli.delivery.ledger::init_ledger",
+        # delivery.receivers — DeliveryReceiver contract + gate vocabulary
+        "specify_cli.delivery.receivers::BATCH_ENDPOINT_PATH",
+        "specify_cli.delivery.receivers::BATCH_TIMEOUT_SECONDS",
+        "specify_cli.delivery.receivers::GateDecision",
+        "specify_cli.delivery.receivers::GateKind",
+        "specify_cli.delivery.receivers::HttpResponse",
+        "specify_cli.delivery.receivers::ReceiverGate",
+        "specify_cli.delivery.receivers::STUB_ENDPOINT_URL",
+        "specify_cli.delivery.receivers::StubReceiver",
+        "specify_cli.delivery.receivers::map_batch_response",
+        # delivery.status_report — additive status JSON section keys + helpers
+        "specify_cli.delivery.status_report::ADDITIVE_SECTION_KEYS",
+        "specify_cli.delivery.status_report::BODY_UPLOAD_COMPAT_KEY",
+        "specify_cli.delivery.status_report::DELIVERY_LEDGER_KEY",
+        "specify_cli.delivery.status_report::DELIVERY_TARGETS_KEY",
+        "specify_cli.delivery.status_report::EVENT_JOURNAL_KEY",
+        "specify_cli.delivery.status_report::GC_LARGE_JOURNAL_THRESHOLD_BYTES",
+        "specify_cli.delivery.status_report::MIGRATION_CONFLICTS_KEY",
+        "specify_cli.delivery.status_report::TARGET_AUTHORITY_KEY",
+        "specify_cli.delivery.status_report::TERMINAL_FAILURES_KEY",
+        "specify_cli.delivery.status_report::evaluate_gc_suggestion",
+        # event_journal.coalesce — WP08 coalescing contract surface
+        "specify_cli.event_journal.coalesce::CoalescingStrategy",
+        "specify_cli.event_journal.coalesce::DeliveredAnywhereQuery",
+        "specify_cli.event_journal.coalesce::SUPERSEDED_TABLE",
+        "specify_cli.event_journal.coalesce::SupersedeMarker",
+        "specify_cli.event_journal.coalesce::install",
+        "specify_cli.event_journal.coalesce::read_supersede_markers",
+        # event_journal.journal / models — append-only journal contract surface
+        "specify_cli.event_journal.journal::JOURNAL_SUBDIR",
+        "specify_cli.event_journal.models::ORDERED_COLUMNS",
+        # sync.migrate_journal — WP10 migration entry points + audit surface.
+        # ``AUDIT_DB_NAME``, ``MigrationResult`` and ``migrate_queues_to_journal``
+        # gained live callers in WP12 (``spec-kitty sync migrate`` + the status
+        # migration-audit read path in ``cli/commands/sync.py``); they are no
+        # longer dead and were removed from this ratchet.
+        "specify_cli.sync.migrate_journal::KNOWN_PREFIX",
+        "specify_cli.sync.migrate_journal::LEGACY_DIGEST",
+        "specify_cli.sync.migrate_journal::MIGRATION_NOTE",
+        "specify_cli.sync.migrate_journal::MigrationConflict",
+        "specify_cli.sync.migrate_journal::SourceDb",
+        "specify_cli.sync.migrate_journal::SourceOutcome",
+        "specify_cli.sync.migrate_journal::UNKNOWN_PREFIX",
+        "specify_cli.sync.migrate_journal::discover_source_dbs",
+        "specify_cli.sync.migrate_journal::migration_target_token",
+    }
+)
+
+
+# sync-daemon-orphan-cleanup-01KWC2A3 (#2261): the ``ResetResult`` per-entry
+# dataclasses are the public structured-reporting surface for
+# ``auth doctor --reset`` (FR-005). They are constructed/asserted directly by the
+# auth-doctor + orphan-sweep test suites (``tests/auth/test_auth_doctor_*`` and
+# ``tests/sync/test_orphan_sweep_classification.py``) but, like their sibling
+# ``SweepReport`` already on this allowlist, have no in-``src/`` importer because
+# production code consumes them only through the ``ResetResult`` container.
+_CATEGORY_C_SYNC_RESET_RESULT_ENTRIES: frozenset[str] = frozenset(
+    {
+        "specify_cli.sync.orphan_sweep::FailedEntry",
+        "specify_cli.sync.orphan_sweep::SkippedEntry",
+        "specify_cli.sync.orphan_sweep::SweptEntry",
     }
 )
 
@@ -619,15 +910,23 @@ _CATEGORY_C_UPSTREAM_SESSION_PRESENCE: frozenset[str] = frozenset(
 _SYMBOL_ALLOWLIST: frozenset[str] = (
     _CATEGORY_A_SLICE_F_DEFERRED
     | _CATEGORY_B_GRANDFATHERED_LEGACY
+    | _CATEGORY_B_T001_UNBLINDED
+    | _CATEGORY_C_COMMON_DOCS_RATCHET_CONSTANT
     | _CATEGORY_C_WP_IN_FLIGHT_CHARTER_SCOPE
     | _CATEGORY_C_WP_IN_FLIGHT_WORKFLOW_REGISTRY
     | _CATEGORY_C_CHARTER_SPLIT_LEGACY_PATCH_SURFACE
     | _CATEGORY_C_WP_IN_FLIGHT_COORDINATION_BRANCH
+    | _CATEGORY_C_WP_IN_FLIGHT_TOPOLOGY_AUTHORITY
     | _CATEGORY_C_WP_IN_FLIGHT_UNIFIED_MISSION_STEP
     | _CATEGORY_C_WP_IN_FLIGHT_CHARTER_ACTIVATION
     | _CATEGORY_C_ORG_DOCTRINE_CLOSEOUT
-    | _CATEGORY_C_UPSTREAM_STATUS_SERVICE
     | _CATEGORY_C_UPSTREAM_SESSION_PRESENCE
+    | _CATEGORY_C_QUALITY_DEBT_1928
+    | _CATEGORY_C_BRANCH_NAMING_FAILOVER_SEAM
+    | _CATEGORY_C_BACKCOMPAT_SHIM_REEXPORT
+    | _CATEGORY_C_MERGE_DECOMP_SHIM_REEXPORT_2057
+    | _CATEGORY_C_EVENT_SYNC_RETENTION_DELIVERY
+    | _CATEGORY_C_SYNC_RESET_RESULT_ENTRIES
 )
 
 
@@ -673,6 +972,242 @@ def _resolve_import_from(node: ast.ImportFrom, containing_pkg: str) -> str:
     return ".".join(base_parts)
 
 
+def _extract_str_consts_from_body(tree: ast.Module) -> dict[str, str]:
+    """Extract top-level ``NAME = "string"`` constants from a module body.
+
+    Only top-level body nodes are inspected (not nested scopes) to avoid
+    false matches from deeply nested string literals.
+
+    Used by ``_build_alias_map_and_consts`` as a separate helper to keep
+    ``_build_alias_map_and_consts`` within the McCabe complexity ceiling.
+    """
+    str_consts: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        str_consts[tgt.id] = node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+            and isinstance(node.target, ast.Name)
+        ):
+            str_consts[node.target.id] = node.value.value
+    return str_consts
+
+
+def _build_alias_map_and_consts(
+    tree: ast.Module,
+    containing_pkg: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Build per-file import alias map and top-level string constants.
+
+    Returns ``(alias_map, str_consts)`` where:
+
+    * ``alias_map`` maps a local Python name to the dotted module it
+      resolves to.  Only explicit ``asname`` bindings are captured:
+
+      - ``import a.b.c as x``  →  ``{"x": "a.b.c"}``
+      - ``from X import Y as Z``  →  ``{"Z": "X.Y"}`` (absolute X)
+
+      Plain ``import a.b.c`` (no alias) is skipped: the gate only needs
+      to trace ``x.attr``-style attribute accesses where the module is
+      bound to a single local name.
+
+    * ``str_consts`` maps top-level ``NAME = "string"`` (or ``AnnAssign``)
+      to the string value.  Used by ``_record_facade_edges`` to resolve
+      symbolic module-path variables like ``_EVENTS_MODULE = ".events"``.
+    """
+    alias_map: dict[str, str] = {}
+    # Walk ALL nodes for import aliases: late/local imports (inside functions
+    # or try-blocks) are common in spec-kitty for cycle-safety, and the
+    # module-attr detector must see them.  String-constant resolution is
+    # limited to top-level body (see ``_extract_str_consts_from_body``).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    alias_map[alias.asname] = alias.name
+                elif "." not in alias.name:
+                    # ``import flat_module`` — local name IS the module name.
+                    # Dotted imports (``import a.b.c``) are skipped: the local
+                    # binding is just ``a``, which would mismatch the full path.
+                    alias_map[alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            target = _resolve_import_from(node, containing_pkg)
+            for alias in node.names:
+                if alias.name != "*" and alias.asname:
+                    alias_map[alias.asname] = f"{target}.{alias.name}"
+    return alias_map, _extract_str_consts_from_body(tree)
+
+
+def _record_module_attr_edges(
+    tree: ast.Module,
+    alias_map: dict[str, str],
+    per_symbol: dict[str, set[str]],
+    known_modules: frozenset[str],
+) -> None:
+    """Record caller-edges from ``alias.attr`` attribute patterns (detector a).
+
+    For every ``<alias>.<name>`` node where ``<alias>`` resolves to a
+    *real module* (a key in ``known_modules``) via ``alias_map``, records
+    ``per_symbol[resolved_module].add(name)``.
+
+    This subsumes the previously-missing Typer ``app.command()`` and
+    lifecycle-module attribute patterns (detector c in the research).
+
+    The ``known_modules`` guard is load-bearing (T004 / no-false-negative):
+    ``from M import SomeClass as C`` binds ``C`` to the *synthetic* path
+    ``M.SomeClass`` (a symbol, not a module). A class-attribute access
+    ``C.NAME`` must NOT record a module-edge on ``M`` — otherwise
+    ``_submodule_index`` would index ``M.SomeClass`` under prefix ``M`` and
+    rule 3 of ``_symbol_has_caller`` would falsely rescue a genuinely-dead
+    ``M::NAME``, silently re-blinding the very gate this mission hardens.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in alias_map
+        ):
+            resolved = alias_map[node.value.id]
+            if resolved in known_modules:
+                per_symbol.setdefault(resolved, set()).add(node.attr)
+
+
+def _record_getattr_str_edges(
+    tree: ast.Module,
+    alias_map: dict[str, str],
+    per_symbol: dict[str, set[str]],
+    known_modules: frozenset[str],
+) -> None:
+    """Record caller-edges from ``getattr(alias, 'name')`` patterns (detector d).
+
+    For every ``getattr(<alias>, <str_literal>)`` call where ``<alias>``
+    resolves to a *real module* (in ``known_modules``) via ``alias_map``,
+    records ``per_symbol[resolved_module].add(str_literal)``. See
+    ``_record_module_attr_edges`` for why the ``known_modules`` guard is
+    required to avoid re-blinding the gate via a symbol-path collision.
+    """
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+        ):
+            continue
+        obj, attr_arg = node.args[0], node.args[1]
+        if not (isinstance(obj, ast.Name) and obj.id in alias_map):
+            continue
+        if not (isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str)):
+            continue
+        resolved = alias_map[obj.id]
+        if resolved in known_modules:
+            per_symbol.setdefault(resolved, set()).add(attr_arg.value)
+
+
+def _find_facade_lazy_dict_name(tree: ast.Module) -> str | None:
+    """Return the lazy-imports dict variable referenced in a ``__getattr__`` facade.
+
+    Searches for ``def __getattr__(name): ... DICT[name] ...`` at module
+    scope.  Returns the dict variable name, or ``None`` if not a facade.
+    """
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef) and node.name == "__getattr__"):
+            continue
+        if not node.args.args:
+            continue
+        arg_id = node.args.args[0].arg
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Subscript)
+                and isinstance(child.value, ast.Name)
+                and isinstance(child.slice, ast.Name)
+                and child.slice.id == arg_id
+            ):
+                return child.value.id
+    return None
+
+
+def _resolve_relative_module(mod_path: str, containing_pkg: str) -> str:
+    """Resolve a relative-or-absolute dotted module path to its absolute form.
+
+    ``".clock"`` resolved from ``"specify_cli.sync"`` →
+    ``"specify_cli.sync.clock"``.  Absolute paths are returned unchanged.
+    """
+    if not mod_path.startswith("."):
+        return mod_path
+    level = len(mod_path) - len(mod_path.lstrip("."))
+    rel = mod_path.lstrip(".")
+    pkg_parts = containing_pkg.split(".") if containing_pkg else []
+    base_parts = pkg_parts[: len(pkg_parts) - (level - 1)] if level > 1 else list(pkg_parts)
+    if rel:
+        base_parts = base_parts + rel.split(".")
+    return ".".join(base_parts)
+
+
+def _record_facade_edges(
+    tree: ast.Module,
+    containing_pkg: str,
+    str_consts: dict[str, str],
+    per_symbol: dict[str, set[str]],
+    known_modules: frozenset[str],
+) -> None:
+    """Record caller-edges from a ``__getattr__``-style lazy-import facade (detector b).
+
+    Detects the pattern::
+
+        _LAZY_IMPORTS = {
+            "Foo": (".bar", "Foo"),           # literal relative module
+            "Baz": (_EVENTS_MODULE, "Baz"),   # name resolved via str_consts
+        }
+        def __getattr__(name):
+            module_path, attr = _LAZY_IMPORTS[name]
+            ...
+
+    For each resolvable dict entry, records
+    ``per_symbol[resolved_submodule].add(attr_name)``.  The ``_LAZY_IMPORTS``
+    dict may be typed (``ast.AnnAssign``) or untyped (``ast.Assign``).
+    """
+    dict_name = _find_facade_lazy_dict_name(tree)
+    if dict_name is None:
+        return
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+            value_node: ast.expr | None = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value_node = node.value
+        else:
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == dict_name for t in targets):
+            continue
+        if not isinstance(value_node, ast.Dict):
+            continue
+        for val in value_node.values:
+            if not isinstance(val, (ast.Tuple, ast.List)) or len(val.elts) != 2:
+                continue
+            mod_expr, attr_expr = val.elts
+            if not (isinstance(attr_expr, ast.Constant) and isinstance(attr_expr.value, str)):
+                continue
+            attr_name: str = attr_expr.value
+            mod_path: str | None = None
+            if isinstance(mod_expr, ast.Constant) and isinstance(mod_expr.value, str):
+                mod_path = mod_expr.value
+            elif isinstance(mod_expr, ast.Name) and mod_expr.id in str_consts:
+                mod_path = str_consts[mod_expr.id]
+            if mod_path is None:
+                continue
+            resolved = _resolve_relative_module(mod_path, containing_pkg)
+            if resolved in known_modules:
+                per_symbol.setdefault(resolved, set()).add(attr_name)
+
+
 def _extract_all_literal(tree: ast.Module) -> frozenset[str] | None:
     """Return the names listed in the module's ``__all__`` if static.
 
@@ -696,6 +1231,8 @@ def _extract_all_literal(tree: ast.Module) -> frozenset[str] | None:
             tgt = node.target
             if isinstance(tgt, ast.Name) and tgt.id == "__all__":
                 value = node.value
+            else:
+                continue  # non-__all__ AnnAssign; skip rather than fall-through
         else:
             continue
         if value is None:
@@ -760,8 +1297,15 @@ def _imports_by_target(
     """
     per_symbol: dict[str, set[str]] = {}
     star_targets: set[str] = set()
+    # The set of REAL src modules. Attribute/getattr/facade detectors only
+    # record an edge when the alias resolves to a member of this set, so a
+    # symbol-path collision (``from M import Cls as C; C.NAME``) cannot
+    # re-blind the gate (T004 / no-false-negative). See
+    # ``_record_module_attr_edges``.
+    known_modules = frozenset(path_to_dotted.values())
     for path, tree in path_to_tree.items():
         containing = _package_of(path)
+        alias_map, str_consts = _build_alias_map_and_consts(tree, containing)
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 target = _resolve_import_from(node, containing)
@@ -770,6 +1314,9 @@ def _imports_by_target(
                         star_targets.add(target)
                     else:
                         per_symbol.setdefault(target, set()).add(alias.name)
+        _record_module_attr_edges(tree, alias_map, per_symbol, known_modules)
+        _record_getattr_str_edges(tree, alias_map, per_symbol, known_modules)
+        _record_facade_edges(tree, containing, str_consts, per_symbol, known_modules)
     return per_symbol, star_targets
 
 
@@ -830,6 +1377,36 @@ def _submodule_index(per_symbol: dict[str, set[str]]) -> dict[str, list[str]]:
     return out
 
 
+def _compute_offenders(
+    decls: dict[str, frozenset[str]],
+    per_symbol: dict[str, set[str]],
+    star_targets: set[str],
+    allowlist: frozenset[str],
+) -> list[str]:
+    """Return sorted ``module::Name`` offenders for the symbol-level gate.
+
+    Extracted so the end-to-end "teeth" self-test
+    (``test_gate_still_flags_a_truly_dead_symbol``) drives a constructed
+    dead-symbol fixture through the *exact* aggregate path the real gate
+    uses — proving the four additive caller-detectors did not turn the gate
+    into a silent no-op (NFR-001 / gate-can't-self-validate).
+    """
+    submodule_index = _submodule_index(per_symbol)
+    offenders: list[str] = []
+    for mod_dotted, names in sorted(decls.items()):
+        if mod_dotted in star_targets:
+            # Star-imported elsewhere; ``__all__`` is consumed wholesale.
+            continue
+        for name in sorted(names):
+            qualified = f"{mod_dotted}::{name}"
+            if qualified in allowlist:
+                continue
+            if _symbol_has_caller(name, mod_dotted, per_symbol, submodule_index):
+                continue
+            offenders.append(qualified)
+    return offenders
+
+
 def test_no_public_symbol_in_all_is_unimported() -> None:
     """Every name in every ``__all__`` must have at least one caller in src/.
 
@@ -841,18 +1418,7 @@ def test_no_public_symbol_in_all_is_unimported() -> None:
     per_symbol, star_targets = _imports_by_target(path_to_dotted, path_to_tree)
     submodule_index = _submodule_index(per_symbol)
 
-    offenders: list[str] = []
-    for mod_dotted, names in sorted(decls.items()):
-        if mod_dotted in star_targets:
-            # Star-imported elsewhere; ``__all__`` is consumed wholesale.
-            continue
-        for name in sorted(names):
-            qualified = f"{mod_dotted}::{name}"
-            if qualified in _SYMBOL_ALLOWLIST:
-                continue
-            if _symbol_has_caller(name, mod_dotted, per_symbol, submodule_index):
-                continue
-            offenders.append(qualified)
+    offenders = _compute_offenders(decls, per_symbol, star_targets, _SYMBOL_ALLOWLIST)
 
     # Detect stale allowlist entries (good news: the symbol gained a
     # caller; remove from allowlist).
@@ -889,3 +1455,180 @@ def test_no_public_symbol_in_all_is_unimported() -> None:
             "from the allowlist:\n  - " + bullets
         )
     assert not messages, "\n\n".join(messages)
+
+
+# ---------------------------------------------------------------------------
+# T001 regression — _extract_all_literal parser bug fix
+# ---------------------------------------------------------------------------
+
+
+def test_extract_all_literal_skips_non_all_annassign() -> None:
+    """A non-``__all__`` AnnAssign before ``__all__`` must not blind the parser.
+
+    Regression for the T001 bug: a top-level ``MESSAGES: dict[...] = {...}``
+    (ast.AnnAssign whose target is NOT ``__all__``) was falling through to
+    ``if value is None: return frozenset()``, silently zeroing the module's
+    ``__all__``.  After the fix, such nodes are skipped with ``continue``.
+    """
+    src = 'MESSAGES: dict[str, str] = {"x": "y"}\n__all__ = ["Foo", "Bar"]'
+    tree = ast.parse(src)
+    result = _extract_all_literal(tree)
+    assert result == frozenset({"Foo", "Bar"}), (
+        f"Expected frozenset({{Foo, Bar}}), got {result!r}"
+    )
+
+
+def test_extract_all_literal_typed_all_annassign() -> None:
+    """A typed ``__all__: list[str] = [...]`` AnnAssign is parsed correctly."""
+    src = '__all__: list[str] = ["Alpha", "Beta"]'
+    tree = ast.parse(src)
+    result = _extract_all_literal(tree)
+    assert result == frozenset({"Alpha", "Beta"})
+
+
+def test_extract_all_literal_bare_annassign_returns_frozenset_empty() -> None:
+    """``__all__: list[str]`` with no value is treated as dynamic (frozenset())."""
+    src = "__all__: list[str]"
+    tree = ast.parse(src)
+    result = _extract_all_literal(tree)
+    assert result == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# T004 no-false-negative guard — detectors must bind to RESOLVED module only
+# ---------------------------------------------------------------------------
+
+
+def test_no_false_negative_module_attr_detector() -> None:
+    """Detector (a) must rescue the resolved module's symbol, not a coincidental one.
+
+    This is the binding invariant from the WP01 spec: ``alias.Foo`` where
+    ``alias`` resolves to ``other_pkg`` rescues **only** ``other_pkg::Foo``,
+    NOT any different module that happens to declare a symbol named ``Foo``.
+    """
+    src = "import other_pkg as alias\nalias.Foo"
+    tree = ast.parse(src)
+    alias_map, _ = _build_alias_map_and_consts(tree, "")
+    ps: dict[str, set[str]] = {}
+    _record_module_attr_edges(tree, alias_map, ps, frozenset({"other_pkg"}))
+    sub_idx = _submodule_index(ps)
+
+    # The resolved module IS rescued.
+    assert _symbol_has_caller("Foo", "other_pkg", ps, sub_idx), (
+        "other_pkg::Foo must be rescued by alias.Foo access"
+    )
+    # A different module with the same symbol name is NOT rescued.
+    assert not _symbol_has_caller("Foo", "declaring_module", ps, sub_idx), (
+        "declaring_module::Foo must NOT be rescued by alias.Foo where alias→other_pkg"
+    )
+
+
+def test_no_false_negative_getattr_detector() -> None:
+    """Detector (d) must rescue the resolved module's symbol only."""
+    src = "import target_mod\ngetattr(target_mod, 'Bar')"
+    tree = ast.parse(src)
+    alias_map, _ = _build_alias_map_and_consts(tree, "")
+    ps: dict[str, set[str]] = {}
+    _record_getattr_str_edges(tree, alias_map, ps, frozenset({"target_mod"}))
+    sub_idx = _submodule_index(ps)
+
+    assert _symbol_has_caller("Bar", "target_mod", ps, sub_idx), (
+        "target_mod::Bar must be rescued by getattr(target_mod, 'Bar')"
+    )
+    assert not _symbol_has_caller("Bar", "unrelated_mod", ps, sub_idx), (
+        "unrelated_mod::Bar must NOT be rescued"
+    )
+
+
+def test_no_false_negative_facade_detector() -> None:
+    """Detector (b) must rescue only the submodule the facade re-exports from."""
+    src = (
+        '_PREFIX = ".sub"\n'
+        "_LAZY = {\n"
+        '    "Cls": (_PREFIX, "Cls"),\n'
+        '    "fn": (".other", "fn"),\n'
+        "}\n"
+        "def __getattr__(name):\n"
+        "    mod_path, attr = _LAZY[name]\n"
+        "    return attr\n"
+    )
+    tree = ast.parse(src)
+    _, str_consts = _build_alias_map_and_consts(tree, "mypkg")
+    ps: dict[str, set[str]] = {}
+    _record_facade_edges(
+        tree, "mypkg", str_consts, ps, frozenset({"mypkg.sub", "mypkg.other"})
+    )
+    sub_idx = _submodule_index(ps)
+
+    # Cls is exported from mypkg.sub
+    assert _symbol_has_caller("Cls", "mypkg.sub", ps, sub_idx), (
+        "mypkg.sub::Cls must be rescued by the facade"
+    )
+    # fn is exported from mypkg.other
+    assert _symbol_has_caller("fn", "mypkg.other", ps, sub_idx)
+    # Neither rescues an unrelated module
+    assert not _symbol_has_caller("Cls", "mypkg.unrelated", ps, sub_idx), (
+        "mypkg.unrelated::Cls must NOT be rescued"
+    )
+
+
+def test_no_false_negative_aliased_symbol_import_does_not_reblind() -> None:
+    """T004 regression: ``from M import Cls as C; C.NAME`` must NOT rescue ``M::NAME``.
+
+    This is the re-blinding vector the ``known_modules`` guard closes. ``C``
+    binds to the synthetic path ``M.SomeClass`` (a symbol, not a module);
+    a class-attribute access ``C.NAME`` must not be mistaken for a
+    module-attribute access on ``M``. ``M`` is a real module, but
+    ``M.SomeClass`` is not — so no edge may be recorded, and a genuinely-dead
+    ``M::NAME`` stays flagged.
+    """
+    src = "from M import SomeClass as C\nC.NAME"
+    tree = ast.parse(src)
+    alias_map, _ = _build_alias_map_and_consts(tree, "")
+    # ``M`` is a real module; ``M.SomeClass`` (the alias target) is NOT.
+    known_modules = frozenset({"M"})
+    ps: dict[str, set[str]] = {}
+    _record_module_attr_edges(tree, alias_map, ps, known_modules)
+    sub_idx = _submodule_index(ps)
+
+    assert not _symbol_has_caller("NAME", "M", ps, sub_idx), (
+        "M::NAME must NOT be rescued by the class-attribute access C.NAME "
+        "(C = SomeClass imported from M); recording that edge would re-blind "
+        "the gate via _submodule_index rule 3."
+    )
+    # Sanity: without the guard the collision DOES rescue — proves the guard
+    # is the load-bearing difference, not a vacuous assertion.
+    ps_unguarded: dict[str, set[str]] = {}
+    _record_module_attr_edges(
+        tree, alias_map, ps_unguarded, frozenset({"M", "M.SomeClass"})
+    )
+    assert _symbol_has_caller(
+        "NAME", "M", ps_unguarded, _submodule_index(ps_unguarded)
+    ), "control: with M.SomeClass treated as a module, the collision rescues M::NAME"
+
+
+def test_gate_still_flags_a_truly_dead_symbol() -> None:
+    """End-to-end teeth (NFR-001): the hardened gate is not a silent no-op.
+
+    Four additive caller-detectors can only ADD rescues, so a self-test must
+    prove the aggregate path still FLAGS a symbol that nothing imports — and
+    still PASSES one that has a real caller. Driven through the same
+    ``_compute_offenders`` path the production gate uses.
+    """
+    decls = {"synthetic.deadmod": frozenset({"NeverImported"})}
+
+    # No caller of any kind → still flagged.
+    flagged = _compute_offenders(decls, {}, set(), frozenset())
+    assert flagged == ["synthetic.deadmod::NeverImported"], (
+        f"gate must flag a symbol with zero callers; got {flagged!r}"
+    )
+
+    # A real direct importer → not flagged (control).
+    with_caller = {"synthetic.deadmod": {"NeverImported"}}
+    assert _compute_offenders(decls, with_caller, set(), frozenset()) == [], (
+        "a symbol with a real caller must NOT be flagged"
+    )
+
+    # Allowlisted → not flagged (control for the exception path).
+    allow = frozenset({"synthetic.deadmod::NeverImported"})
+    assert _compute_offenders(decls, {}, set(), allow) == []

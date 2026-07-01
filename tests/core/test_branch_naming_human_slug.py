@@ -15,9 +15,9 @@ from __future__ import annotations
 import pytest
 
 from specify_cli.lanes.branch_naming import (
+    _mid8,
     is_legacy_branch,
     lane_branch_name,
-    mid8,
     mission_branch_name,
     parse_mission_slug_from_branch,
     strip_numeric_prefix,
@@ -29,8 +29,7 @@ from specify_cli.lanes.branch_naming import (
 # ---------------------------------------------------------------------------
 
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 @pytest.mark.parametrize(
     ("slug", "expected"),
     [
@@ -56,17 +55,17 @@ def test_strip_numeric_prefix(slug: str, expected: str) -> None:
 
 def test_mid8_returns_first_8_chars() -> None:
     ulid = "01KNXQS9ATWWFXS3K5ZJ9E5008"
-    assert mid8(ulid) == "01KNXQS9"
+    assert _mid8(ulid) == "01KNXQS9"
 
 
 def test_mid8_on_minimum_length() -> None:
     # ULID is 26 chars; mid8 needs at least 8
-    assert mid8("01234567ABCDEFGHIJKLMNOPQ") == "01234567"
+    assert _mid8("01234567ABCDEFGHIJKLMNOPQ") == "01234567"
 
 
 def test_mid8_raises_on_too_short() -> None:
     with pytest.raises(ValueError, match="mission_id must be at least 8 characters"):
-        mid8("short")
+        _mid8("short")
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +80,25 @@ def test_mission_branch_name_new_format() -> None:
     assert result == "kitty/mission-mission-id-canonical-identity-migration-01KNXQS9"
 
 
+def test_mission_branch_name_does_not_double_existing_mid8_suffix() -> None:
+    slug = "agent-profile-projection-plugin-production-01KV3NGS"
+    ulid = "01KV3NGSDCJ272573TF6T6NWDW"
+    result = mission_branch_name(slug, mission_id=ulid)
+    assert result == "kitty/mission-agent-profile-projection-plugin-production-01KV3NGS"
+
+
 def test_lane_branch_name_new_format() -> None:
     slug = "083-mission-id-canonical-identity-migration"
     ulid = "01KNXQS9ATWWFXS3K5ZJ9E5008"
     result = lane_branch_name(slug, "lane-a", mission_id=ulid)
     assert result == "kitty/mission-mission-id-canonical-identity-migration-01KNXQS9-lane-a"
+
+
+def test_lane_branch_name_does_not_double_existing_mid8_suffix() -> None:
+    slug = "agent-profile-projection-plugin-production-01KV3NGS"
+    ulid = "01KV3NGSDCJ272573TF6T6NWDW"
+    result = lane_branch_name(slug, "lane-a", mission_id=ulid)
+    assert result == "kitty/mission-agent-profile-projection-plugin-production-01KV3NGS-lane-a"
 
 
 def test_lane_branch_name_without_numeric_prefix() -> None:
@@ -126,10 +139,10 @@ def test_collision_different_ulids_produce_distinct_branches() -> None:
     branch_b = lane_branch_name(slug, "lane-a", mission_id=ulid_b)
 
     assert branch_a != branch_b
-    assert mid8(ulid_a) in branch_a
-    assert mid8(ulid_b) in branch_b
+    assert _mid8(ulid_a) in branch_a
+    assert _mid8(ulid_b) in branch_b
     # The mid8 tokens must differ
-    assert mid8(ulid_a) != mid8(ulid_b)
+    assert _mid8(ulid_a) != _mid8(ulid_b)
 
 
 # ---------------------------------------------------------------------------
@@ -256,3 +269,40 @@ def test_round_trip_construct_then_parse(slug: str, ulid: str, lane: str) -> Non
     assert parsed_lane == lane
     # The human slug should be strip_numeric_prefix(slug)
     assert parsed_slug == strip_numeric_prefix(slug)
+
+
+# ---------------------------------------------------------------------------
+# Pathological case: slug already ends with a *different* mid8-shaped token
+# ---------------------------------------------------------------------------
+
+
+def test_mission_branch_name_does_not_strip_different_mid8_suffix() -> None:
+    """Slug ending with a mid8-shaped token that differs from the mission's own mid8.
+
+    When the slug already contains a different mid8-shaped suffix (e.g. an
+    earlier mission's mid8 embedded in the human slug), ``_human_slug_for_mid8_branch``
+    must NOT strip it — the deduplication guard only removes the suffix when it
+    matches the *current* mission_id's mid8.  The result is a branch name with
+    both the embedded token and the own mid8, i.e. a double-append.  This is the
+    documented behavior, not a bug.
+    """
+    slug = "my-feature-AAAA1111"
+    ulid = "01KV3NGSDCJ272573TF6T6NWDW"  # mid8 = 01KV3NGS
+    result = mission_branch_name(slug, mission_id=ulid)
+    # "AAAA1111" != "01KV3NGS" so it is NOT stripped; own mid8 is appended normally.
+    assert result == "kitty/mission-my-feature-AAAA1111-01KV3NGS"
+
+
+def test_lane_branch_name_pathological_mid8_mismatch() -> None:
+    """Parallel pathological test for lane_branch_name with a mismatched mid8.
+
+    When the slug's embedded mid8-shaped suffix differs from the mission_id's
+    mid8, the guard does NOT strip the slug's token — documented behavior.
+    The result contains both the slug's embedded token and the own mid8,
+    followed by the lane suffix.
+    """
+    slug = "my-feature-AAAA1111"
+    mission_id = "01KV3NGSDCJ272573TF6T6NWDW"  # mid8 = "01KV3NGS"
+    result = lane_branch_name(slug, "lane-a", mission_id=mission_id)
+    # slug's "AAAA1111" treated as part of human name; "01KV3NGS" appended
+    assert result == "kitty/mission-my-feature-AAAA1111-01KV3NGS-lane-a"

@@ -17,9 +17,7 @@ from specify_cli.status.wp_metadata import WPMetadata, read_wp_frontmatter
 
 # Marked for mutmut sandbox skip — see ADR 2026-04-20-1.
 # Reason: walks up to repo kitty-specs/
-pytestmark = pytest.mark.non_sandbox
-
-
+pytestmark = [pytest.mark.non_sandbox, pytest.mark.fast]
 # ─────────────────────────────────────────────────────────────
 # #1753: codebase-wide scope round-trips through the strict parser
 # ─────────────────────────────────────────────────────────────
@@ -159,6 +157,7 @@ class TestWPMetadataValidators:
         with pytest.raises(ValidationError, match="title"):
             WPMetadata(work_package_id="WP01", title="   ")
 
+    @pytest.mark.fast
     def test_invalid_base_commit(self) -> None:
         with pytest.raises(ValidationError, match="base_commit"):
             WPMetadata(work_package_id="WP01", title="T", base_commit="not-hex")
@@ -174,6 +173,11 @@ class TestWPMetadataValidators:
 
     def test_base_commit_none_is_valid(self) -> None:
         meta = WPMetadata(work_package_id="WP01", title="T", base_commit=None)
+        assert meta.base_commit is None
+
+    @pytest.mark.fast
+    def test_legacy_unknown_base_commit_is_normalized_to_none(self) -> None:
+        meta = WPMetadata(work_package_id="WP01", title="T", base_commit="unknown")
         assert meta.base_commit is None
 
     def test_invalid_lane_value_raises(self) -> None:
@@ -524,6 +528,15 @@ class TestReadWpFrontmatter:
         )
         meta, _ = read_wp_frontmatter(wp_file)
         assert meta.shell_pid == 405597
+
+    def test_legacy_unknown_base_commit_in_file_is_normalized(self, tmp_path: Path) -> None:
+        wp_file = tmp_path / "WP01-legacy-base.md"
+        wp_file.write_text(
+            "---\nwork_package_id: WP01\ntitle: Legacy Base\nbase_commit: unknown\n---\n\nBody\n",
+            encoding="utf-8",
+        )
+        meta, _ = read_wp_frontmatter(wp_file)
+        assert meta.base_commit is None
 
     def test_extra_fields_in_file(self, tmp_path: Path) -> None:
         """Fields formerly stored as extras are now declared on the model."""

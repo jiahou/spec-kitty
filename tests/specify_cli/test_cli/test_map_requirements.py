@@ -10,12 +10,12 @@ from typer.testing import CliRunner
 
 from specify_cli.cli.commands.agent.mission import app as feature_app
 from specify_cli.cli.commands.agent.tasks import app as tasks_app
+from specify_cli.coordination.commit_router import CommitRouterResult
 from specify_cli.frontmatter import read_frontmatter
 
 import pytest
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 runner = CliRunner()
 
 SPEC_CONTENT = """\
@@ -36,8 +36,13 @@ SPEC_CONTENT = """\
 
 @pytest.fixture(autouse=True)
 def _bypass_protected_branch_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    """These unit tests exercise mapping semantics on minimal main-branch fixtures."""
-    monkeypatch.setenv("SPEC_KITTY_TEST_MODE", "1")
+    """These unit tests exercise mapping semantics on minimal main-branch fixtures.
+
+    The documented operator escape hatch is the ONE sanctioned waiver for
+    fixtures committing on a protected branch (SPEC_KITTY_TEST_MODE no longer
+    waives the pre-check — PR #1850 guard-bypass fix).
+    """
+    monkeypatch.setenv("SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS", "1")
     monkeypatch.delenv("SPEC_KITTY_ENABLE_SAAS_SYNC", raising=False)
 
 
@@ -505,6 +510,48 @@ class TestMapRequirementsValidation:
         payload = json.loads(result.stdout.strip())
         assert payload["error"] == "Stale or invalid refs in WP frontmatter"
         assert "WP02" in payload["stale_refs"]
+        # #2066: payload now surfaces the parsed spec FR set, per-WP offender
+        # classification, and a hint naming the FR-NNN format rule.
+        assert payload["parsed_spec_ids"] == ["FR-001", "FR-002", "FR-003", "NFR-001"]
+        assert payload["stale_ref_reasons"]["WP02"]["malformed"] == ["BOGUS"]
+        assert payload["stale_ref_reasons"]["WP02"]["unknown_spec_id"] == []
+        assert "FR-NNN" in payload["hint"]
+
+    @patch("specify_cli.cli.commands.agent.tasks.locate_project_root")
+    @patch("specify_cli.cli.commands.agent.tasks._find_mission_slug")
+    @patch("specify_cli.cli.commands.agent.tasks._ensure_target_branch_checked_out")
+    def test_stale_refs_classify_format_vs_unknown(
+        self,
+        mock_branch: Mock,
+        mock_slug: Mock,
+        mock_locate: Mock,
+        tmp_path: Path,
+    ):
+        """#2066 Repro A: a letter-suffixed FR-003a reads as malformed, while a
+        well-formed-but-undeclared FR-999 reads as unknown_spec_id — so the
+        operator can tell a format typo from an orphaned ref."""
+        mock_locate.return_value = tmp_path
+        mock_slug.return_value = "001-test"
+        mock_branch.return_value = (tmp_path, "main")
+        feature_dir = _setup_feature(tmp_path)
+        tasks_dir = feature_dir / "tasks"
+        wp_file = next(tasks_dir.glob("WP02*.md"))
+        frontmatter, body = read_frontmatter(wp_file)
+        frontmatter["requirement_refs"] = ["FR-003a", "FR-999"]
+        from specify_cli.frontmatter import write_frontmatter
+
+        write_frontmatter(wp_file, frontmatter, body)
+
+        result = runner.invoke(
+            tasks_app,
+            ["map-requirements", "--wp", "WP01", "--refs", "FR-001", "--json"],
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout.strip())
+        reasons = payload["stale_ref_reasons"]["WP02"]
+        assert reasons["malformed"] == ["FR-003a"]
+        assert reasons["unknown_spec_id"] == ["FR-999"]
 
 
 class TestFinalizeTasksWithFrontmatterRefs:
@@ -516,7 +563,10 @@ class TestFinalizeTasksWithFrontmatterRefs:
         "specify_cli.cli.commands.agent.mission._show_branch_context",
         return_value=(None, "main"),
     )
-    @patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True)
+    @patch(
+        "specify_cli.coordination.commit_router.commit_for_mission",
+        return_value=CommitRouterResult(status="committed", placement_ref="main", commit_hash="a" * 40),
+    )
     @patch(
         "specify_cli.cli.commands.agent.mission.run_command",
         return_value=(0, "a" * 40, ""),
@@ -571,7 +621,10 @@ class TestFinalizeTasksWithFrontmatterRefs:
         "specify_cli.cli.commands.agent.mission._show_branch_context",
         return_value=(None, "main"),
     )
-    @patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True)
+    @patch(
+        "specify_cli.coordination.commit_router.commit_for_mission",
+        return_value=CommitRouterResult(status="committed", placement_ref="main", commit_hash="a" * 40),
+    )
     @patch(
         "specify_cli.cli.commands.agent.mission.run_command",
         return_value=(0, "a" * 40, ""),
@@ -608,3 +661,60 @@ class TestFinalizeTasksWithFrontmatterRefs:
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         wp01_refs = payload["requirement_refs_parsed"]["WP01"]
         assert wp01_refs == ["FR-001", "FR-002", "FR-003", "NFR-001"]
+
+
+class TestMapRequirementsAutoCommitJson:
+    """Issue #1891 Finding 1: ``--json`` must serialize the commit result.
+
+    ``safe_commit`` returns a ``CommitResult`` (not a bool). Previously that
+    object was placed directly into the ``--json`` payload, so on the
+    auto-commit success path ``json.dumps`` failed with "Object of type
+    CommitResult is not JSON serializable" and the mutation's result was
+    unparseable by an orchestrating agent.
+    """
+
+    @patch("specify_cli.cli.commands.agent.tasks.commit_for_mission")
+    @patch("specify_cli.cli.commands.agent.tasks.locate_project_root")
+    @patch("specify_cli.cli.commands.agent.tasks._find_mission_slug")
+    @patch("specify_cli.cli.commands.agent.tasks._ensure_target_branch_checked_out")
+    def test_auto_commit_json_payload_is_serializable(
+        self,
+        mock_branch: Mock,
+        mock_slug: Mock,
+        mock_locate: Mock,
+        mock_commit_for_mission: Mock,
+        tmp_path: Path,
+    ) -> None:
+        from specify_cli.coordination.commit_router import CommitRouterResult
+
+        mock_locate.return_value = tmp_path
+        mock_slug.return_value = "001-test"
+        mock_branch.return_value = (tmp_path, "main")
+        # WP07 / FR-006: the WP-file commit routes through ``commit_for_mission``.
+        # A committed router result carries the placement ref + commit hash; the
+        # command reconstructs the serializable ``commit_result`` envelope (#1891).
+        mock_commit_for_mission.return_value = CommitRouterResult(
+            status="committed", placement_ref="main", commit_hash="abc1234def"
+        )
+        _setup_feature(tmp_path)
+
+        result = runner.invoke(
+            tasks_app,
+            [
+                "map-requirements",
+                "--wp",
+                "WP01",
+                "--refs",
+                "FR-001",
+                "--auto-commit",
+                "--json",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        # Pre-fix this raised / produced an {"error": ...} payload.
+        payload = json.loads(result.stdout.strip())
+        assert payload["result"] == "success"
+        assert payload["committed"] is True
+        assert payload["commit_sha"] == "abc1234def"
+        mock_commit_for_mission.assert_called_once()

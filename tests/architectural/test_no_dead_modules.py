@@ -146,6 +146,8 @@ _CATEGORY_1_AUTO_DISCOVERED_MIGRATIONS: frozenset[str] = frozenset(
         "specify_cli.upgrade.migrations.m_0_8_0_worktree_agents_symlink",
         "specify_cli.upgrade.migrations.m_0_9_0_frontmatter_only_lanes",
         "specify_cli.upgrade.migrations.m_0_9_2_research_mission_templates",
+        "specify_cli.upgrade.migrations.m_0_9_3_surface_repair_wiring",  # WP01: auto-discovered sentinel migration
+        "specify_cli.upgrade.migrations.m_0_9_4_roo_deprecation",  # WP07: Roo Code deprecation; auto-discovered, never statically imported
         "specify_cli.upgrade.migrations.m_2_0_0_charter_directory",
         "specify_cli.upgrade.migrations.m_2_0_0_historical_status_migration",
         "specify_cli.upgrade.migrations.m_2_0_0_retire_git_hooks",
@@ -186,6 +188,7 @@ _CATEGORY_1_AUTO_DISCOVERED_MIGRATIONS: frozenset[str] = frozenset(
         "specify_cli.upgrade.migrations.m_3_2_0rc35_fix_prompt_file_workaround",
         "specify_cli.upgrade.migrations.m_3_2_0rc35_charter_bundle_v2",
         "specify_cli.upgrade.migrations.m_3_2_0rc35_charter_manifest_defaults_repair",
+        "specify_cli.upgrade.migrations.m_3_2_0rc43_retire_profile_context_command",
         # NOTE: WP01 (charter-pack-activation-layer-01KSYE4V) was expected to
         # add the three entries below.  They are added here as a WP01 gap fix
         # so the WP05 architectural gate passes before lanes are merged.
@@ -227,6 +230,9 @@ _CATEGORY_1_AUTO_DISCOVERED_MIGRATIONS: frozenset[str] = frozenset(
         # imported by runtime code. Test-exercised by
         # tests/upgrade/test_op_record_schema_v2_migration.py.
         "specify_cli.upgrade.migrations.m_3_3_0_op_record_schema_v2",
+        # 3.2.0rc45 standalone governance skill retirement migration:
+        # auto-discovered via pkgutil.iter_modules in migrations/__init__.py.
+        "specify_cli.upgrade.migrations.m_3_2_0rc45_retire_standalone_skill_surface",
     }
 )
 
@@ -234,11 +240,21 @@ _CATEGORY_1_AUTO_DISCOVERED_MIGRATIONS: frozenset[str] = frozenset(
 # Loaded by scripts/generate_schemas.py via dotted-string
 # importlib.import_module to derive JSON schemas from Pydantic
 # models. Never imported by runtime code.
+#
+# Also carries constant modules wired from scripts/ rather than src/ —
+# same "consumed from scripts/, not src/" pattern as the schema generators
+# above (scripts/generate_schemas.py).
 _CATEGORY_2_BUILD_SCHEMA_GENERATORS: frozenset[str] = frozenset(
     {
         "doctrine.agent_profiles.schema_models",
         "doctrine.import_candidates.models",
         "doctrine.model_task_routing.models",
+        # constant module consumed by scripts/docs/anti_sprawl_ratchet.py
+        # (wired from scripts/, not src/) — same pattern as
+        # scripts/generate_schemas.py. COMMON_DOCS_DIRECTIVE_ID is the
+        # single source of truth for the Common Docs directive id, imported
+        # by the anti-sprawl structure ratchet and its self-test.
+        "doctrine.directives.common_docs",
     }
 )
 
@@ -247,15 +263,9 @@ _CATEGORY_2_BUILD_SCHEMA_GENERATORS: frozenset[str] = frozenset(
 # from the git pre-commit hook script installed by
 # src/specify_cli/policy/hook_installer.py. The module path
 # appears only as the string literal MODULE in hook_installer.
-# Stand-alone task helper scripts are invoked outside the spec-kitty
-# import graph (legacy /scripts/tasks/ entry points kept for the
-# acceptance_support compatibility wrapper).
 _CATEGORY_3_EXTERNAL_CLI_ENTRYPOINTS: frozenset[str] = frozenset(
     {
         "specify_cli.policy.commit_guard_hook",
-        "specify_cli.scripts.tasks.acceptance_support",
-        "specify_cli.scripts.tasks.task_helpers",
-        "specify_cli.scripts.tasks.tasks_cli",
     }
 )
 
@@ -290,9 +300,8 @@ _CATEGORY_4_BACKCOMPAT_SHIMS: frozenset[str] = frozenset(
 # mission-review-report.md.
 _CATEGORY_5_WP_IN_FLIGHT_ADAPTERS: frozenset[str] = frozenset(
     {
-        "specify_cli.compat._adapters.detector",
-        "specify_cli.compat._adapters.gate",
-        "specify_cli.compat._adapters.version_checker",
+        # compat._adapters.{detector,gate,version_checker} removed: dead pure-shim
+        # files deleted (zero functional callers; salvaged from closed #2159/#2049).
         # runtime.next._internal_runtime.workflow_registry removed:
         # WP11 wired get_workflow() into planner.py (planner imports it
         # via workflow_registry at module scope), so the module now has a
@@ -333,10 +342,6 @@ _CATEGORY_6_FROZEN_RUNTIME_REEXPORTS: frozenset[str] = frozenset(
 # glossary.rendering) per DM-01KRX6N0YAFBY7MTJC0CN3D3E4.
 _CATEGORY_7_GRANDFATHERED_ORPHANS: frozenset[str] = frozenset(
     {
-        # TODO(triage): hidden_feature_option / LEGACY_FEATURE_HELP
-        # landed in mission stability-and-hygiene-hardening-2026-04
-        # WP07 but no CLI command adopted them.
-        "specify_cli.missions._legacy_aliases",
         # TODO(triage): TaskProfile suggestion engine has unit tests
         # but no integration with `spec-kitty agent tasks`.
         "specify_cli.task_profile",

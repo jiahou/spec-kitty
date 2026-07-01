@@ -69,6 +69,26 @@ def write_release_files(tmp_path: Path, version: str, changelog_body: str) -> No
         f"spec_kitty:\n  version: {version}\n",
         encoding="utf-8",
     )
+    write_uv_lock(tmp_path, version)
+
+
+def write_uv_lock(tmp_path: Path, version: str) -> None:
+    (tmp_path / "uv.lock").write_text(
+        dedent(
+            f"""
+            version = 1
+            revision = 3
+            requires-python = ">=3.11"
+
+            [[package]]
+            name = "spec-kitty-cli"
+            version = "{version}"
+            source = {{ editable = "." }}
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def stage_and_commit(tmp_path: Path, message: str) -> None:
@@ -84,6 +104,14 @@ def changelog_for_versions(*versions: tuple[str, str]) -> str:
     sections = []
     for version, body in versions:
         sections.append(f"## {version}\n{body}\n")
+    return "\n".join(sections)
+
+
+def unreleased_changelog(version: str, body: str, *prior: tuple[str, str]) -> str:
+    """Changelog whose top section is an Unreleased-marked heading for *version*."""
+    sections = [f"## [Unreleased] - {version}\n{body}\n"]
+    for prior_version, prior_body in prior:
+        sections.append(f"## {prior_version}\n{prior_body}\n")
     return "\n".join(sections)
 
 
@@ -238,6 +266,170 @@ def test_branch_mode_fails_without_changelog_entry(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "CHANGELOG.md lacks a populated section for 0.2.4" in result.stderr
+
+
+def test_branch_mode_fails_when_uv_lock_version_drifts(tmp_path: Path) -> None:
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "0.2.3",
+        changelog_for_versions(("0.2.3", "- Initial release")),
+    )
+    stage_and_commit(tmp_path, "chore: bootstrap project")
+    tag(tmp_path, "v0.2.3")
+
+    write_release_files(
+        tmp_path,
+        "0.2.4",
+        changelog_for_versions(
+            ("0.2.4", "- Add automation"),
+            ("0.2.3", "- Initial release"),
+        ),
+    )
+    write_uv_lock(tmp_path, "0.2.3")
+    stage_and_commit(tmp_path, "chore: prep 0.2.4 with stale lockfile")
+
+    result = run_validator(tmp_path, "--mode", "branch")
+
+    assert result.returncode == 1
+    assert "uv.lock" in result.stderr
+    assert "0.2.4" in result.stderr
+    assert "0.2.3" in result.stderr
+
+
+def test_default_lockfile_uses_target_repo_when_called_from_elsewhere(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    caller = tmp_path / "caller"
+    target.mkdir()
+    caller.mkdir()
+    init_repo(target)
+
+    write_release_files(
+        target,
+        "0.2.3",
+        changelog_for_versions(("0.2.3", "- Initial release")),
+    )
+    stage_and_commit(target, "chore: bootstrap project")
+    tag(target, "v0.2.3")
+
+    write_release_files(
+        target,
+        "0.2.4",
+        changelog_for_versions(
+            ("0.2.4", "- Add automation"),
+            ("0.2.3", "- Initial release"),
+        ),
+    )
+    write_uv_lock(target, "0.2.3")
+    write_uv_lock(caller, "0.2.4")
+    stage_and_commit(target, "chore: prep 0.2.4 with stale target lockfile")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--mode",
+            "branch",
+            "--pyproject",
+            str(target / "pyproject.toml"),
+            "--changelog",
+            str(target / "CHANGELOG.md"),
+        ],
+        cwd=caller,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1
+    assert str(target / "uv.lock") in result.stdout
+    assert str(caller / "uv.lock") not in result.stdout
+    assert "uv.lock" in result.stderr
+    assert "0.2.4" in result.stderr
+    assert "0.2.3" in result.stderr
+
+
+def test_consistency_only_skips_release_progression(tmp_path: Path) -> None:
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "0.2.3",
+        changelog_for_versions(("0.2.3", "- Initial release")),
+    )
+    stage_and_commit(tmp_path, "chore: bootstrap project")
+    tag(tmp_path, "v0.2.3")
+
+    result = run_validator(tmp_path, "--mode", "branch", "--consistency-only")
+
+    assert result.returncode == 0, result.stderr
+    assert "All required checks passed." in result.stdout
+
+
+def test_consistency_only_rejects_stale_top_changelog_release(
+    tmp_path: Path,
+) -> None:
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "1.2.3",
+        changelog_for_versions(
+            ("1.2.4", "- Drifted future entry"),
+            ("1.2.3", "- Historical matching entry"),
+        ),
+    )
+    stage_and_commit(tmp_path, "chore: bootstrap drifted changelog")
+    tag(tmp_path, "v1.2.3")
+
+    result = run_validator(tmp_path, "--mode", "branch", "--consistency-only")
+
+    assert result.returncode == 1
+    assert "CHANGELOG.md latest release entry is '1.2.4'" in result.stderr
+    assert "pyproject.toml declares '1.2.3'" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("pyproject_version", "lockfile_version"),
+    [
+        ("1.0.0alpha", "1.0.0a0"),
+        ("1.0.0alpha1", "1.0.0a1"),
+        ("1.0.0beta", "1.0.0b0"),
+        ("1.0.0beta1", "1.0.0b1"),
+    ],
+)
+def test_uv_lock_sync_accepts_canonical_prerelease_aliases(
+    tmp_path: Path,
+    pyproject_version: str,
+    lockfile_version: str,
+) -> None:
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        pyproject_version,
+        changelog_for_versions((pyproject_version, "- Prerelease")),
+    )
+    write_uv_lock(tmp_path, lockfile_version)
+
+    result = run_validator(tmp_path, "--mode", "branch", "--consistency-only")
+
+    assert result.returncode == 0, result.stderr
+    assert "All required checks passed." in result.stdout
+
+
+def test_malformed_uv_lock_reports_validation_issue(tmp_path: Path) -> None:
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "0.2.4",
+        changelog_for_versions(("0.2.4", "- Add automation")),
+    )
+    (tmp_path / "uv.lock").write_text("not = [valid\n", encoding="utf-8")
+
+    result = run_validator(tmp_path, "--mode", "branch", "--consistency-only")
+
+    assert result.returncode == 1
+    assert "Unable to parse uv.lock" in result.stderr
+    assert "Issues detected:" in result.stdout
 
 
 def test_tag_mode_validates_tag_alignment(tmp_path: Path) -> None:
@@ -453,4 +645,139 @@ def test_branch_mode_accepts_final_release_after_prerelease_tag(tmp_path: Path) 
     result = run_validator(tmp_path, "--mode", "branch", "--tag-pattern", "v*.*.*")
 
     assert result.returncode == 0, result.stderr
+    assert "All required checks passed." in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Pre-release "Unreleased - X.Y.Z" heading tolerance (branch mode) vs.
+# tag-mode finalization strictness.
+# ---------------------------------------------------------------------------
+
+
+def test_branch_consistency_only_accepts_unreleased_marked_section(tmp_path: Path) -> None:
+    """Branch + --consistency-only must accept '## [Unreleased] - X.Y.Z' for the pyproject version."""
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "3.2.3",
+        unreleased_changelog(
+            "3.2.3",
+            "- Pending release notes",
+            ("3.2.2", "- Prior release"),
+        ),
+    )
+    stage_and_commit(tmp_path, "chore: prep 3.2.3 (unreleased heading)")
+    tag(tmp_path, "v3.2.2")
+
+    result = run_validator(tmp_path, "--mode", "branch", "--consistency-only")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "All required checks passed." in result.stdout
+
+
+def test_branch_mode_accepts_unreleased_marked_section(tmp_path: Path) -> None:
+    """Full branch mode must accept '## [Unreleased] - X.Y.Z' for the pyproject version."""
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "3.2.3",
+        unreleased_changelog(
+            "3.2.3",
+            "- Pending release notes",
+            ("3.2.2", "- Prior release"),
+        ),
+    )
+    stage_and_commit(tmp_path, "chore: prep 3.2.3 (unreleased heading)")
+    tag(tmp_path, "v3.2.2")
+
+    result = run_validator(tmp_path, "--mode", "branch")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "All required checks passed." in result.stdout
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "## [Unreleased] - 3.2.3",
+        "## [3.2.3] - Unreleased",
+        "## 3.2.3 - Unreleased",
+        "## Unreleased - 3.2.3",
+    ],
+)
+def test_branch_mode_accepts_all_unreleased_heading_variations(
+    tmp_path: Path, heading: str
+) -> None:
+    """Every documented Unreleased+version heading variation parses to the version in branch mode."""
+    init_repo(tmp_path)
+    changelog = f"{heading}\n- Pending release notes\n\n## 3.2.2\n- Prior release\n"
+    write_release_files(tmp_path, "3.2.3", changelog)
+    stage_and_commit(tmp_path, "chore: prep 3.2.3 variation")
+    tag(tmp_path, "v3.2.2")
+
+    result = run_validator(tmp_path, "--mode", "branch")
+
+    assert result.returncode == 0, f"{heading!r}: {result.stdout}{result.stderr}"
+    assert "All required checks passed." in result.stdout
+
+
+def test_tag_mode_rejects_unreleased_marked_section(tmp_path: Path) -> None:
+    """Tag mode must STILL fail on an Unreleased-marked section — release not finalized."""
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "3.2.3",
+        unreleased_changelog(
+            "3.2.3",
+            "- Pending release notes",
+            ("3.2.2", "- Prior release"),
+        ),
+    )
+    stage_and_commit(tmp_path, "chore: prep 3.2.3 (unreleased heading)")
+    tag(tmp_path, "v3.2.2")
+    tag(tmp_path, "v3.2.3")
+
+    result = run_validator(tmp_path, "--mode", "tag", "--tag", "v3.2.3")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "3.2.3" in combined
+    assert "finalized" in combined.lower()
+
+
+def test_tag_mode_accepts_finalized_section(tmp_path: Path) -> None:
+    """Tag mode passes for a finalized '## [X.Y.Z]' section (regression guard)."""
+    init_repo(tmp_path)
+    write_release_files(
+        tmp_path,
+        "3.2.3",
+        changelog_for_versions(
+            ("[3.2.3]", "- Final release notes"),
+            ("[3.2.2]", "- Prior release"),
+        ),
+    )
+    stage_and_commit(tmp_path, "chore: finalize 3.2.3")
+    tag(tmp_path, "v3.2.2")
+    tag(tmp_path, "v3.2.3")
+
+    result = run_validator(tmp_path, "--mode", "tag", "--tag", "v3.2.3")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Tag: v3.2.3" in result.stdout
+
+
+def test_versionless_unreleased_above_finalized_section_unchanged(tmp_path: Path) -> None:
+    """Classic version-less '## [Unreleased]' above a finalized '## [3.2.2]' still behaves as before."""
+    init_repo(tmp_path)
+    changelog = (
+        "## [Unreleased]\n- Work in progress\n\n"
+        "## [3.2.2]\n- Prior release\n"
+    )
+    write_release_files(tmp_path, "3.2.2", changelog)
+    stage_and_commit(tmp_path, "chore: bootstrap 3.2.2 with unreleased placeholder")
+    tag(tmp_path, "v3.2.1")
+
+    result = run_validator(tmp_path, "--mode", "branch")
+
+    assert result.returncode == 0, result.stdout + result.stderr
     assert "All required checks passed." in result.stdout

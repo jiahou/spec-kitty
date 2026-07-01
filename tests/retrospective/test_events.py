@@ -34,7 +34,7 @@ from specify_cli.retrospective.schema import (
 )
 from specify_cli.retrospective.summary import classify_mission_record
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
 # ---------------------------------------------------------------------------
 # Test fixture helpers
@@ -124,7 +124,7 @@ class TestEventTypeShapes:
             mission_slug=MISSION_SLUG,
             execution_mode="main",
             findings_status="has_findings",
-            record_path=".kittify/missions/" + MISSION_ID + "/retrospective.yaml",
+            record_path="kitty-specs/" + MISSION_SLUG + "/retrospective.yaml",
             generator_version="1.0",
             policy_source=dict(_POLICY_SOURCE),
             provenance_kind="runtime_post_completion",

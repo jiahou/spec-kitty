@@ -13,13 +13,15 @@ All subcommands output JSON to stdout and exit 0 on success, 1 on structured err
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_mission
+from specify_cli.core.paths import locate_project_root
+from specify_cli.missions._read_path_resolver import resolve_feature_dir_for_mission
 import json
 import re as _re
 from pathlib import Path
 
 import typer
+
+from mission_runtime import ActionContextError
 
 from specify_cli.decisions.models import (
     DecisionErrorCode,
@@ -57,19 +59,42 @@ _SAFE_SLUG_RE = _re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 def _resolve_repo_root_and_slug(mission_handle: str) -> tuple[Path, str]:
     """Return ``(repo_root, mission_slug)`` for a mission handle.
 
-    The mission handle is treated as a mission_slug directly.  repo_root is
-    resolved by walking up from the current working directory looking for a
-    ``kitty-specs/`` directory.  If none is found, the current working directory
-    is returned as repo_root (allowing test fixtures to pass tmp_path directly
-    via environment).
+    The mission handle may be a full slug, a bare ``mid8``, a full ULID, or a
+    numeric prefix; it is canonicalized to the resolved mission directory's
+    name when that directory exists (F-001 — the same boundary pattern as the
+    agent ``_find_mission_slug`` helpers), so the slug persisted downstream
+    (decisions/index.json, the DM artifact, the DecisionPointOpened event) is
+    identical across handle forms. Handles that resolve to no existing mission
+    keep their raw form, preserving the historical MISSION_NOT_FOUND path.
 
-    This keeps the CLI decoupled from the heavier context resolver while still
-    supporting the standard project layout used by spec-kitty.
+    ``repo_root`` is the **canonical root authority** (``locate_project_root``),
+    the same authority the read-path resolver itself anchors on — so the root
+    used here agrees with the coord-aware resolved path the resolver returns.
+    When no project root is found the current working directory is used (test
+    fixtures pass ``tmp_path`` as the cwd).
+
+    FR-003 / C-IC03 (single authority): this helper performs NO private
+    walk-up-to-``kitty-specs/`` and NO escape-validation of the *resolved* path.
+    The resolved mission directory is whatever the single canonical resolver
+    returns (it may legitimately live in a coordination worktree, i.e. outside
+    ``repo_root/kitty-specs/``); asserting it stays under the primary base was
+    the dead second authority that rejected valid coord handles. We validate the
+    RAW operator token (the input boundary) and trust the resolver's output
+    (DIR-031).
 
     Security: the mission_handle is validated against ``_SAFE_SLUG_RE`` to
-    prevent path-traversal attacks (RISK-1 from mission review 01KPWT8P).
+    prevent path-traversal attacks (RISK-1 from mission review 01KPWT8P). This
+    rejection on the **raw** token is preserved.
+
+    Raises:
+        typer.BadParameter: when the raw handle contains path traversal.
+        ActionContextError: when the canonical resolver cannot resolve the
+            handle (e.g. ``COORDINATION_BRANCH_DELETED``). Callers structure it
+            via :func:`_handle_action_context_error` rather than letting it
+            surface as a raw traceback (the live #8 symptom).
     """
-    # Reject path-traversal payloads early, before any filesystem access.
+    # Reject path-traversal payloads early, before any filesystem access. This
+    # guards the RAW operator token only — the resolver's output is trusted.
     if not _SAFE_SLUG_RE.match(mission_handle):
         raise typer.BadParameter(
             f"Invalid --mission value {mission_handle!r}: must match "
@@ -77,31 +102,18 @@ def _resolve_repo_root_and_slug(mission_handle: str) -> tuple[Path, str]:
             param_hint="'--mission'",
         )
 
-    # Walk up looking for kitty-specs/ (project root marker)
-    cwd = Path.cwd()
-    candidate: Path | None = None
-    current = cwd
-    for _ in range(20):
-        if (current / KITTY_SPECS_DIR).is_dir():
-            candidate = current
-            break
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
+    # Canonical root authority — agrees with the resolver's own anchor (C-001:
+    # adopt the existing root authority, never re-derive via a private walk).
+    repo_root = locate_project_root() or Path.cwd()
 
-    repo_root = candidate if candidate is not None else cwd
-
-    # Verify the resolved mission path stays within kitty-specs/ even after
-    # Path normalization (defence-in-depth against any edge cases in slug parsing).
-    resolved = (resolve_feature_dir_for_mission(repo_root, mission_handle)).resolve()
-    base = (repo_root / KITTY_SPECS_DIR).resolve()
-    if not str(resolved).startswith(str(base) + "/") and resolved != base:
-        raise typer.BadParameter(
-            f"Mission path would escape kitty-specs/: {mission_handle!r}",
-            param_hint="'--mission'",
-        )
-
+    # Single authority: resolve the mission directory through the one
+    # coord-aware resolver. F-001: the resolved directory's NAME (not the raw
+    # handle) is the canonical slug persisted downstream. Handles that resolve
+    # to no existing mission keep their raw form so the service's
+    # MISSION_NOT_FOUND behaviour is unchanged.
+    resolved = resolve_feature_dir_for_mission(repo_root, mission_handle).resolve()
+    if resolved.is_dir():
+        return repo_root, resolved.name
     return repo_root, mission_handle
 
 
@@ -154,6 +166,24 @@ def _handle_decision_error(exc: DecisionError) -> None:
         "error": str(exc),
         "code": exc.code.value,
         "details": exc.details,
+    }
+    typer.echo(json.dumps(payload, sort_keys=True), err=True)
+    raise typer.Exit(1)
+
+
+def _handle_action_context_error(exc: ActionContextError) -> None:
+    """Render a read-path resolver failure as a structured typed diagnostic.
+
+    FR-003 / C-IC03: the canonical resolver raises :class:`ActionContextError`
+    carrying its real ``code`` (e.g. ``COORDINATION_BRANCH_DELETED``,
+    ``MISSION_AMBIGUOUS_SELECTOR``, ``STATUS_READ_PATH_NOT_FOUND``). The operator
+    MUST see that structured payload — never an uncaught Rich traceback (the
+    live #8 symptom). Mirrors the GOOD-citizen pattern in
+    ``agent context resolve`` (``agent/context.py``).
+    """
+    payload = {
+        "error": str(exc),
+        "code": exc.code,
     }
     typer.echo(json.dumps(payload, sort_keys=True), err=True)
     raise typer.Exit(1)
@@ -214,7 +244,11 @@ def cmd_open(  # noqa: PLR0913
             return
         parsed_options = tuple(str(item) for item in raw)
 
-    repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    try:
+        repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    except ActionContextError as exc:
+        _handle_action_context_error(exc)
+        return  # unreachable — _handle_action_context_error raises
 
     try:
         resp = open_decision(
@@ -266,7 +300,11 @@ def cmd_resolve(  # noqa: PLR0913
     json_out: bool = typer.Option(True, "--json/--no-json", help="Output JSON (default true)"),  # noqa: ARG001
 ) -> None:
     """Resolve a decision with a concrete final answer."""
-    repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    try:
+        repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    except ActionContextError as exc:
+        _handle_action_context_error(exc)
+        return  # unreachable — _handle_action_context_error raises
 
     try:
         resp = resolve_decision(
@@ -312,7 +350,11 @@ def cmd_defer(
         _handle_decision_error(err)
         return
 
-    repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    try:
+        repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    except ActionContextError as exc:
+        _handle_action_context_error(exc)
+        return  # unreachable — _handle_action_context_error raises
 
     try:
         resp = defer_decision(
@@ -356,7 +398,11 @@ def cmd_cancel(
         _handle_decision_error(err)
         return
 
-    repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    try:
+        repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    except ActionContextError as exc:
+        _handle_action_context_error(exc)
+        return  # unreachable — _handle_action_context_error raises
 
     try:
         resp = cancel_decision(
@@ -391,19 +437,42 @@ def cmd_verify(
     json_out: bool = typer.Option(True, "--json/--no-json", help="Output JSON (default true)"),  # noqa: ARG001
 ) -> None:
     """Cross-check deferred decisions against inline sentinel markers."""
-    repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    try:
+        repo_root, mission_slug = _resolve_repo_root_and_slug(mission)
+    except ActionContextError as exc:
+        _handle_action_context_error(exc)
+        return  # unreachable — _handle_action_context_error raises
     # Read-path mediation (WP08 T037, FR-030): in the coord-branch
     # topology ``decisions/index.json`` lives in the coordination
     # worktree, not the primary checkout.  The resolver returns the
     # coord-worktree mission directory when one exists, and falls back
     # to the primary checkout for legacy missions / early lifecycle.
     from specify_cli.missions._read_path_resolver import (
-        resolve_mission_read_path,
+        MissionSelectorAmbiguous,
+        StatusReadPathNotFound,
+        resolve_handle_to_read_path,
     )
-    from specify_cli.lanes.branch_naming import mid8_from_slug
 
-    _mid8 = mid8_from_slug(mission_slug)
-    mission_dir = resolve_mission_read_path(repo_root, mission_slug, _mid8)
+    # WP02/FR-002 (D-6 consolidation): the former D-6 factory-boundary bootstrap
+    # (raw ``KITTY_SPECS_DIR / mission_slug`` join → ``load_meta`` →
+    # ``resolve_mid8`` → ``resolve_mission_read_path``) collapses onto the single
+    # guarded read-side seam. ``resolve_handle_to_read_path`` performs the SAME
+    # primary-meta probe and the sanctioned mid8 cascade internally (reading the
+    # canonical ``mission_id`` from the primary meta, never seeding an empty
+    # identity), then routes through the existence-gated topology resolver — and
+    # adds the ``assert_safe_path_segment`` guard (FR-004) this bootstrap lacked.
+    # M5 (FR-003 / #8 class): ``cmd_verify`` still surfaces the resolver's
+    # fail-closed refusals (``StatusReadPathNotFound`` /
+    # ``CoordinationBranchDeleted``) and selector ambiguity
+    # (``MissionSelectorAmbiguous``) as structured typed diagnostics carrying the
+    # real ``error_code`` — never an uncaught traceback.
+    try:
+        mission_dir = resolve_handle_to_read_path(repo_root, mission_slug)
+    except (StatusReadPathNotFound, MissionSelectorAmbiguous) as exc:
+        _handle_action_context_error(
+            ActionContextError(exc.error_code, str(exc))
+        )
+        return  # unreachable — _handle_action_context_error raises
 
     result = _verify_decisions(mission_dir, mission_slug)
 

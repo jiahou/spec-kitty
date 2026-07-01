@@ -245,6 +245,7 @@ class AgentProfileRepository:
         """
         self._profiles: dict[str, AgentProfile] = {}
         self._provenance: dict[str, str] = {}
+        self._source_paths: dict[str, Path] = {}
         self._skipped: list[SkippedProfile] = []
         self._built_in_dir = built_in_dir or self._default_built_in_dir()
         self._org_dirs: list[Path] = list(org_dirs) if org_dirs else []
@@ -490,6 +491,7 @@ class AgentProfileRepository:
 
             self._profiles[profile.profile_id] = profile
             self._provenance[profile.profile_id] = layer
+            self._source_paths[profile.profile_id] = yaml_file
             loaded[profile.profile_id] = profile
 
         return loaded
@@ -568,6 +570,39 @@ class AgentProfileRepository:
         ``None`` if the profile is not loaded.
         """
         return self._provenance.get(profile_id)
+
+    def get_source_path(self, profile_id: str) -> Path | None:
+        """Return the YAML file path that supplied the loaded profile."""
+        return self._source_paths.get(profile_id)
+
+    def register_overlay(
+        self,
+        profile: AgentProfile,
+        *,
+        layer: str,
+        source_path: Path | None,
+    ) -> None:
+        """Overlay an externally-resolved ``profile`` onto this repository.
+
+        Public entry point so callers (e.g. the charter-activation-admitted org
+        subset) merge a profile without reaching into the private
+        ``_profiles``/``_provenance``/``_source_paths`` maps. The overlay is
+        applied only when ``layer`` ranks at or above the id's current
+        provenance per ``_LAYER_RANK``: an ``org`` overlay replaces a
+        ``builtin`` entry, but never clobbers a higher-ranked ``project`` entry.
+        A previously-unseen id is always admitted. ``source_path`` is recorded
+        only when provided (``None`` leaves any existing path untouched).
+        """
+        profile_id = profile.profile_id
+        existing_layer = self._provenance.get(profile_id)
+        if existing_layer is not None and _LAYER_RANK.get(layer, -1) < _LAYER_RANK.get(
+            existing_layer, -1
+        ):
+            return
+        self._profiles[profile_id] = profile
+        self._provenance[profile_id] = layer
+        if source_path is not None:
+            self._source_paths[profile_id] = source_path
 
     def find_by_role(self, role: Role | str) -> list[AgentProfile]:
         """Find all profiles that list the given role (primary or secondary position).

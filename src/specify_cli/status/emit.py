@@ -23,12 +23,11 @@ Pipeline order (critical -- do not reorder):
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
 import logging
 import re
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import ulid as _ulid_mod
 from pydantic import ValidationError
@@ -88,14 +87,11 @@ def _load_mission_id(feature_dir: Path) -> str | None:
 
     Returns None when meta.json is absent or does not contain
     a ``mission_id`` key (legacy missions pre-dating 3.1.1).
-    Never raises — missing/corrupt meta is a silent degradation.
+    Never raises — missing/corrupt meta is a silent degradation
+    (on_malformed="none" absorbs both missing and malformed to None).
     """
-    try:
-        meta = load_meta(feature_dir)
-    except ValueError:
-        logger.debug("Malformed meta.json in %s; mission_id will be None", feature_dir)
-        return None
-    if not isinstance(meta, dict):
+    meta = load_meta(feature_dir, allow_missing=True, on_malformed="none")
+    if meta is None:
         return None
     raw_id = meta.get("mission_id")
     return str(raw_id) if raw_id else None
@@ -223,19 +219,23 @@ def _derive_from_lane(feature_dir: Path, wp_id: str) -> str:
     explicit ``genesis -> planned`` transition rather than a dropped
     ``planned -> planned`` self-transition.
     """
+    # cast: follow_imports=skip makes _store.read_events/_reducer.reduce return Any
+    # (specify_cli.* boundary); the real signatures return list[StatusEvent] and
+    # StatusSnapshot respectively. Lane(…).value is str but Lane itself is not str —
+    # all casts below are type-only with no behaviour change.
     events = _store.read_events(feature_dir)
     if not events:
-        return Lane.GENESIS
+        return cast(str, Lane.GENESIS)
 
     snapshot = _reducer.reduce(events)
     wp_state = snapshot.work_packages.get(wp_id)
     if wp_state is None:
-        return Lane.GENESIS
+        return cast(str, Lane.GENESIS)
 
-    lane = wp_state.get("lane")
-    if lane is not None:
-        return Lane(lane)
-    return Lane.GENESIS
+    lane_raw: str | None = cast("str | None", wp_state.get("lane"))
+    if lane_raw is not None:
+        return cast(str, Lane(lane_raw))
+    return cast(str, Lane.GENESIS)
 
 
 def _build_done_evidence(evidence: dict[str, Any]) -> DoneEvidence:
@@ -301,13 +301,16 @@ def _infer_implementation_evidence(feature_dir: Path, wp_id: str) -> bool:
 
 
 def _phase1_dual_write_enabled(feature_dir: Path) -> bool:
-    """Return True when this feature explicitly requests phase-1 mirroring."""
-    try:
-        meta = load_meta(feature_dir)
-    except ValueError:
-        logger.warning("Invalid meta.json in %s; skipping phase-1 lane mirror", feature_dir)
-        return False
-    if not isinstance(meta, dict):
+    """Return True when this feature explicitly requests phase-1 mirroring.
+
+    Uses on_malformed="none" so both missing and malformed meta.json degrade
+    to False (non-phase-1) without raising.  A missing-but-logged-warning
+    case for malformed files is preserved by checking the file existence first.
+    """
+    meta = load_meta(feature_dir, allow_missing=True, on_malformed="none")
+    if meta is None:
+        if (feature_dir / "meta.json").exists():
+            logger.warning("Invalid meta.json in %s; skipping phase-1 lane mirror", feature_dir)
         return False
     status_phase = meta.get("status_phase")
     return str(status_phase).strip() == "1"
@@ -382,12 +385,15 @@ def _legacy_alias_collapses_to_current_lane(
 
 
 def _feature_status_lock_root(feature_dir: Path, repo_root: Path | None) -> Path:
-    """Resolve the repo root used for per-feature status locking."""
-    if repo_root is not None:
-        return repo_root
-    if feature_dir.parent.name == KITTY_SPECS_DIR:
-        return feature_dir.parent.parent
-    return feature_dir
+    """Resolve the repo root used for per-feature status locking.
+
+    Thin shim — delegates to the single shared implementation in
+    :func:`specify_cli.workspace.root_resolver.resolve_status_lock_root`
+    (WP02 / SC-002 consolidation).
+    """
+    from specify_cli.workspace.root_resolver import resolve_status_lock_root
+
+    return resolve_status_lock_root(feature_dir, repo_root)
 
 
 def emit_status_transition(  # NOSONAR — central orchestration hub; 15 of 20 params are optional with stable defaults; refactor tracked separately
@@ -525,9 +531,9 @@ def emit_status_transition(  # NOSONAR — central orchestration hub; 15 of 20 p
         if workspace_context is None:
             context_root = repo_root if repo_root is not None else feature_dir
             workspace_context = f"{execution_mode}:{context_root}"
-        if subtasks_complete is None and from_lane == "in_progress" and resolved_lane == "for_review":
+        if subtasks_complete is None and from_lane == Lane.IN_PROGRESS and resolved_lane == Lane.FOR_REVIEW:
             subtasks_complete = _infer_subtasks_complete(feature_dir, wp_id)
-        if implementation_evidence_present is None and from_lane == "in_progress" and resolved_lane == "for_review":
+        if implementation_evidence_present is None and from_lane == Lane.IN_PROGRESS and resolved_lane == Lane.FOR_REVIEW:
             implementation_evidence_present = _infer_implementation_evidence(feature_dir, wp_id)
 
         if _legacy_alias_collapses_to_current_lane(raw_to_lane, resolved_lane, from_lane):

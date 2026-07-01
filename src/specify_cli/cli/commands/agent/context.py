@@ -30,33 +30,62 @@ console = Console()
 
 def _find_feature_directory(
     repo_root: Path,
-    cwd: Path,
+    cwd: Path,  # noqa: ARG001 -- kept for signature compatibility
     explicit_mission: str | None = None,
-    explicit_feature: str | None = None,
 ) -> Path:
-    """Find the mission directory from an explicit mission slug.
+    """Find the mission directory from an explicit mission handle.
 
-    Uses the canonical mission resolver which handles ambiguous numeric-prefix
-    handles, mid8 prefixes, and full ULID forms.
+    Routes through the single read primitive
+    (:func:`specify_cli.missions._read_path_resolver.resolve_mission_read_path`),
+    so a ``--mission <mid8>`` handle resolves to the same directory as the full
+    slug (F-001/F-003/F-004). There is **no silent fallback** to a
+    wrong-but-plausible primary-checkout path: an unresolvable handle raises a
+    structured :class:`ActionContextError` (``FEATURE_CONTEXT_UNRESOLVED``) and
+    an ambiguous handle raises ``MISSION_AMBIGUOUS_SELECTOR`` (C-CTX-4 / C-009).
 
     Args:
         repo_root: Repository root path
         cwd: Current working directory (unused — kept for signature compatibility)
-        explicit_mission: Mission slug provided explicitly (required)
-        explicit_feature: Mission slug provided via hidden --feature alias.
+        explicit_mission: Mission handle provided explicitly (required)
 
     Returns:
         Path to mission directory
 
     Raises:
-        ValueError: If mission slug is not provided or directory doesn't exist.
+        ActionContextError: If no handle is provided, the handle is ambiguous, or
+            it resolves to no existing mission directory (structured error).
     """
-    raw_handle = explicit_mission or explicit_feature
+    from specify_cli.missions._read_path_resolver import (
+        MissionSelectorAmbiguous,
+        StatusReadPathNotFound,
+        resolve_handle_to_read_path,
+    )
+
+    raw_handle = explicit_mission.strip() if explicit_mission else None
     if not raw_handle:
-        raise ValueError("--mission <slug> is required")
-    # resolve_mission_handle calls sys.exit(2) on error; on success returns ResolvedMission.
-    resolved = resolve_mission_handle(raw_handle, repo_root)
-    return resolved.feature_dir
+        raise ActionContextError(
+            "FEATURE_CONTEXT_UNRESOLVED", "--mission <slug> is required"
+        )
+    # WP02/FR-002: the single guarded read-side seam (IC-01) collapses the former
+    # raw-join → load_meta → resolve_mid8 bootstrap. It performs the primary-meta
+    # probe, the sanctioned mid8 cascade, the fail-closed coord gate, and the
+    # existence-gated topology routing internally — and adds the missing
+    # assert_safe_path_segment guard (FR-004) the hand-rolled block lacked.
+    try:
+        feature_dir: Path = resolve_handle_to_read_path(
+            repo_root,
+            raw_handle,
+            require_exists=True,
+        )
+    except MissionSelectorAmbiguous as exc:
+        raise ActionContextError(exc.error_code, str(exc)) from exc
+    except StatusReadPathNotFound as exc:
+        raise ActionContextError(
+            "FEATURE_CONTEXT_UNRESOLVED",
+            f"Mission not found for handle {raw_handle!r}; checked the "
+            f"coordination worktree and the primary checkout. {exc}",
+        ) from exc
+    return feature_dir
 
 
 @app.command(name="resolve")
@@ -72,7 +101,6 @@ def resolve_context(
         ),
     ],
     mission: Annotated[str | None, typer.Option("--mission", help="Mission slug (e.g., '020-my-mission')")] = None,
-    feature: Annotated[str | None, typer.Option("--feature", hidden=True, help="(deprecated) Use --mission")] = None,
     wp_id: Annotated[str | None, typer.Option("--wp-id", help="Work package ID (e.g., WP01)")] = None,
     agent: Annotated[str | None, typer.Option("--agent", help="Agent name for exact command rendering")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output results as JSON")] = False,
@@ -92,7 +120,7 @@ def resolve_context(
                 f"Invalid action '{action}'. Expected one of: {', '.join(ACTION_NAMES)}.",
             )
 
-        raw_handle = mission or feature
+        raw_handle = mission.strip() if mission else None
         if not raw_handle:
             raise ActionContextError("MISSING_MISSION", "--mission <slug> is required")
         mission_resolved = resolve_mission_handle(raw_handle, repo_root, json_mode=json_output)

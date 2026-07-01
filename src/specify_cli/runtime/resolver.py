@@ -19,6 +19,7 @@ import sys
 import warnings
 from functools import lru_cache
 from pathlib import Path
+from typing import Protocol
 
 # Single source of truth for the resolution enum / result dataclass.
 # Re-exported via the charter.resolution facade (which itself re-exports
@@ -46,6 +47,17 @@ from specify_cli.runtime.home import get_kittify_home, get_package_asset_root
 logger = logging.getLogger(__name__)
 
 
+class _CharterTemplateResolver(Protocol):
+    def resolve_command_template_path(self, mission: str, command: str) -> Path | None:
+        ...
+
+    def resolve_content_template_path(self, mission: str, name: str) -> Path | None:
+        ...
+
+    def resolve_mission_config_path(self, mission: str) -> Path | None:
+        ...
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -68,6 +80,11 @@ def _is_global_runtime_configured() -> bool:
 # Module-level flag: ensures the migrate nudge is emitted at most once per
 # CLI invocation (not per resolution call).
 _migrate_nudge_shown = False
+
+
+def _is_json_mode_invocation() -> bool:
+    """Return True when the active CLI invocation requested machine JSON."""
+    return "--json" in sys.argv[1:]
 
 
 def _warn_legacy_asset(path: Path) -> None:
@@ -107,6 +124,8 @@ def _emit_migrate_nudge() -> None:
     global _migrate_nudge_shown  # noqa: PLW0603
     if _migrate_nudge_shown:
         return
+    if _is_json_mode_invocation():
+        return
     _migrate_nudge_shown = True
     from specify_cli.paths import render_runtime_path  # noqa: PLC0415
     from specify_cli.runtime.home import get_kittify_home  # noqa: PLC0415
@@ -125,7 +144,7 @@ def _reset_migrate_nudge() -> None:
 
 
 @lru_cache(maxsize=8)
-def _charter_template_resolver_for(missions_root: str):
+def _charter_template_resolver_for(missions_root: str) -> _CharterTemplateResolver:
     """Return a charter template resolver for ``missions_root``.
 
     Kept at the Tier-5 boundary so package-default filesystem access remains
@@ -146,9 +165,11 @@ def _package_default_path(
     """Resolve package defaults through charter's doctrine facade."""
     charter_resolver = _charter_template_resolver_for(str(pkg_missions))
     if subdir == "command-templates":
-        return charter_resolver.resolve_command_template_path(mission, Path(name).stem)
+        resolved = charter_resolver.resolve_command_template_path(mission, Path(name).stem)
+        return resolved if isinstance(resolved, Path) else None
     if subdir == "templates":
-        return charter_resolver.resolve_content_template_path(mission, name)
+        resolved = charter_resolver.resolve_content_template_path(mission, name)
+        return resolved if isinstance(resolved, Path) else None
 
     pkg_path = pkg_missions / mission / subdir / name
     return pkg_path if pkg_path.is_file() else None

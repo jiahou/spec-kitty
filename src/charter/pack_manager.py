@@ -129,6 +129,12 @@ _LAYER_SEGMENTS: tuple[str, ...] = ("built-in", "org", "project")
 _KITTIFY_DIRNAME = ".kittify"
 _CONFIG_FILENAME = "config.yaml"
 _CHARTER_FILENAME = "charter.md"
+_PROJECT_KIND_DIRS: dict[ArtifactKind, str] = {
+    ArtifactKind.DIRECTIVE: "directive",
+    ArtifactKind.TACTIC: "tactic",
+    ArtifactKind.STYLEGUIDE: "styleguide",
+    ArtifactKind.PROCEDURE: "procedure",
+}
 
 
 def _resolve_kind(token: str) -> ArtifactKind | None:
@@ -182,6 +188,24 @@ def _scan_layout_for(kind: ArtifactKind | None) -> tuple[str, str, bool]:
     # The 7 standard artifact kinds: doctrine/<plural>/<layer>/ with the
     # canonical glob from ArtifactKind.
     return (f"doctrine/{kind.plural}", kind.glob_pattern, True)
+
+
+def _resolve_org_layer_dir(root: Path, kind: ArtifactKind, base_dir: str) -> Path:
+    """Resolve the org-layer scan directory, tolerant of flat vs nested layouts.
+
+    FR-013 unifies the charter activation subsystem with runtime, which resolves
+    org packs from the **flat** ``<pack>/<plural>/`` layout
+    (``resolve_org_roots`` → ``DoctrineService``). Flat is therefore the
+    canonical, preferred layout. The legacy nested
+    ``<pack>/doctrine/<plural>/org/`` layout is kept as a fallback so packs that
+    already ship the nested layout keep resolving — a layout-tolerant default,
+    not a hard cutover (post-tasks squad decision; keeps the un-owned nested
+    catalog fixtures green).
+    """
+    flat = root / kind.plural
+    if flat.is_dir():
+        return flat
+    return root / base_dir / "org"
 
 
 def _config_stem(path: Path) -> str:
@@ -431,7 +455,7 @@ class CharterPackManager:
         artifact_id: str,
         *,
         cascade: bool = False,  # noqa: ARG002 — kept for caller API stability
-        layer_roots: dict[str, Path] | None = None,  # noqa: ARG002 — symmetry with activate
+        layer_roots: dict[str, Path] | None = None,
     ) -> ActivationResult:
         """Deactivate ``artifact_id`` for ``kind`` in the project charter pack.
 
@@ -470,6 +494,7 @@ class CharterPackManager:
             If the kind has no explicit activation set (the engine raises this;
             the CLI surfaces the upgrade guidance).
         """
+        del layer_roots  # Accepted for API symmetry with activate(); deactivation ignores external layer maps.
         self._require_kind(kind)
         yaml_key = YAML_KEY_MAP[kind]
 
@@ -536,9 +561,10 @@ class CharterPackManager:
         """Return ``(layer, directory)`` pairs to scan for *kind_token*.
 
         The built-in layer is rooted under the installed doctrine package
-        (``src/doctrine``). Org/project roots are supplied **as data** (C-008):
-        each value in *layer_roots* is the doctrine root for that layer, and the
-        kind's base dir is resolved beneath it. Non-existent directories are
+        (``src/doctrine``). Org/project roots are supplied **as data** (C-008).
+        Org roots use the pack layout ``doctrine/<plural>/org``. Project roots
+        use the live project overlay layout ``doctrine/<singular>`` for kinds
+        synthesized into ``.kittify/doctrine``. Non-existent directories are
         skipped so a layer that is simply not present contributes nothing.
         """
         kind = _resolve_kind(kind_token)
@@ -552,7 +578,12 @@ class CharterPackManager:
             root = roots.get(layer)
             if root is None:
                 continue
-            if layered:
+            if layered and layer == "project" and kind is not None:
+                kind_dir = _PROJECT_KIND_DIRS.get(kind, kind.plural)
+                candidate = root / "doctrine" / kind_dir
+            elif layered and layer == "org" and kind is not None:
+                candidate = _resolve_org_layer_dir(root, kind, base_dir)
+            elif layered:
                 candidate = root / base_dir / layer
             elif layer == "built-in":
                 # Flat-directory kinds (mission-type / step contracts) only have

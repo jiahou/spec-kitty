@@ -1,3 +1,11 @@
+---
+title: 'Status Model: Operator Documentation'
+description: 'Operator reference for the Spec Kitty status model: the append-only event-log lane state machine, the canonical --mission selector, and mission_id ULID identity.'
+doc_status: active
+updated: '2026-06-27'
+related:
+- docs/migration/mission-id-canonical-identity.md
+---
 # Status Model: Operator Documentation
 
 **Feature**: 034-feature-status-state-model-remediation
@@ -5,7 +13,11 @@
 
 **Terminology note**
 - Canonical 2.x model: `Mission Type -> Mission -> Mission Run`
-- Status commands now use `--mission` as the canonical tracked-mission selector. Legacy `--feature` remains a hidden deprecated alias for compatibility only.
+- Status commands now use `--mission` as the canonical tracked-mission selector.
+  As of 3.2.x (#1060-A), `spec-kitty agent status ...` no longer accepts the
+  legacy `--feature` alias. As of this release (#1060), the `--feature` alias
+  has been hard-removed from all user-facing commands; passing `--feature` yields
+  exit code 2. Use `--mission` on all commands.
 - As of mission `083-mission-id-canonical-identity-migration`, a mission's canonical machine identity is `mission_id` (a ULID). The `--mission` flag accepts `mission_id`, `mid8` (first 8 chars of the ULID), or `mission_slug`. The numeric prefix in slug examples below (e.g. `034-feature-name`) is display-only metadata — the event log's aggregate key is `mission_id`, not the prefix. See the [mission identity migration runbook](migration/mission-id-canonical-identity.md).
 
 ## Overview
@@ -357,3 +369,25 @@ kitty-specs/<feature>/
 **"No event log found"**: Run `spec-kitty agent status migrate --mission <slug>` to bootstrap from existing frontmatter state.
 
 **Stale claims reported by doctor**: Either continue work on the WP or release the claim by moving it back to `planned` (requires reason).
+
+### Pre-3.0 layout rejection
+
+Active `spec-kitty` commands (task, status, acceptance) require a post-3.0
+project layout — flat `tasks/WP*.md` files and `status.events.jsonl` as the
+status source of truth. Commands that encounter a pre-3.0 lane-directory layout
+(`tasks/planned/`, `tasks/doing/`, `tasks/for_review/`, `tasks/done/`
+containing `.md` files) will refuse to proceed:
+
+```
+Pre-3.0 layout detected (tasks/planned/ directories or frontmatter lane state).
+Run `spec-kitty upgrade` to migrate before continuing.
+```
+
+**Migration path**: Run `spec-kitty upgrade` (or
+`spec-kitty upgrade --migration 0.9.0_frontmatter_only_lanes`) to move WP
+files from lane subdirectories to flat `tasks/`. After upgrade, all active
+commands will work normally.
+
+The `lane` frontmatter field is historical/migration-only and is not written
+or read by any active command. Status is tracked exclusively through
+`status.events.jsonl`.

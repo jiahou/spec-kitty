@@ -14,14 +14,18 @@ Strategy note (FR-006, FR-007):
 
 from __future__ import annotations
 
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_mission
+from mission_runtime import MissionArtifactKind
+from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
 import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from specify_cli.lanes.branch_naming import lane_branch_name
+from specify_cli.git.ref_advance import advance_branch_ref
+from specify_cli.status import COORD_OWNED_STATUS_FILES
+from specify_cli.lanes._git import branch_exists as _shared_branch_exists
+from specify_cli.lanes.branch_naming import lane_branch_name, worktree_path as _worktree_path
 from specify_cli.lanes.models import ExecutionLane, LanesManifest
 from specify_cli.lanes.persistence import read_lanes_json
 from specify_cli.lanes.stale_check import StaleCheckResult, check_lane_staleness
@@ -62,7 +66,12 @@ def _resolve_lane_manifest(
     """Return the provided manifest or load it from disk."""
     if lanes_manifest is not None:
         return lanes_manifest
-    feature_dir = resolve_feature_dir_for_mission(repo_root, mission_slug)
+    # FR-001 (#2185): ``lanes.json`` is LANE_STATE (PRIMARY-partition) — it lives
+    # ONLY on the PRIMARY checkout post-#2106. The coord-aware resolver lands on
+    # the STATUS-only ``-coord`` husk (no lanes.json), so route by kind.
+    feature_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+    )
     return read_lanes_json(feature_dir)
 
 
@@ -77,8 +86,8 @@ def _try_auto_rebase_if_stale(
     """If the lane is stale and a worktree exists, attempt auto-rebase and recheck."""
     if not stale.is_stale:
         return stale
-    worktree_path = (
-        repo_root / ".worktrees" / f"{mission_slug}-{lane.lane_id}"
+    worktree_path = _worktree_path(
+        repo_root, mission_slug, mission_id=None, lane_id=lane.lane_id
     )
     if not worktree_path.exists():
         return stale
@@ -192,7 +201,10 @@ def merge_mission_to_target(
         MissionMergeResult with success/error status.
     """
     if lanes_manifest is None:
-        feature_dir = resolve_feature_dir_for_mission(repo_root, mission_slug)
+        # FR-001 (#2185): LANE_STATE read — PRIMARY-partition (see above).
+        feature_dir = resolve_planning_read_dir(
+            repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+        )
         lanes_manifest = read_lanes_json(feature_dir)
         if lanes_manifest is None:
             return MissionMergeResult(
@@ -243,11 +255,10 @@ def merge_mission_to_target(
 
 
 def _branch_exists(repo_root: Path, branch: str) -> bool:
-    result = subprocess.run(
-        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
-        cwd=str(repo_root), capture_output=True, text=True,
-    )
-    return result.returncode == 0
+    # Routes the existence check through the shared lanes/_git helper while
+    # preserving the merge pipeline's single env authority (_make_merge_env);
+    # the env composes through rather than forking the helper (#1904).
+    return bool(_shared_branch_exists(repo_root, branch, env=_make_merge_env()))
 
 
 def _git_config_get(repo_root: Path, key: str) -> str | None:
@@ -257,6 +268,7 @@ def _git_config_get(repo_root: Path, key: str) -> str | None:
         cwd=str(repo_root),
         capture_output=True,
         text=True,
+        env=_make_merge_env(),
     )
     if result.returncode != 0:
         return None
@@ -281,6 +293,7 @@ def _ensure_event_log_merge_driver_config(repo_root: Path) -> None:
             capture_output=True,
             text=True,
             check=True,
+            env=_make_merge_env(),
         )
     if _git_config_get(repo_root, "merge.spec-kitty-event-log.driver") != _EVENT_LOG_DRIVER_COMMAND:
         subprocess.run(
@@ -289,13 +302,32 @@ def _ensure_event_log_merge_driver_config(repo_root: Path) -> None:
             capture_output=True,
             text=True,
             check=True,
+            env=_make_merge_env(),
         )
+
+
+def _make_merge_env() -> dict[str, str]:
+    """Single environment authority for the lane-merge pipeline (AC-F1).
+
+    Prepends the current venv's bin directory to PATH so that git's merge
+    driver invocation of ``spec-kitty merge-driver-event-log`` resolves to the
+    same spec-kitty binary that is currently running, not a stale global one.
+
+    Every subprocess invocation in this module routes its ``env`` through
+    this helper — no inline ``os.environ`` copies with ad-hoc PATH/GIT_*
+    mutations (FR-008b; ratchet in
+    ``tests/architectural/test_merge_pipeline_ratchets.py``).
+    """
+    venv_bin = str(Path(sys.executable).parent)
+    env = os.environ.copy()
+    env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
+    return env
 
 
 def _rev_parse(repo_root: Path, ref: str) -> str | None:
     result = subprocess.run(
         ["git", "rev-parse", ref],
-        cwd=str(repo_root), capture_output=True, text=True,
+        cwd=str(repo_root), capture_output=True, text=True, env=_make_merge_env(),
     )
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -329,12 +361,8 @@ def _merge_branch_into(
     tmp_dir = tempfile.mkdtemp(prefix="kitty-merge-")
     tmp_path = Path(tmp_dir)
 
-    # Prepend the current venv's bin directory to PATH so that git's merge
-    # driver invocation of `spec-kitty merge-driver-event-log` resolves to the
-    # same spec-kitty binary that is currently running, not a stale global one.
-    _venv_bin = str(Path(sys.executable).parent)
-    _env = os.environ.copy()
-    _env["PATH"] = _venv_bin + os.pathsep + _env.get("PATH", "")
+    # Single environment authority for the lane-merge pipeline (AC-F1).
+    _env = _make_merge_env()
 
     try:
         _ensure_event_log_merge_driver_config(repo_root)
@@ -435,16 +463,17 @@ def _merge_branch_into(
                 ["git", "rev-parse", "HEAD"],
                 cwd=str(tmp_path), capture_output=True, text=True, check=True, env=_env,
             ).stdout.strip()
-            # Fast-forward the target branch to the rebased tip.
-            result = subprocess.run(
-                ["git", "update-ref", f"refs/heads/{target_branch}", rebased_sha],
-                cwd=str(repo_root), capture_output=True, text=True, env=_env,
+            # Fast-forward the target branch to the rebased tip, resyncing any
+            # worktree that has target_branch checked out (#1826 / AC-B2).
+            # Coordination status residue is excluded from the dirty gate via
+            # the single residue authority (FR-012 / #1878).
+            advance_branch_ref(
+                repo_root,
+                target_branch,
+                rebased_sha,
+                env=_env,
+                coord_owned_filenames=COORD_OWNED_STATUS_FILES,
             )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Failed to fast-forward {target_branch} after rebase: "
-                    f"{result.stderr.strip()}"
-                )
             return True  # early return — ref already updated
         else:
             # MERGE strategy (default for lane→mission): no-ff merge commit.
@@ -469,15 +498,17 @@ def _merge_branch_into(
             cwd=str(tmp_path), capture_output=True, text=True, check=True, env=_env,
         ).stdout.strip()
 
-        # Update the target branch ref to point to the merge commit.
-        result = subprocess.run(
-            ["git", "update-ref", f"refs/heads/{target_branch}", merge_commit],
-            cwd=str(repo_root), capture_output=True, text=True, env=_env,
+        # Update the target branch ref to point to the merge commit, resyncing
+        # any worktree that has target_branch checked out (#1826 / AC-B2).
+        # Coordination status residue is excluded from the dirty gate via the
+        # single residue authority (FR-012 / #1878).
+        advance_branch_ref(
+            repo_root,
+            target_branch,
+            merge_commit,
+            env=_env,
+            coord_owned_filenames=COORD_OWNED_STATUS_FILES,
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to update {target_branch} ref: {result.stderr.strip()}"
-            )
         return True
     finally:
         subprocess.run(

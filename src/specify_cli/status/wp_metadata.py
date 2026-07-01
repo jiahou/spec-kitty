@@ -219,6 +219,15 @@ class WPMetadata(BaseModel):
     # ── Optional: execution context ────────────────────────────
     execution_mode: str | None = None
     owned_files: list[str] = Field(default_factory=list)
+    create_intent: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Paths in owned_files that are planned-new-file entries "
+            "(not yet created). A zero-match for these paths is expected "
+            "and suppresses the hard-error that literal-path zero-match "
+            "would otherwise raise. See FR-006 (issue #1886)."
+        ),
+    )
     authoritative_surface: str | None = None
     scope: str | None = Field(
         default=None,
@@ -328,7 +337,9 @@ class WPMetadata(BaseModel):
     @field_validator("base_commit")
     @classmethod
     def validate_base_commit(cls, v: str | None) -> str | None:
-        if v is not None and not re.match(r"^[0-9a-f]{7,40}$", v):
+        if v is None or v == "unknown":
+            return None
+        if not re.match(r"^[0-9a-f]{7,40}$", v):
             raise ValueError(f"Invalid base_commit: {v!r} (must be hex SHA)")
         return v
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from specify_cli.core.dependency_graph import build_dependency_graph, topological_sort
 from specify_cli.core.paths import get_main_repo_root, get_feature_target_branch
 from specify_cli.mission_metadata import mission_identity_fields, resolve_mission_identity
-from specify_cli.status import CanonicalStatusNotFoundError, get_wp_lane
+from specify_cli.status import CanonicalStatusNotFoundError, get_wp_lane, LEGACY_UNINITIALIZED_SENTINEL
 from specify_cli.workspace.context import get_normalized_wp, resolve_workspace_for_wp
 
 
@@ -78,7 +78,7 @@ def _read_canonical_lane_or_default(feature_dir: Path, wp_id: str) -> str:
         return "planned"
     except Exception:
         return "planned"
-    if lane == "uninitialized":
+    if lane == LEGACY_UNINITIALIZED_SENTINEL:
         return "planned"
     return str(lane)
 
@@ -129,13 +129,22 @@ def _planning_claim_commit(repo_root: Path, wp_path: Path, wp_id: str) -> str | 
 
 def materialize_worktree_topology(repo_root: Path, mission_slug: str) -> FeatureTopology:
     """Gather the full lane worktree topology for a feature."""
+    from mission_runtime import MissionArtifactKind
     from specify_cli.lanes.branch_naming import lane_branch_name
     from specify_cli.lanes.persistence import read_lanes_json
-    from specify_cli.missions.feature_dir_resolver import candidate_feature_dir_for_mission
+    from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
 
     main_repo_root = get_main_repo_root(repo_root)
     target_branch = get_feature_target_branch(main_repo_root, mission_slug)
-    feature_dir = candidate_feature_dir_for_mission(main_repo_root, mission_slug)
+    # FR-001 (#2185): a single PRIMARY read dir co-resolves all three legs — the
+    # identity meta.json (PRIMARY_METADATA), lanes.json (LANE_STATE), and the
+    # tasks/ dependency graph (WORK_PACKAGE_TASK) are all PRIMARY-partition kinds
+    # that resolve topology-blind to the PRIMARY checkout. The coord-aware resolver
+    # would land on the STATUS-only ``-coord`` husk (no meta/lanes/tasks), yielding
+    # a sentinel identity and an empty topology.
+    feature_dir = resolve_planning_read_dir(
+        main_repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+    )
     identity = resolve_mission_identity(feature_dir)
     lanes_manifest = read_lanes_json(feature_dir)
     graph = build_dependency_graph(feature_dir)

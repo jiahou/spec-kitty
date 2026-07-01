@@ -31,20 +31,31 @@ test_no_dead_modules:
   # wp-lane-state-machine-fsm): upstream #1756 added m_3_3_0_session_presence_all_harnesses
   # and m_3_3_0_session_presence_claude_code; both auto-discovered via
   # pkgutil.iter_modules, never statically imported. Growth here is expected/routine.
-  category_1_auto_discovered_migrations: 83  # justification: +1 (82->83) for m_3_3_0_op_record_schema_v2 (do-dispatch-open-op-lifecycle-01KTSJ2H WP05 Op record schema v2 migration; auto-discovered via pkgutil.iter_modules, never statically imported); growth is expected/routine for this category.
+  category_1_auto_discovered_migrations: 87  # justification: +1 (86->87): m_3_2_0rc45_retire_standalone_skill_surface is an auto-discovered migration loaded via pkgutil.iter_modules, never statically imported.
   # justification: 3 schema generator modules consumed by
   # scripts/generate_schemas.py via importlib.import_module.
   # Shrunk from 4 → 3 when doctrine.missions.models gained a live
   # src/ caller via MissionTypeRepository (WP14 mission-type commands).
-  category_2_build_schema_generators: 3
-  # justification: 4 external/CLI entry points invoked outside the
-  # spec-kitty import graph (commit_guard_hook + 3 task helpers).
-  category_3_external_cli_entrypoints: 4
+  # 3 -> 4 (common-docs-consolidation post-merge remediation): added
+  # doctrine.directives.common_docs, a constant module (COMMON_DOCS_DIRECTIVE_ID,
+  # the Common Docs directive-id SSOT) consumed by
+  # scripts/docs/anti_sprawl_ratchet.py -- wired from scripts/, not src/, the
+  # same "build-script-consumed" pattern as the schema generators.
+  category_2_build_schema_generators: 4  # justification: doctrine.directives.common_docs consumed from scripts/docs, not src/
+  # justification: 1 external/CLI entry point invoked outside the
+  # spec-kitty import graph (commit_guard_hook). Shrunk from 4 by
+  # retire-standalone-tasks-cli WP04 (FR-007): the 3 standalone-tasks-surface
+  # module entries dropped with the deleted surface (shrink — burn-down ok).
+  category_3_external_cli_entrypoints: 1
   # justification: 8 documented backward-compat shim modules whose
-  # absence of static src/ callers is the point.
+  # absence of static src/ callers is the point. (#2048 retired dead shim
+  # specify_cli.mission_read_path: zero src callers after 01KVJPEQ re-pointed the
+  # last production importer to the canonical resolve_handle_to_read_path seam.
+  # Reverses the 01KVJPEQ 8->9 bump and restores the SHRINK trend; live
+  # _CATEGORY_4_BACKCOMPAT_SHIMS size is now 8.)
   category_4_backcompat_shims: 8
   # justification: 3 compat-shim WP-in-flight adapters.
-  category_5_wp_in_flight_adapters: 3  # justification: specify_cli.compat._adapters.{detector,gate,version_checker}; doctrine.missions.mission_step_repository wired in charter-pack-activation-layer-01KSYE4V (removed)
+  category_5_wp_in_flight_adapters: 0  # emptied: the 3 dead compat._adapters shim modules deleted (salvaged from closed #2159/#2049)
   # justification: 3 frozen-contract internal re-exports under
   # next/_internal_runtime/ frozen by shared-package-boundary-cutover.
   category_6_frozen_runtime_reexports: 3
@@ -53,7 +64,14 @@ test_no_dead_modules:
   # glossary.prompts, glossary.rendering)
   # bringing the live size to 7. Per C-006 this category MUST shrink
   # by >= 2 entries per major release; target = 0 by 4.0.
-  category_7_grandfathered_orphans: 7
+  # Lowered 7 -> 6 to lock in observed shrinkage (one further orphan removed).
+  # #2082 FR-011 burn-down LANDED: WP08 wired override_policy's three governance
+  # predicates into the `spec-kitty doctor doctrine` runtime caller
+  # (specify_cli.cli.commands._doctrine_collect), so the module now has a real
+  # src/ caller and is no longer an orphan; WP09 narrowed its __all__ to those
+  # three live functions and retired the doctrine.drg.override_policy allowlist
+  # entry. Re-lowered 7 -> 6, reversing the prior deliberate bump.
+  category_7_grandfathered_orphans: 6
 
 # tests/architectural/test_migration_chain_integrity.py
 test_migration_chain_integrity:
@@ -86,21 +104,37 @@ test_compat_shims:
   # justification: 3 pure-shim adapter files under
   # src/specify_cli/compat/_adapters/. Per C-006 this MUST shrink to
   # 0 by 4.0 (the compat-planner mission is the burn-down owner).
-  pure_shim_files: 3
+  pure_shim_files: 0  # the 3 pure-shim adapter files deleted (closed #2159/#2049)
 
 # tests/contract/test_example_round_trip.py
 # Populated by WP03 after the legacy-contract-allowlist discovery
 # sweep. WP01 pins this at 0 so the meta-test can run; WP03 edits
 # upward only if the sweep finds legitimately-excluded contracts.
 test_example_round_trip:
-  # justification: WP03 discovery sweep found 151 contracts from missions
-  # predating the Slice F frontmatter convention. These are allowlisted
-  # per FR-141 so they warn instead of failing. +1 for T031 (#1301):
-  # spec-kitty-3-2-docs-01KS4KSZ/contracts/check_docs_freshness.md carries a
-  # CI-wiring YAML snippet (not a Pydantic model payload). The baseline
-  # participates in the burn-down policy (C-004): it MUST shrink as legacy
-  # missions backfill the ``# pydantic_model:`` / ``# expect:`` frontmatter.
-  legacy_contract_allowlist: 152
+  # justification: 151 contracts from missions PREDATING the Slice F frontmatter
+  # convention. These are allowlisted file-level per FR-141 so they warn instead
+  # of failing. This set is *only* pre-Slice-F legacy debt and participates in the
+  # burn-down policy (C-004): it MUST shrink as legacy missions backfill the
+  # ``# pydantic_model:`` / ``# expect:`` frontmatter.
+  #
+  # Post-Slice-F files that are simply non-executable (CI-wiring snippets,
+  # ``.kittify/config.yaml`` shape sketches, non-Pydantic operator config) do NOT
+  # belong here. Per #2255 they carry a per-block ``# round-trip: skip: <reason>``
+  # marker instead (block-level discovery in test_example_round_trip.py). That
+  # migration moved check_docs_freshness.md (the former T031 +1) out of this set,
+  # so the count drops 152 -> 151.
+  legacy_contract_allowlist: 151
+  # justification: count of permanently-non-executable ``# round-trip: skip:``
+  # blocks in NON-legacy contracts (#2255). Unlike the legacy allowlist above,
+  # these are legitimate permanent exemptions (shape sketches, CI snippets,
+  # non-Pydantic operator config) with NO shrink mandate — this baseline exists
+  # so that ADDING a new skip is explicit and reviewable: a new marker grows the
+  # count above this baseline and fails test_ratchet_baselines until the value is
+  # bumped here with a one-line rationale naming the new block. The 5 seed entries
+  # are config-schema-delta.md, protection-config.md, check_docs_freshness.md, and
+  # the two Slice F convention contracts (contract-round-trip-frontmatter.md,
+  # org-drg-schema.md).
+  skip_marker_blocks: 5
 
 # tests/architectural/test_all_declarations_required.py
 # Populated by WP02 after the charter/kernel __all__ sweep. WP01
@@ -135,7 +169,16 @@ test_no_dead_symbols:
   # status.lifecycle_events::{mission_event_log_path,read_lifecycle_events},
   # and the two events.py re-exports SignificanceEvaluatedPayload /
   # TimeoutExpiredPayload dropped from __all__ while keeping imports).
-  category_b_grandfathered_legacy: 271
+  # 286->237 (retire-standalone-tasks-cli WP04, FR-007 + Boy Scout): the
+  # standalone tasks surface was deleted, dropping the 13
+  # ``scripts.tasks.acceptance_support::*`` and 21 ``scripts.tasks.task_helpers::*``
+  # grandfathered entries. The same touch also sheds two now-LIVE entries that
+  # WP03's reconciliation left stale — ``specify_cli.acceptance::ArtifactEncodingError``
+  # and ``::normalize_feature_encoding`` gained callers via the canonical-home
+  # move, so the dead-symbol gate correctly demanded their removal. Recomputed to
+  # the live ``len(_CATEGORY_B_GRANDFATHERED_LEGACY)``; a shrink (burn-down policy:
+  # a shrink needs no extra workflow).
+  category_b_grandfathered_legacy: 237
   # 6->4 (org-doctrine close-out WP04): removed the now-wired
   # charter.invocation_context::{OperationalContext,build_operational_context}
   # (WP14 added live src/ callers). Remaining 4: the two require_active_*
@@ -158,9 +201,8 @@ test_no_dead_symbols:
   # charter.template_catalog facade landed (the 4 doctrine.template_catalog
   # accessors remain genuinely unimported). Tracker: WP06/T021 (DIRECTIVE_013).
   category_c_org_doctrine_closeout: 15
-  # justification: 5 pre-existing upstream specify_cli.coordination.status_service
-  # public symbols (landed on upstream/main via #1614, no live caller there);
-  # surfaced in the close-out branch via the upstream rebase. NOT this mission's
-  # code; allowlisted-with-tracker so the gate is GREEN. Tracker (DIRECTIVE_013):
-  # Priivacy-ai/spec-kitty#1622 (wire or prune; then shrink this baseline).
-  category_c_upstream_status_service: 5
+  # category_c_upstream_status_service removed by execution-context-unification
+  # WP09 (#1622/#391): the 2 truly-dead functions (append_event_log_batch,
+  # read_wp_lane_actor) were deleted and the 3 internally-used types
+  # (EventLogWriteTarget, StatusContractError, StatusReadSource) were
+  # de-exported from status_service.__all__, so the baseline is now 0.

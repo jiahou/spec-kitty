@@ -20,8 +20,7 @@ from specify_cli.ownership.validation import (
 from specify_cli.status.wp_metadata import WPMetadata
 
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 def _manifest(
     mode: ExecutionMode = ExecutionMode.CODE_CHANGE,
     owned: tuple[str, ...] = ("src/foo/**",),
@@ -79,6 +78,65 @@ class TestValidateNoOverlap:
     def test_empty_manifests_no_overlap(self) -> None:
         errors = validate_no_overlap({})
         assert errors == []
+
+
+class TestValidateNoOverlapSequential:
+    """Dependency-aware overlap: same-lane sequential WPs may share owned_files.
+
+    Captures the #2017-class guard bug — a linearized refactor chain (WPs with a
+    directed dependency path between them) runs in one worktree, in order, never
+    concurrently, so sharing owned_files is legitimate. The no-overlap guard must
+    bind only *concurrent* (dependency-unordered / parallel-lane) WPs.
+    """
+
+    def test_sequential_pair_with_dependency_allows_overlap(self) -> None:
+        # WP02 depends on WP01 → strictly sequential → identical owned_files is OK.
+        manifests = {
+            "WP01": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+            "WP02": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+        }
+        errors = validate_no_overlap(manifests, {"WP02": ["WP01"]})
+        assert errors == []
+
+    def test_transitive_sequential_allows_overlap(self) -> None:
+        # WP03→WP02→WP01: WP01 and WP03 share files but are transitively ordered.
+        manifests = {
+            "WP01": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+            "WP02": _manifest(owned=("src/bar/**",), surface="src/bar/"),
+            "WP03": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+        }
+        deps = {"WP02": ["WP01"], "WP03": ["WP02"]}
+        errors = validate_no_overlap(manifests, deps)
+        assert errors == []
+
+    def test_concurrent_pair_still_errors_with_deps(self) -> None:
+        # WP01 and WP02 overlap but have NO dependency path → concurrent → ERROR.
+        manifests = {
+            "WP01": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+            "WP02": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+            "WP03": _manifest(owned=("src/bar/**",), surface="src/bar/"),
+        }
+        # WP03 depends on both, but WP01/WP02 are siblings (no path between them).
+        deps = {"WP03": ["WP01", "WP02"]}
+        errors = validate_no_overlap(manifests, deps)
+        assert len(errors) == 1
+        assert "WP01" in errors[0] and "WP02" in errors[0]
+
+    def test_no_deps_preserves_legacy_all_pairs_behavior(self) -> None:
+        manifests = {
+            "WP01": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+            "WP02": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+        }
+        # dependencies=None → legacy all-pairs overlap detection.
+        assert len(validate_no_overlap(manifests, None)) == 1
+
+    def test_validate_all_threads_dependencies(self) -> None:
+        manifests = {
+            "WP01": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+            "WP02": _manifest(owned=("src/foo/**",), surface="src/foo/"),
+        }
+        result = validate_all(manifests, {"WP02": ["WP01"]})
+        assert result.passed, result.errors
 
 
 # ---------------------------------------------------------------------------
@@ -247,17 +305,19 @@ class TestValidateAll:
 
 class TestValidateGlobMatches:
     def test_nonexistent_glob_emits_warning(self, tmp_path: Path) -> None:
-        """A glob that matches no files must produce a warning."""
+        """A zero-match glob pattern must produce a warning (not a hard error)."""
         manifests = {
             "WP01": _manifest(
                 owned=("nonexistent_dir/**",),
                 surface="nonexistent_dir/",
             ),
         }
-        warnings = validate_glob_matches(manifests, tmp_path)
-        assert len(warnings) == 1
-        assert "WP01" in warnings[0]
-        assert "nonexistent_dir/**" in warnings[0]
+        result = validate_glob_matches(manifests, tmp_path)
+        # Glob patterns are soft warnings — command still passes
+        assert result.passed, f"Glob zero-match should not be a hard error: {result.errors}"
+        assert len(result.warnings) == 1
+        assert "WP01" in result.warnings[0]
+        assert "nonexistent_dir/**" in result.warnings[0]
 
     def test_existing_glob_no_warning(self, tmp_path: Path) -> None:
         """A glob that matches at least one file must produce no warning."""
@@ -269,8 +329,10 @@ class TestValidateGlobMatches:
         manifests = {
             "WP01": _manifest(owned=("src/**",), surface="src/"),
         }
-        warnings = validate_glob_matches(manifests, tmp_path)
-        assert warnings == []
+        result = validate_glob_matches(manifests, tmp_path)
+        assert result.passed
+        assert result.warnings == []
+        assert result.errors == []
 
     def test_multiple_globs_one_missing_warns(self, tmp_path: Path) -> None:
         """Only the missing glob gets a warning; existing one is fine."""
@@ -285,13 +347,16 @@ class TestValidateGlobMatches:
                 authoritative_surface="src/",
             ),
         }
-        warnings = validate_glob_matches(manifests, tmp_path)
-        assert len(warnings) == 1
-        assert "missing_path/**" in warnings[0]
+        result = validate_glob_matches(manifests, tmp_path)
+        assert result.passed  # glob warnings don't fail passed
+        assert len(result.warnings) == 1
+        assert "missing_path/**" in result.warnings[0]
 
     def test_empty_manifests_no_warnings(self, tmp_path: Path) -> None:
-        warnings = validate_glob_matches({}, tmp_path)
-        assert warnings == []
+        result = validate_glob_matches({}, tmp_path)
+        assert result.passed
+        assert result.warnings == []
+        assert result.errors == []
 
     def test_warnings_sorted_by_wp_id(self, tmp_path: Path) -> None:
         """Warnings are emitted in sorted WP ID order."""
@@ -299,10 +364,47 @@ class TestValidateGlobMatches:
             "WP02": _manifest(owned=("miss_b/**",), surface="miss_b/"),
             "WP01": _manifest(owned=("miss_a/**",), surface="miss_a/"),
         }
-        warnings = validate_glob_matches(manifests, tmp_path)
-        assert len(warnings) == 2
-        assert warnings[0].startswith("WP01")
-        assert warnings[1].startswith("WP02")
+        result = validate_glob_matches(manifests, tmp_path)
+        assert result.passed
+        assert len(result.warnings) == 2
+        assert result.warnings[0].startswith("WP01")
+        assert result.warnings[1].startswith("WP02")
+
+    def test_literal_zero_match_error_hints_create_intent(self, tmp_path: Path) -> None:
+        """Regression for issue #1982.
+
+        A literal owned_files path that matches zero files must produce an error
+        message containing a YAML-format create_intent snippet so agents can
+        self-recover without consulting documentation.
+
+        The assertion checks for the YAML-list syntax form which is absent in
+        the pre-fix message ("add it to 'create_intent' in the WP frontmatter")
+        and present only after the fix adds the inline YAML fragment.
+        """
+        absent_path = "src/specify_cli/new_planned_module.py"
+        manifests = {
+            "WP01": OwnershipManifest(
+                owned_files=(absent_path,),
+                authoritative_surface="src/specify_cli/",
+                execution_mode=ExecutionMode.CODE_CHANGE,
+            )
+        }
+
+        result = validate_glob_matches(manifests, tmp_path)
+
+        assert not result.passed, "Expected validation to fail for absent literal path"
+        assert result.errors, "Expected at least one error message"
+        error_text = result.errors[0]
+        # Assert YAML-list syntax — absent in pre-fix message, present only after the fix.
+        # Pre-fix: "add it to 'create_intent' in the WP frontmatter."
+        # Post-fix: "declare it in the WP frontmatter:\n  create_intent:\n    - <path>"
+        assert "  create_intent:\n    -" in error_text, (
+            f"Error must contain YAML snippet '  create_intent:\\n    -' (absent in pre-fix "
+            f"message). Got: {error_text!r}"
+        )
+        assert absent_path in error_text, (
+            f"Error message must include the offending path '{absent_path}'. Got: {error_text!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

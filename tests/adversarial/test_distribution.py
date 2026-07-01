@@ -190,10 +190,6 @@ class TestInitWithoutTemplateRoot:
 class TestUpgradeWithAllMissions:
     """Test upgrade command updates templates from package."""
 
-    @pytest.mark.xfail(
-        reason="spec-kitty init still prompts for agent strategy even with --ai/--script/--mission flags (issue #TBD)",
-        strict=False,
-    )
     def test_upgrade_updates_templates(self, installed_venv: Path, tmp_path: Path) -> None:
         """spec-kitty upgrade should update templates from packaged source."""
         project_dir = tmp_path / "upgrade-project"

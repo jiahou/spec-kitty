@@ -11,9 +11,8 @@ import typer
 from rich.panel import Panel
 from rich.table import Table
 
-from specify_cli.cli.selector_resolution import resolve_selector
 from specify_cli.cli.helpers import console, get_project_root_or_exit
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_slug
+from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
 from specify_cli.task_metadata_validation import (
     repair_lane_mismatch,
     scan_all_tasks_for_mismatches,
@@ -21,12 +20,17 @@ from specify_cli.task_metadata_validation import (
 from specify_cli.task_utils import TaskCliError, find_repo_root
 
 
+def _normalize_mission_option(value: object) -> str | None:
+    """Return a stripped mission selector, treating Typer sentinels as unset."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def validate_tasks(
     mission: str | None = typer.Option(
         None, "--mission", help="Mission slug to validate"
-    ),
-    feature: str | None = typer.Option(
-        None, "--feature", hidden=True, help="(deprecated) Use --mission"
     ),
     fix: bool = typer.Option(False, "--fix", help="Automatically repair metadata inconsistencies"),
     check_all: bool = typer.Option(False, "--all", help="Check all features, not just one"),
@@ -102,30 +106,29 @@ def validate_tasks(
         raise typer.Exit(0 if total_mismatches == 0 or fix else 1)
 
     # Validate single feature
-    try:
-        mission_slug = resolve_selector(
-            canonical_value=mission,
-            canonical_flag="--mission",
-            alias_value=feature,
-            alias_flag="--feature",
-            suppress_env_var="SPEC_KITTY_SUPPRESS_FEATURE_DEPRECATION",
-            command_hint="--mission <slug>",
-        ).canonical_value
-    except typer.BadParameter as exc:
-        console.print(f"[red]Error:[/red] {exc}")
-        raise typer.Exit(1) from exc
+    mission_slug = _normalize_mission_option(mission)
+    if mission_slug is None:
+        console.print("[red]Error:[/red] --mission <slug> is required (or use --all)")
+        raise typer.Exit(1)
+    # FR-009 / single-leg PRIMARY (T028).
+    # scan_all_tasks_for_mismatches reads WP-frontmatter from tasks/planned|doing|…/WP*.md
+    # (WORK_PACKAGE_TASK partition).  Before this fix, the coord-aware resolver returned the
+    # STATUS-only husk which carries no tasks/ → silent {} (pre-fix bug).
+    from mission_runtime import MissionArtifactKind  # late import — keeps cold-start cost low
 
-    feature_dir = resolve_feature_dir_for_slug(repo_root, mission_slug)
+    planning_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
 
-    if not feature_dir.exists():
-        console.print(f"[red]Error:[/red] Feature directory not found: {feature_dir}")
+    if not planning_dir.exists():
+        console.print(f"[red]Error:[/red] Feature directory not found: {planning_dir}")
         raise typer.Exit(1)
 
     console.print(f"[cyan]Validating task metadata for feature:[/cyan] {mission_slug}")
     console.print()
 
     mismatches, fixed = _validate_feature_tasks(
-        feature_dir, fix=fix, agent=agent, shell_pid=shell_pid
+        planning_dir, fix=fix, agent=agent, shell_pid=shell_pid
     )
 
     if mismatches == 0:
@@ -143,9 +146,23 @@ def validate_tasks(
 
 
 def _validate_feature_tasks(
-    feature_dir: Path, *, fix: bool, agent: str, shell_pid: str
+    feature_dir: Path,
+    *,
+    fix: bool,
+    agent: str,
+    shell_pid: str,
 ) -> tuple[int, int]:
     """Validate task metadata for a single feature directory.
+
+    Reads WP-frontmatter from the PRIMARY planning surface (tasks/planned|doing|…/WP*.md).
+    This is a single-leg PRIMARY read: the frontmatter ``lane:`` field is compared against
+    the lane-subdir the file lives in; no STATUS leg (status.events.jsonl) is read.
+
+    Args:
+        feature_dir: PRIMARY-partition planning dir (tasks/ frontmatter reads).
+        fix: When True, automatically repair lane mismatches in-place.
+        agent: Agent name written to the activity log on repair.
+        shell_pid: Shell PID written to the activity log on repair.
 
     Returns:
         Tuple of (mismatches_found, mismatches_fixed)

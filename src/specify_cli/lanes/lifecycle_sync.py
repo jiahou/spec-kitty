@@ -8,16 +8,18 @@ from pathlib import Path
 from typing import ClassVar
 
 from specify_cli.lanes.auto_rebase import AutoRebaseReport, attempt_auto_rebase
-from specify_cli.lanes.branch_naming import lane_branch_name
+from specify_cli.lanes.branch_naming import lane_branch_name, worktree_path as _worktree_path
 from specify_cli.lanes.compute import is_planning_lane
 from specify_cli.lanes.models import ExecutionLane
 from specify_cli.lanes.persistence import CorruptLanesError, read_lanes_json
+from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
+from mission_runtime import MissionArtifactKind
 
 LANE_AUTO_REBASE_FAILED = "LANE_AUTO_REBASE_FAILED"
 WORKTREES_DIRNAME = ".worktrees"
 
 
-@dataclass(frozen=True)
+@dataclass
 class LaneAutoRebaseSyncError(RuntimeError):
     """Structured failure for a lane sync-point auto-rebase refusal."""
 
@@ -85,7 +87,7 @@ def _resolve_lane_branch(
     planning_base_branch: str,
     mission_id: str | None,
 ) -> str:
-    candidates = []
+    candidates: list[str] = []
     if mission_id and len(mission_id) >= 8:
         candidates.append(
             lane_branch_name(
@@ -114,7 +116,6 @@ def _resolve_lane_branch(
 def sync_lane_after_coordination_commit(
     *,
     repo_root: Path,
-    feature_dir: Path,
     mission_slug: str,
     wp_id: str,
     coordination_branch: str,
@@ -126,8 +127,19 @@ def sync_lane_after_coordination_commit(
     underlying auto-rebase path aborts failed git merges before this exception
     is raised, so lane worktree state remains at its pre-sync tip.
     """
+    # FR-002 (#2185): ``lanes.json`` is a LANE_STATE (PRIMARY-partition) artifact
+    # that lives ONLY on the PRIMARY checkout post-#2106. The auto-rebase callers
+    # thread the coord-aware STATUS feature dir (the ``-coord`` husk for a
+    # coord-topology mission), which lacks ``lanes.json`` — so trusting that dir
+    # here makes ``read_lanes_json`` return ``None`` and SILENTLY skips the
+    # post-coordination lane auto-rebase. Self-resolve the read by its real kind
+    # so it lands on PRIMARY regardless of topology; the callers' STATUS legs (the
+    # append-only event log) stay coord-aware untouched (C-001).
+    lanes_read_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+    )
     try:
-        lanes_manifest = read_lanes_json(feature_dir)
+        lanes_manifest = read_lanes_json(lanes_read_dir)
     except CorruptLanesError as exc:
         raise LaneAutoRebaseSyncError(
             lane_id="unknown",
@@ -145,16 +157,19 @@ def sync_lane_after_coordination_commit(
     if lane is None or is_planning_lane(lane):
         return None
 
+    _lane_worktree = _worktree_path(
+        repo_root, mission_slug, mission_id=None, lane_id=lane.lane_id
+    )
     lane_branch = _resolve_lane_branch(
         repo_root,
-        repo_root / WORKTREES_DIRNAME / f"{mission_slug}-{lane.lane_id}",
+        _lane_worktree,
         mission_slug,
         lane,
         planning_base_branch=lanes_manifest.target_branch,
         mission_id=lanes_manifest.mission_id,
     )
     coordination_head = _git_stdout(repo_root, "rev-parse", coordination_branch)
-    worktree_path = repo_root / WORKTREES_DIRNAME / f"{mission_slug}-{lane.lane_id}"
+    worktree_path = _lane_worktree
     if not (worktree_path / ".git").exists():
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         add_result = subprocess.run(

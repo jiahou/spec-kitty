@@ -18,6 +18,11 @@ pytestmark = pytest.mark.fast
 accept_module = importlib.import_module("specify_cli.cli.commands.accept")
 dashboard_module = importlib.import_module("specify_cli.cli.commands.dashboard")
 merge_module = importlib.import_module("specify_cli.cli.commands.merge")
+# Mission #2057 relocated target-branch validation into the merge ``preflight``
+# seam; ``_validate_target_branch`` resolves ``run_command`` from that module's
+# namespace, so the dry-run tests patch the seam (the merge shim re-exports
+# ``run_command`` for patch-target stability, but the live call resolves here).
+merge_preflight_module = importlib.import_module("specify_cli.merge.preflight")
 research_module = importlib.import_module("specify_cli.cli.commands.research")
 lifecycle_module = importlib.import_module("specify_cli.cli.commands.lifecycle")
 verify_module = importlib.import_module("specify_cli.cli.commands.verify")
@@ -99,11 +104,13 @@ def test_specify_command_delegates_to_agent_lifecycle(monkeypatch) -> None:
         mission=None,
         mission_type=None,
         json_output: bool = False,
+        topology=None,
     ):
         captured["mission_slug"] = mission_slug
         captured["mission"] = mission
         captured["mission_type"] = mission_type
         captured["json_output"] = json_output
+        captured["topology"] = topology
 
     monkeypatch.setattr(lifecycle_module.agent_feature, "create_mission", fake_create_mission)
     monkeypatch.setattr(lifecycle_module, "assert_initialized", lambda **_kwargs: None)
@@ -131,7 +138,7 @@ def test_plan_and_tasks_delegate_to_agent_lifecycle(monkeypatch) -> None:
     monkeypatch.setattr(lifecycle_module.agent_feature, "finalize_tasks", fake_finalize_tasks)
     monkeypatch.setattr(lifecycle_module, "assert_initialized", lambda **_kwargs: None)
 
-    plan_result = runner.invoke(cli_app, ["plan", "--feature", "001-demo", "--json"])
+    plan_result = runner.invoke(cli_app, ["plan", "--mission", "001-demo", "--json"])
     tasks_result = runner.invoke(cli_app, ["tasks", "--mission", "001-demo", "--json"])
 
     assert plan_result.exit_code == 0
@@ -172,7 +179,7 @@ def test_research_creates_artifacts(monkeypatch, tmp_path: Path) -> None:
     )
     monkeypatch.setattr(research_module, "resolve_template_path", lambda *_args, **_kwargs: None)
 
-    result = runner.invoke(cli_app, ["research", "--feature", "001-demo-feature", "--force"])
+    result = runner.invoke(cli_app, ["research", "--mission", "001-demo-feature", "--force"])
     assert result.exit_code == 0
 
     assert (feature_dir / "research.md").exists()
@@ -237,11 +244,11 @@ def test_accept_checklist_json_output(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_accept_requires_explicit_feature_flag(monkeypatch, tmp_path: Path) -> None:
-    """After heuristic detection removal, accept without --mission exits 1.
+    """After heuristic detection removal, accept without --mission exits non-zero.
 
     The old test_accept_json_suppresses_fallback_announcement was testing that
     detect_mission_slug auto-detection worked.  Now that auto-detection is gone,
-    accept without --mission is an explicit error.
+    accept without --mission is an explicit error (exits 2 per typer convention).
     """
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -253,8 +260,8 @@ def test_accept_requires_explicit_feature_flag(monkeypatch, tmp_path: Path) -> N
         ["accept", "--mode", "checklist", "--json", "--allow-fail"],
     )
 
-    # Must fail because --mission is required
-    assert result.exit_code == 1
+    # Must fail because --mission is required (exit 2 = typer error for missing param)
+    assert result.exit_code != 0
     output = result.stdout
     assert "error" in output.lower() or "mission" in output.lower(), (
         f"Expected error about missing mission, got: {output}"
@@ -282,10 +289,11 @@ def test_merge_dry_run_outputs_lane_payload(monkeypatch, tmp_path: Path) -> None
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(merge_module, "run_command", fake_run_command)
+    monkeypatch.setattr(merge_preflight_module, "run_command", fake_run_command)
 
     result = runner.invoke(
         cli_app,
-        ["merge", "--json", "--dry-run", "--feature", "010-test-feature", "--target", "main"],
+        ["merge", "--json", "--dry-run", "--mission", "010-test-feature", "--target", "main"],
     )
     assert result.exit_code == 0
     payload = json.loads(result.stdout.strip())
@@ -322,10 +330,11 @@ def test_merge_json_dry_run_requires_lane_manifest(monkeypatch, tmp_path: Path) 
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(merge_module, "run_command", fake_run_command)
+    monkeypatch.setattr(merge_preflight_module, "run_command", fake_run_command)
 
     result = runner.invoke(
         cli_app,
-        ["merge", "--json", "--dry-run", "--feature", "010-test-feature", "--target", "main"],
+        ["merge", "--json", "--dry-run", "--mission", "010-test-feature", "--target", "main"],
     )
     assert result.exit_code == 1
     payload = json.loads(result.stdout.strip())
@@ -341,13 +350,18 @@ def test_merge_git_preflight_json_payload_includes_cli_version(
     repo_root.mkdir()
     (repo_root / ".git").mkdir()
 
+    # ``_enforce_git_preflight`` lives in ``specify_cli.merge.preflight`` (mission
+    # #2057 decomposition) and resolves ``run_git_preflight`` /
+    # ``build_git_preflight_failure_payload`` in *that* module's namespace, so the
+    # stubs must be installed there — patching the ``merge`` shim is dead (mirrors
+    # the sibling dry-run tests that patch ``merge_preflight_module``).
     monkeypatch.setattr(
-        merge_module,
+        merge_preflight_module,
         "run_git_preflight",
         lambda *_args, **_kwargs: type("Preflight", (), {"passed": False})(),
     )
     monkeypatch.setattr(
-        merge_module,
+        merge_preflight_module,
         "build_git_preflight_failure_payload",
         lambda *_args, **_kwargs: {
             "error_code": "GIT_PREFLIGHT_FAILED",
@@ -384,6 +398,7 @@ def test_merge_json_dry_run_requires_feature_resolution(monkeypatch, tmp_path: P
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(merge_module, "run_command", fake_run_command)
+    monkeypatch.setattr(merge_preflight_module, "run_command", fake_run_command)
 
     result = runner.invoke(
         cli_app,
@@ -416,13 +431,14 @@ def test_merge_json_dry_run_honors_keep_flags(monkeypatch, tmp_path: Path) -> No
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(merge_module, "run_command", fake_run_command)
+    monkeypatch.setattr(merge_preflight_module, "run_command", fake_run_command)
     result = runner.invoke(
         cli_app,
         [
             "merge",
             "--json",
             "--dry-run",
-            "--feature",
+            "--mission",
             "010-test-feature",
             "--target",
             "main",
@@ -470,7 +486,7 @@ def test_verify_setup_json_output(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr(verify_module, "run_enhanced_verify", fake_verify)
 
-    result = runner.invoke(cli_app, ["verify-setup", "--json", "--feature", "001-demo-feature"])
+    result = runner.invoke(cli_app, ["verify-setup", "--json", "--mission", "001-demo-feature"])
     assert result.exit_code == 0
     payload = _load_json_from_output(result.stdout)
     assert payload["status"] == "ok"

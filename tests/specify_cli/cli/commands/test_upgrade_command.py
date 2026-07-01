@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -41,7 +42,21 @@ from specify_cli.compat.provider import FakeLatestVersionProvider, LatestVersion
 # Contract path (relative to repo root)
 # ---------------------------------------------------------------------------
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip rich's ANSI color codes so substring assertions are robust.
+
+    Rich auto-highlights numerics (e.g. ``schema \x1b[1;36m7\x1b[0m``,
+    ``\x1b[1;36m3.1\x1b[0m.\x1b[1;36m0\x1b[0m``), which breaks plain substring
+    checks against the rendered output. Strip the codes to pin the message text
+    contract without coupling to the highlighter.
+    """
+    return _ANSI_RE.sub("", text)
+
 
 _WORKTREE_ROOT = Path(__file__).parent.parent.parent.parent.parent  # repo root
 _CONTRACT_PATH = (
@@ -203,7 +218,13 @@ def test_agent_check_json_prompts_when_update_available(tmp_path: Path, monkeypa
         "get_latest",
         lambda self, package: LatestVersionResult("999.0.0", "pypi", None),
     )
-    monkeypatch.setattr("specify_cli.compat.detect_install_method", lambda: InstallMethod.PIPX)
+    monkeypatch.setattr("specify_cli.compat._detect.install_method.detect_install_method", lambda: InstallMethod.PIPX)
+    # The agent-check producer builds its Invocation with ``env_ci=is_ci_env()``;
+    # under CI the planner selects NoNetworkProvider and the PyPIProvider mock
+    # never fires (latest_version stays None → action=none). Pin network-allowed
+    # so the real "update available → prompt" decision path is the one exercised,
+    # independent of whether the suite itself runs in a CI environment.
+    monkeypatch.setattr("specify_cli.compat.is_ci_env", lambda: False)
 
     result = _invoke_upgrade(["--agent-check", "--json"], cwd=tmp_path)
 
@@ -228,7 +249,11 @@ def test_agent_check_guidance_when_upgrade_command_unavailable(
         "get_latest",
         lambda self, package: LatestVersionResult("999.0.0", "pypi", None),
     )
-    monkeypatch.setattr("specify_cli.compat.detect_install_method", lambda: InstallMethod.UNKNOWN)
+    monkeypatch.setattr("specify_cli.compat._detect.install_method.detect_install_method", lambda: InstallMethod.UNKNOWN)
+    # See test_agent_check_json_prompts_when_update_available: pin network-allowed
+    # so the PyPIProvider mock fires under CI and the real "manual upgrade required
+    # → guidance" path is exercised rather than the CI network-suppressed action=none.
+    monkeypatch.setattr("specify_cli.compat.is_ci_env", lambda: False)
 
     result = _invoke_upgrade(["--agent-check", "--json"], cwd=tmp_path)
 
@@ -238,6 +263,32 @@ def test_agent_check_guidance_when_upgrade_command_unavailable(
     assert payload["reason"] == "manual_upgrade_required"
     assert payload["upgrade_command"] is None
     assert payload["upgrade_note"]
+
+
+def test_agent_check_uv_tool_command_targets_latest_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from specify_cli.compat._detect.install_method import InstallMethod
+    from specify_cli.compat.cache import NagCache
+    from specify_cli.compat.provider import PyPIProvider
+
+    monkeypatch.setattr("specify_cli.compat.cache.NagCache.default", lambda: NagCache(tmp_path / "agent-cache.json"))
+    # Use a high sentinel for the mocked "latest" (matching the 999.0.0 convention
+    # in test_agent_choice_not_now_records_snooze) so this stays > the installed
+    # package version across release bumps and the upgrade-available ('prompt')
+    # path is always exercised — never coupled to the current pyproject version.
+    monkeypatch.setattr(
+        PyPIProvider,
+        "get_latest",
+        lambda self, package: LatestVersionResult("999.0.0", "pypi", None),
+    )
+    monkeypatch.setattr("specify_cli.compat._detect.install_method.detect_install_method", lambda: InstallMethod.UV_TOOL)
+    monkeypatch.setattr("specify_cli.compat.is_ci_env", lambda: False)
+
+    result = _invoke_upgrade(["--agent-check", "--json"], cwd=tmp_path)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["action"] == "prompt"
+    assert payload["upgrade_command"] == "uv tool install --force spec-kitty-cli==999.0.0"
 
 
 def test_agent_choice_not_now_records_snooze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,11 +483,12 @@ def test_project_migration_needed_project_dry_run_json_contract(tmp_path: Path) 
 
 
 def _assert_too_new_project_human_output(output: str) -> None:
-    normalized = " ".join(output.split())
-    assert "This project uses Spec Kitty project schema 7" in output
+    plain = _strip_ansi(output)
+    normalized = " ".join(plain.split())
+    assert "This project uses Spec Kitty project schema 7" in normalized
     assert "supports up to schema" in normalized
-    assert "Upgrade your CLI:" in output
-    assert "pip install --upgrade spec-kitty-cli" in output
+    assert "Upgrade your CLI:" in plain
+    assert "pip install --upgrade spec-kitty-cli" in plain
 
 
 def test_project_too_new_for_cli_command_exit_5(tmp_path: Path) -> None:
@@ -937,3 +989,61 @@ def test_existing_no_worktrees_flag_preserved(tmp_path: Path) -> None:
     _make_compatible_project(tmp_path, schema_version=3)
     result = _invoke_upgrade(["--dry-run", "--no-worktrees"], cwd=tmp_path)
     assert result.exit_code != 2, f"--no-worktrees caused a usage error: {result.output}"
+
+
+# ---------------------------------------------------------------------------
+# WP02 / FR-013 (#1784 P3 crumb) — honest --dry-run outcome line
+# ---------------------------------------------------------------------------
+
+
+def _make_upgrade_result(*, dry_run: bool, success: bool = True) -> Any:
+    from specify_cli.upgrade.runner import UpgradeResult
+
+    return UpgradeResult(
+        success=success,
+        from_version="3.1.0",
+        to_version="3.2.0",
+        dry_run=dry_run,
+    )
+
+
+def _render_upgrade_outcome(result: Any) -> str:
+    from specify_cli.cli.commands.upgrade import _display_upgrade_results
+    from specify_cli.cli.helpers import console
+
+    with console.capture() as capture:
+        _display_upgrade_results(
+            result,
+            manual_review_paths=[],
+            auto_committed=False,
+            auto_commit_paths=[],
+        )
+    return capture.get()
+
+
+def test_dry_run_success_does_not_print_upgrade_complete() -> None:
+    """A --dry-run never prints a line implying changes were applied (FR-013)."""
+    output = _render_upgrade_outcome(_make_upgrade_result(dry_run=True))
+    assert "Upgrade complete!" not in output, (
+        f"--dry-run printed a success line implying changes were applied:\n{output}"
+    )
+    assert "Dry run complete" in output
+    assert "no changes applied" in output
+
+
+def test_real_run_success_line_unchanged() -> None:
+    """A real (non-dry-run) successful upgrade keeps the success line."""
+    output = _strip_ansi(_render_upgrade_outcome(_make_upgrade_result(dry_run=False)))
+    assert "Upgrade complete!" in output
+    assert "3.1.0 -> 3.2.0" in output
+    assert "Dry run complete" not in output
+
+
+def test_failed_run_exits_1_for_both_modes() -> None:
+    """Failure still exits 1 regardless of dry-run flag."""
+    for dry_run in (False, True):
+        with pytest.raises(typer.Exit) as excinfo:
+            _render_upgrade_outcome(
+                _make_upgrade_result(dry_run=dry_run, success=False)
+            )
+        assert excinfo.value.exit_code == 1

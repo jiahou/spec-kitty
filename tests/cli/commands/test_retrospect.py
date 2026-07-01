@@ -27,7 +27,7 @@ from typer.testing import CliRunner
 from specify_cli.cli.commands.retrospect import app as retrospect_app
 from specify_cli.cli.commands.agent_retrospect import app as agent_retrospect_app
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
 RUNNER = CliRunner()
 
@@ -917,6 +917,7 @@ class TestSynthesizeFabricateEmpty:
         data = json.loads(result.output)
         assert data["code"] == "RETROSPECTIVE_RECORD_MISSING"
 
+    @pytest.mark.quarantine  # Typer/click help-render skew (local != CI) (Wave-0 orphan-bind triage #2295, #2034/#2283)
     def test_help_shows_fabricate_empty_flag(self) -> None:
         """--fabricate-empty flag appears in help text."""
         result = RUNNER.invoke(agent_retrospect_app, ["synthesize", "--help"])
@@ -2234,9 +2235,13 @@ class TestSynthesizeFabricateProvenance:
         # The command should succeed (exit 0)
         assert result.exit_code == 0, result.output
 
-        # The YAML file must exist on disk
-        retro_path = missions_dir / MISSION_ID_COMPLETED / "retrospective.yaml"
+        # FR-006 (#1771): the record lands in the tracked feature_dir, not the
+        # gitignored .kittify/missions/ tree.
+        retro_path = feature_dir / "retrospective.yaml"
         assert retro_path.exists(), "retrospective.yaml must be written to disk by --fabricate-empty"
+        assert not (missions_dir / MISSION_ID_COMPLETED / "retrospective.yaml").exists(), (
+            "record must NOT be written to the gitignored .kittify/missions/ tree"
+        )
 
         # Read back the YAML and verify provenance.kind
         raw = _yaml.safe_load(retro_path.read_text(encoding="utf-8"))

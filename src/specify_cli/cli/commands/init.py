@@ -96,6 +96,8 @@ def _emit_project_init_event(project_path: Path) -> None:
     try:
         from specify_cli.identity.project import ensure_identity
 
+        # WRITE-AUTHORIZED BOUNDARY (#2263, FR-003): project init may persist identity
+        # to .kittify/config.yaml. Do NOT swap to resolve_identity (read-path only).
         ensure_identity(project_path)
     except Exception as exc:
         _logger.debug("Could not ensure project identity for init event: %s", exc)
@@ -860,6 +862,8 @@ def init(  # noqa: C901
                 from specify_cli.status import emit_project_initialized
                 from specify_cli import __version__ as _sk_runtime_version
 
+                # WRITE-AUTHORIZED BOUNDARY (#2263, FR-003): project init may persist
+                # identity to .kittify/config.yaml. Do NOT swap to resolve_identity.
                 _identity = ensure_identity(project_path)
                 if _identity.project_uuid is not None:
                     emit_project_initialized(
@@ -903,7 +907,7 @@ def init(  # noqa: C901
         "auggie": ".augment/",
         "copilot": ".github/",
         "antigravity": ".agent/",
-        "roo": ".roo/",
+        # "roo" removed — Roo Code shut down on 2026-05-15 (C-007)
         "q": ".amazonq/",
         "kiro": ".kiro/",
         "pi": ".agents/skills/",
@@ -1149,6 +1153,31 @@ def init(  # noqa: C901
         _emit_project_init_event(project_path)
     except Exception as e:
         _console.print(f"[dim]Note: Could not emit project-init event: {e}[/dim]")
+
+    # Run tool-surface repair after all agent config has been flushed to disk.
+    # NFR-007: --yes (non_interactive) does NOT imply --repair-drift; drifted
+    # files are only reported, never overwritten, unless the caller explicitly
+    # passes --repair-drift=overwrite (not yet exposed on init; defaults False).
+    try:
+        from specify_cli.tool_surface.repair import (
+            render_surface_summary_lines,
+            run_surface_repair,
+        )
+
+        _surface_summary = run_surface_repair(
+            project_path,
+            interactive=not non_interactive,
+            repair_drift=False,
+        )
+        for _line in render_surface_summary_lines(_surface_summary):
+            _console.print(_line)
+        if _surface_summary.drifted_reported and non_interactive:
+            raise typer.Exit(1)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        # Never fail init due to surface repair errors.
+        _console.print(f"[dim]Note: Could not run tool surface repair: {e}[/dim]")
 
     # Clean up temporary directories used during init.
     # In full-copy mode: .kittify/templates/ holds the copied base templates.

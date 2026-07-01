@@ -64,7 +64,7 @@ def _fresh_seed_manifest_text() -> str:
     except Exception:
         synthesizer_version = "unknown"
 
-    without_hash = {
+    without_hash: dict[str, object] = {
         "schema_version": "2",
         "mission_id": None,
         "created_at": "1970-01-01T00:00:00+00:00",
@@ -110,13 +110,14 @@ def _materialize_fresh_doctrine(repo_root: Path) -> list[str]:
     if not manifest_path.exists() or manifest_path.read_text(encoding="utf-8") != manifest_text:
         manifest_path.write_text(manifest_text, encoding="utf-8")
 
-    # #1717 Fix A: the fresh-seed manifest declares built_in_only=true, so the
-    # FR-009 XOR invariant (graph.yaml XOR built_in_only) requires removing any
-    # stale project-local graph.yaml. Leaving it produces the terminal
-    # built_in_only ∧ graph-present "invalid" freshness state. Mirrors the
-    # synthesizer's own post-condition (project_drg.apply_post_condition,
-    # has_project_graph=False) for the path that bypasses the synthesizer.
-    (doctrine_dir / "graph.yaml").unlink(missing_ok=True)
+    # #1717 Fix A: the fresh-seed manifest declares built_in_only=true, so any
+    # stale project-local graph.yaml the manifest disowns must be removed.
+    # Mirrors the synthesizer's own post-condition (project_drg.
+    # apply_post_condition, has_project_graph=False) for the path that bypasses
+    # the synthesizer. FR-007: both sites route through the one shared helper.
+    from charter.synthesizer.graph_residue import unlink_stale_project_graph  # noqa: PLC0415
+
+    unlink_stale_project_graph(doctrine_dir)
 
     return [
         str(provenance_path.relative_to(repo_root)),

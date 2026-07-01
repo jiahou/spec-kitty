@@ -90,7 +90,7 @@ Full software development lifecycle with work packages and code review.
 
 **Steps:**
 ```
-discovery → specify → plan → tasks_outline → tasks_packages → tasks_finalize → implement → review → accept
+discovery → specify → plan → tasks → implement → review → accept
 ```
 
 **Required artifacts:** `spec.md`, `plan.md`, `tasks.md`
@@ -194,7 +194,7 @@ steps:
     prompt_template: plan.md
 
   - id: implement
-    depends_on: [tasks_finalize]
+    depends_on: [tasks]
     prompt_template: implement.md
 ```
 
@@ -248,14 +248,15 @@ guards:
     check: 'artifact_exists("spec.md")'
 ```
 
-### command-templates/ (Agent Prompts)
+### mission-steps/ (Agent Prompts)
 
 Markdown files shown to agents at each step:
-- `specify.md` — Instructions for writing the specification
-- `plan.md` — Instructions for creating the implementation plan
-- `implement.md` — Instructions for implementing a work package
-- `review.md` — Instructions for reviewing a work package
-- `accept.md` — Instructions for final acceptance validation
+- `mission-steps/software-dev/specify/prompt.md` — Instructions for writing the specification
+- `mission-steps/software-dev/plan/prompt.md` — Instructions for creating the implementation plan
+- `mission-steps/software-dev/tasks/prompt.md` — Instructions for creating tasks and work packages
+- `mission-steps/software-dev/implement/prompt.md` — Instructions for implementing a work package
+- `mission-steps/software-dev/review/prompt.md` — Instructions for reviewing a work package
+- `mission-steps/software-dev/accept/prompt.md` — Instructions for final acceptance validation
 
 ### templates/ (Content Templates)
 
@@ -313,10 +314,12 @@ Procedures live in `src/doctrine/procedures/shipped/` (shipped) or
 procedure = service.procedures.get("refactoring")
 # procedure.steps → ordered list of actions
 # procedure.prerequisites → what must be true before starting
+# All procedures: read src/doctrine/procedures/shipped/ or .kittify/procedures/
 ```
 
+To validate project-layer doctrine artifacts:
 ```bash
-spec-kitty doctrine list --kind procedure
+spec-kitty doctrine validate .kittify/
 ```
 
 ### Agent Profiles (Role-Based WP Assignment)
@@ -326,11 +329,9 @@ package assignment. Each profile has 6 sections: context_sources, purpose,
 specialization (languages, frameworks, boundaries), collaboration (handoffs,
 outputs), mode_defaults, and initialization_declaration.
 
-Profiles form a hierarchy via `specializes_from` — a language-specific
-profile inherits from a general implementer profile, adding language-scoped
-capabilities. The DDR-011 algorithm resolves which profile best matches a
-given task context based on weighted signals (language, framework,
-file-pattern, keyword, exact-id).
+Profiles do not use relationship fields such as `specializes_from`. Lineage and
+specialization relationships belong in the doctrine DRG; profile matching uses
+weighted signals (language, framework, file path, keyword, exact-id).
 
 The `mission.yaml` `task_types` section maps WP actions to agent roles:
 
@@ -345,15 +346,17 @@ task_types:
 ```
 
 ```bash
-# Discover available profiles
+# Discover activated profiles (--all for the full on-disk catalog)
 spec-kitty agent profile list
 
-# Inspect a profile's boundaries and initialization context
+# Inspect a profile's boundaries and initialization context (resolved
+# through DRG lineage and context sources)
 spec-kitty agent profile show <profile-id>
-
-# Visualize the specialization hierarchy
-spec-kitty agent profile hierarchy
 ```
+
+There is no separate hierarchy command: specialization lineage is declared in
+the doctrine DRG (see the org-pack DRG YAML / generated `graph.yaml`); `profile
+show` displays the resolved result.
 
 ### Action Indices (Doctrine Scoping)
 
@@ -396,21 +399,17 @@ list must pass for the transition to fire.
 
 ## Template Resolution (5-Tier Chain)
 
-When a command template is needed, spec-kitty searches 5 locations in order:
+When a command prompt is needed, spec-kitty resolves the current doctrine
+mission-step prompt:
 
-| Tier | Path | Purpose |
+| Scope | Path | Purpose |
 |---|---|---|
-| 1. Override | `.kittify/overrides/command-templates/` | Project customization |
-| 2. Legacy | `.kittify/command-templates/` | Deprecated pre-migration |
-| 3. Global Mission | `~/.kittify/missions/{mission}/command-templates/` | User global |
-| 4. Global | `~/.kittify/command-templates/` | User global fallback |
-| 5. Package | `src/doctrine/missions/{mission}/command-templates/` | Built-in default |
+| Package | `src/doctrine/missions/mission-steps/<mission>/<step>/prompt.md` | Built-in default |
+| Project doctrine | `.kittify/doctrine/...` | Project-local doctrine overrides where supported |
+| Org doctrine | org doctrine pack | Shared organization doctrine where installed |
 
-First match wins. Override a template by placing your version in
-`.kittify/overrides/command-templates/`. The package default is always the
-fallback.
-
-Content templates (`templates/`) follow the same 5-tier resolution.
+The package default is always the fallback. Legacy `command-templates` paths are
+pre-migration artifacts, not the current package layout.
 
 ---
 
@@ -423,10 +422,11 @@ It's recorded in `meta.json` and cannot be changed after creation.
 
 ```bash
 # List available mission types
-spec-kitty list-missions
+spec-kitty mission-type list
+spec-kitty doctrine mission-type list
 
 # Specify a mission with a specific mission type
-spec-kitty specify --mission research "What are the best auth patterns?"
+spec-kitty specify --mission-type research "What are the best auth patterns?"
 
 # Check which mission type a mission uses
 cat kitty-specs/<mission-slug>/meta.json | jq .mission
@@ -477,6 +477,44 @@ On every CLI invocation, `ensure_runtime()` runs:
 This ensures `~/.kittify/` always matches the installed spec-kitty version.
 
 ---
+
+## CLI Surface Contract
+
+### `agent action implement` / `agent action review` — text-only output
+
+The canonical agent surfaces `spec-kitty agent action implement <wp_id>` and
+`spec-kitty agent action review <wp_id>` return **plain text** only. They do not
+accept a `--json` flag. Passing `--json` to either command produces a Typer exit-2
+error.
+
+The top-level command `spec-kitty implement` *does* accept `--json`, but it is the
+internal allocator used by the harness — not the surface intended for agent prompt
+steps. Do **not** invoke `spec-kitty implement --json` from prompt steps; that is
+an internal-only surface. Use `spec-kitty agent action implement <wp_id>` for
+work-package execution.
+
+Summary:
+
+| Command | `--json`? | Intended for |
+|---|---|---|
+| `spec-kitty agent action implement <wp_id>` | **no** | Agent prompt steps |
+| `spec-kitty agent action review <wp_id>` | **no** | Agent prompt steps |
+| `spec-kitty implement <wp_id>` | **yes** | Internal harness allocator only |
+
+If you need structured output from the implement action, use `spec-kitty agent tasks status --json`
+to query the resulting WP state after the action completes.
+
+### Workspace recovery
+
+If a worktree is missing or corrupted, use the real recovery command (post-#2135,
+the former `worktree repair` subcommand no longer exists):
+
+```bash
+spec-kitty doctor workspaces --fix
+```
+
+This removes husk directories (entries in `.worktrees/` that lack a `.git` entry)
+without touching registered live worktrees.
 
 ## References
 

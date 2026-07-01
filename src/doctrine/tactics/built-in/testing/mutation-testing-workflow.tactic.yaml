@@ -58,3 +58,15 @@ notes: >
   moderate — many improvements possible; 80–90% good; > 90% strong — watch for
   equivalent mutant inflation. Use # pragma: no mutate to suppress specific lines
   where mutations are semantically equivalent (e.g. version strings, log messages).
+references:
+  # This workflow drives the language-specific mutation toolchains; cite the
+  # toolguides it operationalizes so the tools are reachable from the workflow
+  # that uses them (real "uses tool" relationship, per language).
+  - name: Python Mutation Tools
+    type: toolguide
+    id: python-mutation-tools
+    when: Use when applying the mutation testing workflow to Python projects.
+  - name: TypeScript Mutation Tools
+    type: toolguide
+    id: typescript-mutation-tools
+    when: Use when applying the mutation testing workflow to TypeScript projects.

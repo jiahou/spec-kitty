@@ -10,7 +10,9 @@ from typing import Any
 import pytest
 
 from specify_cli.coordination.status_transition import (
+    emit_status_transition_batch_transactional,
     emit_status_transition_transactional,
+    read_current_wp_state_transactional,
     read_events_transactional,
 )
 from specify_cli.coordination.status_service import (
@@ -22,6 +24,7 @@ from specify_cli.coordination.status_service import (
     read_event_log,
 )
 from specify_cli.coordination.transaction import BookkeepingCommitFailed, BookkeepingWorktreeMissing
+from specify_cli.coordination.workspace import CoordinationWorkspace
 from specify_cli.status.models import Lane, StatusEvent, TransitionRequest
 
 pytest_plugins = ("tests.conftest_saas_sink",)
@@ -325,3 +328,233 @@ def test_transactional_emit_fails_closed_on_malformed_meta(
 
     assert mock_saas_sink.call_count == 0
     assert not (repo / "kitty-specs" / MISSION_DIRNAME / "status.events.jsonl").exists()
+
+
+def _seed_coord_branch_without_meta(repo: Path) -> StatusEvent:
+    """Set up the coordination branch the way a real mission has it.
+
+    On the coordination branch the mission folder holds the status log but no
+    ``meta.json`` — ``meta.json`` only lives in the normal checkout. We also
+    record WP01 as ``planned`` so the work-start batch has a valid starting
+    point. This is done in a temporary worktree that we delete before adding the
+    real one, because git won't let the same branch be checked out twice at once.
+    """
+    seed_event = StatusEvent(
+        event_id="01SEEDGENESIS0000000000001",
+        mission_slug=MISSION_SLUG,
+        mission_id=MISSION_ID,
+        wp_id="WP01",
+        from_lane=Lane.GENESIS,
+        to_lane=Lane.PLANNED,
+        at="2026-05-31T00:00:00+00:00",
+        actor="seed",
+        force=False,
+        reason="seed",
+        execution_mode="worktree",
+    )
+    worktree = repo / ".worktrees" / "seed-coord-nometa"
+    _git(repo, "worktree", "add", "-q", str(worktree), COORD_BRANCH)
+    coord_feature_dir = worktree / "kitty-specs" / MISSION_DIRNAME
+    (coord_feature_dir / "meta.json").unlink()
+    append_event_log(
+        EventLogWriteContract.coordination_transaction_append(coord_feature_dir),
+        seed_event,
+    )
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "coord: status surface without meta")
+    _git(repo, "worktree", "remove", "-f", str(worktree))
+    return seed_event
+
+
+def test_transactional_batch_rejects_request_without_any_feature_dir(repo: Path) -> None:
+    """A batch whose first request carries neither feature_dir nor mission_dir fails fast.
+
+    The transactional batch needs a folder to anchor identity + the same-WP
+    consistency check on. If the first request supplies neither ``feature_dir``
+    nor ``mission_dir`` (both default to ``None``) it must raise ``TypeError``
+    before touching git — alongside the existing missing-slug / missing-wp guard
+    — rather than crashing deeper in identity resolution.
+    """
+    request = TransitionRequest(
+        feature_dir=None,
+        mission_dir=None,
+        mission_slug=MISSION_SLUG,
+        wp_id="WP01",
+        to_lane="claimed",
+        actor="no-feature-dir-test",
+        repo_root=repo,
+    )
+
+    with pytest.raises(
+        TypeError, match="requires feature_dir/mission_dir, mission_slug, and wp_id"
+    ):
+        emit_status_transition_batch_transactional([request], sync_dossier=False)
+
+
+def test_transactional_batch_same_wp_under_coord_topology_does_not_misfire(
+    repo: Path,
+    mock_saas_sink: Any,
+) -> None:
+    """Starting a work package on a coordination-mode mission used to crash here.
+
+    Such a mission lives in two folders: the normal checkout and a separate
+    coordination worktree. The batch that starts a work package points at the
+    coordination folder, but the guard compared it against the normal-checkout
+    folder and rejected the batch as "more than one work package" — crashing
+    start-implementation. This builds that two-folder setup and checks the batch
+    now succeeds.
+    """
+    seed = _seed_coord_branch_without_meta(repo)
+
+    # Register the coordination worktree (in real life it already exists by the
+    # time work starts) and pass the full mission-folder name, the way the
+    # orchestrator does. This makes the requests point at the coordination folder
+    # while the mission's identity still resolves to the normal checkout — the
+    # mismatch that used to trip the guard.
+    coord_worktree = CoordinationWorkspace.worktree_path(repo, MISSION_DIRNAME, MID8)
+    _git(repo, "worktree", "add", "-q", str(coord_worktree), COORD_BRANCH)
+    coord_feature_dir = coord_worktree / "kitty-specs" / MISSION_DIRNAME
+
+    def _coord_request(to_lane: str) -> TransitionRequest:
+        return TransitionRequest(
+            feature_dir=coord_feature_dir,
+            mission_slug=MISSION_DIRNAME,
+            wp_id="WP01",
+            to_lane=to_lane,
+            actor="coord-batch-test",
+            repo_root=repo,
+        )
+
+    events = emit_status_transition_batch_transactional(
+        [_coord_request("claimed"), _coord_request("in_progress")],
+        sync_dossier=False,
+    )
+
+    assert [e.to_lane for e in events] == [Lane.CLAIMED, Lane.IN_PROGRESS]
+    assert events[0].from_lane == seed.to_lane  # planned -> claimed
+
+
+def _seed_planned_on_primary(repo: Path) -> StatusEvent:
+    """Append a genesis->planned seed directly to the primary checkout log."""
+    seed_event = StatusEvent(
+        event_id="01SEEDPRIMARY000000000001",
+        mission_slug=MISSION_SLUG,
+        mission_id=MISSION_ID,
+        wp_id="WP01",
+        from_lane=Lane.GENESIS,
+        to_lane=Lane.PLANNED,
+        at="2026-05-31T00:00:00+00:00",
+        actor="seed",
+        force=False,
+        reason="seed",
+        execution_mode="worktree",
+    )
+    append_event_log(
+        EventLogWriteContract.primary_checkout_append(repo / "kitty-specs" / MISSION_DIRNAME),
+        seed_event,
+    )
+    return seed_event
+
+
+def test_transactional_read_falls_back_to_primary_when_coord_branch_deleted(repo: Path) -> None:
+    """A deleted coordination branch must not mis-read WPs as genesis (#1847).
+
+    Post-merge cleanup deletes the coordination branch while meta.json still
+    declares it. The read path must then report lanes from the primary
+    checkout event log instead of reading the dangling ref as empty.
+    """
+    from specify_cli.coordination.status_transition import read_current_wp_state_transactional
+
+    seed = _seed_planned_on_primary(repo)
+    _git(repo, "add", "kitty-specs")
+    _git(repo, "commit", "-q", "-m", "merge mission artifacts to main")
+    _git(repo, "branch", "-D", COORD_BRANCH)
+
+    lane, actor = read_current_wp_state_transactional(
+        feature_dir=repo / "kitty-specs" / MISSION_DIRNAME,
+        mission_slug=MISSION_SLUG,
+        wp_id="WP01",
+        repo_root=repo,
+    )
+    assert lane == Lane.PLANNED
+    assert actor == "seed"
+
+    events = read_events_transactional(
+        feature_dir=repo / "kitty-specs" / MISSION_DIRNAME,
+        mission_slug=MISSION_SLUG,
+        repo_root=repo,
+    )
+    assert [e.event_id for e in events] == [seed.event_id]
+
+
+# ---------------------------------------------------------------------------
+# M6 error contract (PR #1850): the fail-closed surface refusal
+# (StatusReadPathNotFound — coord worktree root materialized, mission dir
+# absent) must never escape the transactional paths as a raw traceback. The
+# transaction identity anchors on the canonical primary dir the structured
+# refusal already carries; failures stay structured (Bookkeeping* errors).
+# ---------------------------------------------------------------------------
+
+
+def _materialize_coord_root_without_mission_dir(repo: Path) -> Path:
+    """The fail-closed window: coord worktree root exists, mission dir absent."""
+    coord_root = repo / ".worktrees" / f"{MISSION_DIRNAME}-coord"
+    coord_root.mkdir(parents=True)
+    return coord_root
+
+
+def _canonical_slug_request(repo: Path) -> TransitionRequest:
+    """Request carrying the canonical mission-dir name (what resolvers hand over)."""
+    return TransitionRequest(
+        feature_dir=repo / "kitty-specs" / MISSION_DIRNAME,
+        mission_slug=MISSION_DIRNAME,
+        wp_id="WP01",
+        to_lane="planned",
+        actor="m6-error-contract-test",
+        repo_root=repo,
+    )
+
+
+def test_transactional_read_survives_fail_closed_surface_refusal(repo: Path) -> None:
+    _materialize_coord_root_without_mission_dir(repo)
+
+    events = read_events_transactional(
+        feature_dir=repo / "kitty-specs" / MISSION_DIRNAME,
+        mission_slug=MISSION_DIRNAME,
+        repo_root=repo,
+    )
+
+    assert events == []
+
+
+def test_transactional_wp_state_read_survives_fail_closed_surface_refusal(
+    repo: Path,
+) -> None:
+    _materialize_coord_root_without_mission_dir(repo)
+
+    lane, actor = read_current_wp_state_transactional(
+        feature_dir=repo / "kitty-specs" / MISSION_DIRNAME,
+        mission_slug=MISSION_DIRNAME,
+        wp_id="WP01",
+        repo_root=repo,
+    )
+
+    assert lane == Lane.GENESIS
+    assert actor is None
+
+
+def test_transactional_emit_fail_closed_surface_refusal_stays_structured(
+    repo: Path,
+) -> None:
+    """The emit path refuses with a structured Bookkeeping error, not a raw leak.
+
+    The mkdir'd coord root is not a valid git worktree, so after identity
+    resolution succeeds the transaction refuses with its own structured
+    BOOKKEEPING_WORKTREE_MISSING error — never a raw StatusReadPathNotFound.
+    """
+    _materialize_coord_root_without_mission_dir(repo)
+
+    with pytest.raises(BookkeepingWorktreeMissing):
+        emit_status_transition_transactional(
+            _canonical_slug_request(repo), sync_dossier=False
+        )

@@ -10,12 +10,9 @@ Each test targets exactly one of the 4 regressions fixed in WP01-WP03:
 
 from __future__ import annotations
 
-import inspect
 import json
-import os
 import re
 import subprocess
-import sys
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Tuple
@@ -168,6 +165,20 @@ def _create_test_feature(
     tasks_dir = feature_dir / "tasks"
     tasks_dir.mkdir(parents=True)
 
+    # The software-dev mission declares required path conventions. The build dirs
+    # (src/, tests/, docs/) live at the repo root; contracts/ is a MISSION artifact
+    # and lives under the feature dir (#2115). collect_feature_summary() validates
+    # them and, under the default strict mode, turns a missing convention path into
+    # a hard ``path_violations`` entry that forces ``summary.ok`` to False and makes
+    # perform_acceptance() raise AcceptanceError. Create the dirs (with a committed
+    # ``.gitkeep`` so git tracks the otherwise-empty dirs and the repo stays clean)
+    # so acceptance reflects the WP/lane state under test, not a fixture artifact.
+    for convention_dir in ("src", "tests", "docs"):
+        (repo_root / convention_dir).mkdir(parents=True, exist_ok=True)
+        (repo_root / convention_dir / ".gitkeep").write_text("")
+    (feature_dir / "contracts").mkdir(parents=True, exist_ok=True)
+    (feature_dir / "contracts" / ".gitkeep").write_text("")
+
     # meta.json
     meta = {
         "mission_number": "099",
@@ -264,8 +275,25 @@ def test_collect_feature_summary_does_not_dirty_repo(tmp_path: Path) -> None:
     assert summary2.git_dirty == [], f"Second call dirtied the repo: {summary2.git_dirty}"
 
 
-def test_collect_feature_summary_checks_required_artifacts_in_coord_worktree(tmp_path: Path) -> None:
-    """Regression: coord topology stores canonical planning artifacts in the coord worktree."""
+def test_collect_feature_summary_reads_planning_artifacts_from_primary(tmp_path: Path) -> None:
+    """FR-002 (#2085, WP03): the accept gate reads PLANNING artifacts from PRIMARY.
+
+    This previously asserted the OPPOSITE — that the coord worktree was the
+    artifact-read surface for spec/plan/tasks. WP03 split the single
+    ``status_feature_dir`` per-partition: PLANNING reads now resolve the PRIMARY
+    surface via the WP01 kind-aware seam, while only the STATUS reads
+    (status.events.jsonl, acceptance-matrix) stay coord-aware. The coord-only
+    single-authority read was the drift this mission removes, not a contract to
+    preserve (unification, not parity).
+
+    The coord-topology setup is kept; the assertions invert to the new contract:
+
+    * spec/plan/tasks deleted from PRIMARY (still present on coord) are reported
+      MISSING — proving the gate read primary, not coord;
+    * a ``NEEDS CLARIFICATION`` marker planted ONLY in the coord ``spec.md`` is
+      NOT surfaced — proving the clarification scan read the (now-absent) primary
+      ``spec.md`` rather than the coord copy.
+    """
     repo_root, feature_dir = _create_test_feature(tmp_path)
     mid8 = "01ABCDEF"
     coord_feature_dir = (
@@ -294,6 +322,9 @@ def test_collect_feature_summary_checks_required_artifacts_in_coord_worktree(tmp
     )
     (repo_root / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
     (coord_feature_dir / "tasks.md").write_text("# tasks.md\n- [ ] Coord-only unfinished task\n", encoding="utf-8")
+    # Coord ``spec.md`` carries a clarification marker; primary ``spec.md`` is
+    # deleted below. Post-WP03 the gate reads primary, so this coord marker MUST
+    # NOT leak into ``needs_clarification``.
     (coord_feature_dir / "spec.md").write_text(
         "# spec.md\n[NEEDS CLARIFICATION: coord marker] <!-- decision_id: 01KS0ABCDEF0123456789ABCDE -->\n",
         encoding="utf-8",
@@ -310,9 +341,79 @@ def test_collect_feature_summary_checks_required_artifacts_in_coord_worktree(tmp
     summary = collect_feature_summary(repo_root, _FEATURE_SLUG)
 
     assert summary.feature_dir == feature_dir
+    # PLANNING reads resolve PRIMARY (FR-002): the artifacts present only on coord
+    # are now correctly reported missing. A gate still reading coord would report
+    # ZERO missing (the false-green this remediation removes).
+    assert {"spec.md", "plan.md", "tasks.md"}.issubset(set(summary.missing_artifacts))
+    # The clarification scan read the (absent) primary ``spec.md``, NOT the coord
+    # copy — so the coord-only marker is not surfaced.
+    assert summary.needs_clarification == []
+
+
+_MISSION_ID = "01ABCDEF0123456789ABCDEFGH"
+
+
+@pytest.mark.parametrize(
+    "handle",
+    # The handle tiers that resolve the fixture mission via resolve_mission:
+    # mid8 (mission_id[:8]), full ULID (mission_id), and the numeric prefix of the
+    # mission *slug* (099-test-feature -> "099"; NOT meta.mission_number).
+    [_MISSION_ID[:8], _MISSION_ID, _FEATURE_SLUG.split("-", 1)[0]],
+    ids=["mid8", "ulid", "numeric"],
+)
+def test_collect_feature_summary_anchors_primary_across_handle_tiers(
+    tmp_path: Path, handle: str
+) -> None:
+    """A mid8 / ULID / numeric handle must resolve the accept gate's PRIMARY-partition
+    reads to the primary mission dir (#2126), while STATUS reads stay coord-aware.
+
+    Asserts all three legs: the identity anchor (``feature_dir``), the
+    ``_iter_work_packages`` leg (``lanes``), and the ``_planning_read_dir`` leg
+    (``missing_artifacts`` — a raw-handle mis-resolve would list spec/plan/tasks as
+    missing because it would compose a nonexistent ``kitty-specs/<handle>`` dir)."""
+    repo_root, feature_dir = _create_test_feature(tmp_path)
+    mid8 = _MISSION_ID[:8]
+    coord_feature_dir = (
+        repo_root
+        / ".worktrees"
+        / f"{_FEATURE_SLUG}-{mid8}-coord"
+        / "kitty-specs"
+        / f"{_FEATURE_SLUG}-{mid8}"
+    )
+    coord_feature_dir.mkdir(parents=True)
+
+    for path in feature_dir.rglob("*"):
+        if path.is_file():
+            target = coord_feature_dir / path.relative_to(feature_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(path.read_bytes())
+
+    meta_path = feature_dir / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["mission_id"] = _MISSION_ID
+    meta["mid8"] = mid8
+    meta["coordination_branch"] = f"kitty/mission-{_FEATURE_SLUG}-{mid8}"
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (coord_feature_dir / "meta.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (repo_root / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo_root), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo_root), "commit", "-m", "Backfill identity + coord topology"],
+        check=True,
+        capture_output=True,
+    )
+
+    summary = collect_feature_summary(repo_root, handle)
+
+    # Identity anchor -> primary checkout dir.
+    assert summary.feature_dir == feature_dir
+    # `_iter_work_packages` leg (WP tasks/) resolved off the primary surface.
+    assert summary.lanes["done"] == ["WP01"]
+    # `_planning_read_dir` leg (spec/plan/tasks) resolved off the primary surface.
     assert summary.missing_artifacts == []
-    assert summary.unchecked_tasks == ["- [ ] Coord-only unfinished task"]
-    assert summary.needs_clarification == [str(coord_feature_dir / "spec.md")]
 
 
 def test_collect_feature_summary_blocks_workflow_changes_without_runner_evidence(tmp_path: Path) -> None:
@@ -415,6 +516,15 @@ def test_perform_acceptance_persists_accept_commit(tmp_path: Path) -> None:
     and the real SHA was never written back after the commit was created.
     """
     repo_root, feature_dir = _create_test_feature(tmp_path)
+    # perform_acceptance commits the acceptance meta through the protected-primary
+    # router (01KVMBD6). The flattened fixture mission commits to the current ref;
+    # 'main' is protected and would be refused, so run from the (never-protected)
+    # mission branch — the same pattern the sibling regression tests use.
+    subprocess.run(
+        ["git", "-C", str(repo_root), "checkout", "-b", f"kitty/mission-{_FEATURE_SLUG}"],
+        check=True,
+        capture_output=True,
+    )
 
     summary = collect_feature_summary(repo_root, _FEATURE_SLUG)
     result = perform_acceptance(summary, mode="local", actor="test-agent")
@@ -954,36 +1064,10 @@ class TestIntegrationBranchGuard:
         assert "git branch -d master" not in merged
 
 
-# ---------------------------------------------------------------------------
-# T014: standalone tasks_cli.py --help works
-# ---------------------------------------------------------------------------
-
-
-def test_standalone_tasks_cli_help() -> None:
-    """Regression: tasks_cli.py must work via subprocess without pip install.
-
-    The sys.path bootstrap must add the repo src/ root so that
-    specify_cli.* imports resolve from a checkout.
-    """
-    # Find the script relative to the repo src layout
-    src_dir = Path(__file__).resolve().parents[2] / "src"
-    script_path = src_dir / "specify_cli" / "scripts" / "tasks" / "tasks_cli.py"
-    assert script_path.exists(), f"tasks_cli.py not found at {script_path}"
-
-    result = subprocess.run(
-        [sys.executable, str(script_path), "--help"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env={**os.environ, "PYTHONPATH": ""},
-    )
-
-    assert result.returncode == 0, f"tasks_cli.py --help failed (rc={result.returncode}):\n{result.stderr}"
-    assert "ModuleNotFoundError" not in result.stderr, f"ModuleNotFoundError in stderr:\n{result.stderr}"
-    # Confirm help text actually rendered
-    assert "usage" in result.stdout.lower() or "--help" in result.stdout, (
-        f"Help text not found in stdout:\n{result.stdout}"
-    )
+# NOTE: T014 ``test_standalone_tasks_cli_help`` was retired with the standalone
+# tasks surface (WP03/FR-004) — it subprocess-ran the standalone tasks CLI's
+# ``--help``, which no longer exists. The canonical ``spec-kitty`` CLI help is
+# covered by the CLI command test suites.
 
 
 # ---------------------------------------------------------------------------
@@ -1051,46 +1135,8 @@ class TestMalformedJsonlRaisesAcceptanceError:
         assert any("finalize-tasks" in issue for issue in summary.activity_issues)
 
 
-# ---------------------------------------------------------------------------
-# T016: Copy-parity assertions
-# ---------------------------------------------------------------------------
-
-
-def test_copy_parity_between_acceptance_modules() -> None:
-    """Verify acceptance_support.py re-exports match acceptance.py exactly.
-
-    After deduplication, acceptance_support.py is a thin re-export wrapper.
-    The __all__ sets must be equal, and every re-exported name must be the
-    exact same object (not a copy).
-    """
-    from specify_cli import acceptance
-    from specify_cli.scripts.tasks import acceptance_support
-
-    # __all__ parity: sets must be equal
-    core_exports = set(acceptance.__all__)
-    standalone_exports = set(acceptance_support.__all__)
-    assert core_exports == standalone_exports, (
-        f"Wrapper must re-export all canonical names. "
-        f"Missing: {core_exports - standalone_exports}, "
-        f"Extra: {standalone_exports - core_exports}"
-    )
-
-    # Object identity: re-exports must be the same objects, not copies
-    for name in acceptance.__all__:
-        assert getattr(acceptance, name) is getattr(acceptance_support, name), (
-            f"{name} in acceptance_support is not the same object as in acceptance"
-        )
-
-    # Function signature parity for key functions (validates re-exports match)
-    parity_functions = [
-        "collect_feature_summary",
-        "detect_mission_slug",
-        "perform_acceptance",
-        "choose_mode",
-    ]
-    for fn_name in parity_functions:
-        sig_core = inspect.signature(getattr(acceptance, fn_name))
-        sig_standalone = inspect.signature(getattr(acceptance_support, fn_name))
-        assert sig_core == sig_standalone, (
-            f"{fn_name} signature mismatch:\n  acceptance:         {sig_core}\n  acceptance_support: {sig_standalone}"
-        )
+# NOTE: T016 ``test_copy_parity_between_acceptance_modules`` was retired with the
+# standalone tasks surface (WP03/FR-004). It asserted that the standalone
+# acceptance re-export shim mirrored ``specify_cli.acceptance`` object-for-object;
+# once that shim is gone (WP04) the parity check is moot. The canonical surface is
+# ``specify_cli.acceptance`` directly.

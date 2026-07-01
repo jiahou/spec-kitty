@@ -1,6 +1,6 @@
 [project]
 name = "spec-kitty-cli"
-version = "3.2.0rc42"
+version = "3.2.4"
 description = "Spec Kitty, a tool for Specification Driven Development (SDD) agentic projects, with kanban and git worktree isolation."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -81,13 +81,14 @@ dependencies = [
     "spec-kitty-tracker>=0.4,<0.5",
     "websockets>=12.0",  # WebSocket client for sync protocol
     "toml>=0.10.2",  # Config file parsing
+    "tomli-w>=1.0.0",  # TOML write serialiser (stdlib tomllib is read-only)
     "filelock>=3.13.0",  # Credential storage locking
     "requests>=2.33.0",  # HTTP client for batch sync (CVE-2026-25645 fix)
     "transitions>=0.9.2",  # State machine library for mission DSL v1
     "jsonschema>=4.0",  # JSON Schema validation for mission configs
     "python-ulid>=3.0",  # ULID generation for event IDs
     "google-re2>=1.1",  # RE2 engine for linear-time regex (ReDoS prevention)
-    "cryptography>=42.0",  # AES-256-GCM + scrypt KDF for encrypted auth session storage (feature 080)
+    "cryptography>=48.0.1",  # AES-256-GCM + scrypt KDF for encrypted auth session storage (feature 080)
 ]
 
 [project.urls]
@@ -102,6 +103,7 @@ test = [
     "pytest-asyncio>=0.21.0",  # Required for async tests
     "pytest-cov>=4.1.0",  # Required by CI coverage flags
     "pytest-timeout>=2.2.0",  # Required by mutmut pytest_add_cli_args --timeout flag
+    "pytest-xdist>=3.8.0",  # Parallelize large CI shards with --dist loadfile
     "respx>=0.21.1",  # HTTPX mocking for auth transport tests (feature 080)
     "diff-cover>=10.0.0",  # Enforce changed-line coverage in CI
     "chardet>=3.0.4,<6",  # Pin chardet below 6.x to avoid requests compatibility warning
@@ -112,6 +114,7 @@ test = [
 lint = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
+    "msgpack>=1.2.1",  # GHSA-6v7p-g79w-8964 fix; transitive via CacheControl/pip-audit
     "types-jsonschema>=4.0.0",
     "types-psutil>=5.9.0",
     "types-PyYAML>=6.0",
@@ -176,30 +179,15 @@ exclude = [
     "src/specify_cli/**/tests/**",
 ]
 
-[tool.pytest.ini_options]
-markers = [
-    "fast: Pure unit tests with no I/O or subprocess calls (CI fast gate)",
-    "integration: Integration tests using real filesystem or in-process I/O, no subprocess/git",
-    "slow: Tests taking >10 seconds or requiring heavy setup",
-    "git_repo: Tests that need a real git repository (integration gate)",
-    "adversarial: Adversarial/security tests for 0.13.0",
-    "doctrine: Doctrine package smoke and integration checks",
-    "distribution: Tests requiring wheel install (slow, no SPEC_KITTY_TEMPLATE_ROOT)",
-    "e2e: End-to-end tests exercising the full CLI workflow (may be slow)",
-    "platform_darwin: macOS-specific tests (case-insensitive FS)",
-    "platform_linux: Linux-specific tests",
-    "requires_symlinks: Tests that need symlink support",
-    "no_readiness_stub: Opt out of any autouse readiness-stub fixture so the test exercises its own readiness wiring (mission 082 tracker CLI tests)",
-    "architectural: Architectural enforcement tests (layer rules, import-graph invariants)",
-    "contract: Consumer-surface contract tests pinning external public APIs (e.g. spec-kitty-events / spec-kitty-tracker) the CLI depends on",
-    "windows_ci: Tests that require a native win32 environment — auto-skipped on non-Windows",
-    "live_adapter: tests that call the real Anthropic API (deselect with -m 'not live_adapter')",
-    "non_sandbox: test is structurally incompatible with mutmut's forked sandbox (subprocess CLI calls, whole-codebase AST walks, wheel builds, or repo-state fixtures outside also_copy). See ADR 2026-04-20-1",
-    "flaky: test passes in the main suite but is non-deterministic under mutmut or forking pipelines. Each entry is debt — root-cause and remove. See ADR 2026-04-20-1",
-    "stress: Concurrency/load stress tests — run separately from the fast suite (mission-coordination-branch-atomic-event-log WP09)",
-    "regression: Issue-pinned regression tests that exercise an exact reproduction sequence end-to-end (mission-coordination-branch-atomic-event-log WP09)",
-    "unit: Pure unit-level tests for a single module (legacy marker used by coordination tests)",
-]
+# NOTE: pytest configuration (markers, pythonpath, testpaths, addopts) lives in
+# `pytest.ini`, which is the single source of truth. pytest reads only one
+# config file and prefers `pytest.ini` over `[tool.pytest.ini_options]` when
+# both are present, so a markers list here would be dead config that silently
+# drifts from the live registry (this block had already drifted ~10 markers out
+# of sync — see Priivacy-ai/spec-kitty#2034). Do not reintroduce
+# `[tool.pytest.ini_options]` here; add markers to `pytest.ini` instead. This
+# invariant is guarded by
+# tests/architectural/test_marker_registry_single_source.py.
 
 [tool.ruff]
 target-version = "py311"
@@ -236,14 +224,8 @@ ignore = [
 "src/specify_cli/cli/commands/agent/config.py" = ["B904"]
 "src/specify_cli/cli/commands/agent/status.py" = ["B904"]
 "src/specify_cli/cli/commands/agent/workflow.py" = ["B904"]
-# F822 false positives: these acceptance-support shims populate their namespace
-# at runtime via ``globals().update(_load_acceptance_api())``; the names in
-# ``__all__`` are real but resolved dynamically and not visible to static
-# analysis. The runtime guarantee is enforced by _load_acceptance_api itself.
-"scripts/tasks/acceptance_support.py" = ["F822"]
-".kittify/overrides/scripts/tasks/acceptance_support.py" = ["F822"]
 # TID251 (banned-api) is ENFORCED across the ENTIRE tests/ tree — see ADR
-# architecture/adrs/2026-05-28-1-... (Gap 3 / Gap 5) and the dedicated
+# docs/adr/3.x/2026-05-28-1-... (Gap 3 / Gap 5) and the dedicated
 # "[ENFORCED] banned-API (TID251)" gate in .github/workflows/ci-quality.yml.
 #
 # There are intentionally NO whole-directory TID251 exemptions for tests/. A directory
@@ -350,9 +332,6 @@ module = [
     "runtime.next.decision",
     "runtime.next.runtime_bridge",
     "specify_cli.orchestrator_api.commands",
-    "specify_cli.scripts.tasks.acceptance_support",
-    "specify_cli.scripts.tasks.task_helpers",
-    "specify_cli.scripts.tasks.tasks_cli",
     "specify_cli.scripts.validate_encoding",
     "specify_cli.status.validate",
     "specify_cli.sync.auth",
@@ -452,8 +431,7 @@ also_copy = [
     "src/specify_cli/compat/",  # compat package under test
     "README.md",
     "contracts/",  # JSON fixture files for contract tests
-    "docs/",  # Markdown files referenced by contract/terminology tests
-    "architecture/",  # Architecture docs referenced by tests/docs/ consistency checks
+    "docs/",  # Markdown files referenced by contract/terminology tests (incl. folded docs/architecture/)
 
     ".pytest_cache/spec-kitty-test-venv/",  # Pre-seeded venv so test_venv fixture skips rebuild
     "src/specify_cli/*.py",  # Copy all top-level modules (frontmatter, etc.)
@@ -491,4 +469,32 @@ also_copy = [
 do_not_mutate = [
     "src/specify_cli/upgrade/migrations/",
     "src/specify_cli/version_utils.py",
+]
+
+# ---------------------------------------------------------------------------
+# Coverage configuration
+# ---------------------------------------------------------------------------
+# relative_files = true: stores file paths relative to the project root (CWD)
+# in the .coverage data file.  This matters when multiple test jobs each run
+# with a narrow --cov=src/<package> argument, which would otherwise write
+# absolute per-package paths into each coverage.xml (e.g.
+# <source>/github/workspace/src/specify_cli</source> and
+# <source>/github/workspace/src/mission_runtime</source>).  SonarCloud then
+# tries to resolve a bare filename such as __init__.py against EVERY <source>
+# entry and, finding it under several of them, emits:
+#   ERROR Cannot resolve the file path '__init__.py' of the coverage report,
+#         ambiguity, the file exists in several 'source'.
+# With relative_files = true the Sonar normalization step in ci-quality.yml
+# can re-emit the XML with a single canonical <source>src</source> so every
+# path is unambiguous (e.g. src/specify_cli/__init__.py).
+#
+# [paths] maps per-package absolute source roots back to the single src/ tree
+# so that coverage combine (if ever used) merges data files correctly too.
+[tool.coverage.run]
+relative_files = true
+
+[tool.coverage.paths]
+source = [
+    "src/",
+    "/home/runner/work/spec-kitty/spec-kitty/src/",
 ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -25,6 +26,30 @@ def _run(cmd: list[str], cwd: Path, *, check: bool = True) -> subprocess.Complet
         text=True,
         check=check,
     )
+
+
+def _status_event(
+    event_id: str,
+    *,
+    mission_slug: str,
+    to_lane: str,
+) -> str:
+    return json.dumps(
+        {
+            "actor": "tester",
+            "at": "2026-06-15T04:00:00Z",
+            "event_id": event_id,
+            "execution_mode": "worktree",
+            "force": False,
+            "from_lane": "genesis",
+            "mission_slug": mission_slug,
+            "reason": None,
+            "review_ref": None,
+            "to_lane": to_lane,
+            "wp_id": "WP01",
+        },
+        sort_keys=True,
+    ) + "\n"
 
 
 def _init_repo(tmp_path: Path, mission_slug: str) -> tuple[Path, Path, str, str]:
@@ -72,7 +97,11 @@ def test_lifecycle_sync_clean_rebase_updates_lane_worktree(tmp_path: Path) -> No
 
     _run(["git", "switch", coordination_branch], repo)
     (feature_dir / "status.events.jsonl").write_text(
-        '{"wp_id":"WP01","to_lane":"claimed"}\n',
+        _status_event(
+            "01AAA000000000000000000001",
+            mission_slug="sync-clean",
+            to_lane="claimed",
+        ),
         encoding="utf-8",
     )
     _run(["git", "add", "kitty-specs/sync-clean/status.events.jsonl"], repo)
@@ -85,7 +114,6 @@ def test_lifecycle_sync_clean_rebase_updates_lane_worktree(tmp_path: Path) -> No
 
     report = sync_lane_after_coordination_commit(
         repo_root=repo,
-        feature_dir=feature_dir,
         mission_slug="sync-clean",
         wp_id="WP01",
         coordination_branch=coordination_branch,
@@ -106,7 +134,11 @@ def test_lifecycle_sync_recreates_missing_lane_worktree(tmp_path: Path) -> None:
 
     _run(["git", "switch", coordination_branch], repo)
     (feature_dir / "status.events.jsonl").write_text(
-        '{"wp_id":"WP01","to_lane":"in_review"}\n',
+        _status_event(
+            "01BBB000000000000000000002",
+            mission_slug="sync-missing-worktree",
+            to_lane="in_review",
+        ),
         encoding="utf-8",
     )
     _run(
@@ -122,7 +154,6 @@ def test_lifecycle_sync_recreates_missing_lane_worktree(tmp_path: Path) -> None:
 
     report = sync_lane_after_coordination_commit(
         repo_root=repo,
-        feature_dir=feature_dir,
         mission_slug="sync-missing-worktree",
         wp_id="WP01",
         coordination_branch=coordination_branch,
@@ -162,7 +193,6 @@ def test_lifecycle_sync_conflict_refuses_and_preserves_lane_state(tmp_path: Path
     with pytest.raises(LaneAutoRebaseSyncError) as exc_info:
         sync_lane_after_coordination_commit(
             repo_root=repo,
-            feature_dir=feature_dir,
             mission_slug="sync-conflict",
             wp_id="WP01",
             coordination_branch=coordination_branch,

@@ -6,8 +6,7 @@ from pathlib import Path
 import pytest
 
 
-pytestmark = [pytest.mark.doctrine]
-
+pytestmark = [pytest.mark.doctrine, pytest.mark.fast]
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_ROOT = REPO_ROOT / "src" / "doctrine" / "skills"
 SPK_SKILLS = {
@@ -48,6 +47,7 @@ SPK_SKILLS = {
     "spk-team-connectors",
     "spk-team-sync",
     "spk-team-tracker",
+    "spk-team-upsun-cli-sync",
 }
 LEGACY_ALIAS_SKILLS = {
     "ad-hoc-profile-load",

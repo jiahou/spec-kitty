@@ -18,6 +18,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from specify_cli.core.paths import assert_safe_path_segment
+
+from mission_runtime import CommitTarget
+from specify_cli.core.commit_guard import GuardCapability
 from specify_cli.events.sanitizer import sanitize_event_for_log
 from specify_cli.git.commit_helpers import SafeCommitError, safe_commit
 from runtime.next._internal_runtime.events import (
@@ -44,7 +48,7 @@ logger = logging.getLogger(__name__)
 def _generate_event_id() -> str:
     """Generate a ULID-format event ID."""
     try:
-        import ulid  # type: ignore[import-untyped]
+        import ulid
         return str(ulid.ULID())
     except ImportError:
         # Fallback: use a UUID4-based ID if ulid not available.
@@ -75,17 +79,29 @@ class DecisionGitLog:
         mission_slug: str,
         *,
         inner: RuntimeEventEmitter,
-        mission_id: str = "",
+        mission_id: str | None = None,
+        target: CommitTarget | None = None,
     ) -> None:
         self._repo_root = repo_root
         self._worktree_root = worktree_root
         self._destination_ref = destination_ref
         self._mission_slug = mission_slug
-        # Prefer the canonical ULID; fall back to slug for legacy callers.
-        self._mission_id = mission_id or mission_slug
+        # T010: the CommitTarget is resolved by the calling surface
+        # (runtime_bridge) which knows the coordination topology — it is passed
+        # in, not re-derived here. When a legacy caller supplies only the string
+        # destination_ref, fall back to a ref-only target on that ref: the decision
+        # log always lands on the per-mission coordination branch, and safe_commit
+        # reads only ``target.ref`` (the vestigial ``.kind`` carrier is dropped,
+        # WP04 drain; the VO field defaults transitionally until WP16 removes it).
+        self._target = target or CommitTarget(ref=destination_ref)
+        # WP04/FR-004: mission_id must be a ULID or None (fail-closed). Never
+        # substitute the slug — a slug in a mission_id field is a contract violation.
+        self._mission_id = mission_id
         self._inner = inner
+        # FR-001: validate mission_slug before joining into a FS path (traversal guard).
+        _safe_slug = assert_safe_path_segment(mission_slug)
         self._decisions_file = (
-            worktree_root / KITTY_SPECS_DIR / mission_slug / "decisions.events.jsonl"
+            worktree_root / KITTY_SPECS_DIR / _safe_slug / "decisions.events.jsonl"
         )
 
     # ------------------------------------------------------------------
@@ -193,9 +209,14 @@ class DecisionGitLog:
             safe_commit(
                 repo_root=self._repo_root,
                 worktree_root=self._worktree_root,
-                destination_ref=self._destination_ref,
+                target=self._target,
                 message="chore(decisions): record decision [skip ci]",
                 paths=(self._decisions_file,),
+                # The decision record lands on the (unprotected) coordination
+                # branch; STANDARD refuses a protected destination instead of
+                # waiving it — the refusal is logged below and the event line
+                # already written to disk is preserved (FR-008).
+                capability=GuardCapability.STANDARD,
             )
         except SafeCommitError as exc:
             _observed = getattr(exc, "observed_head", None)

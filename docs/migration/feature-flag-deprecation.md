@@ -1,14 +1,23 @@
 ---
-title: "Migration: --feature to --mission"
-description: "Migration guidance for Migration: --feature to --mission in Spec Kitty 3.2, including upgrade context and historical behavior boundaries."
+title: 'Migration: --feature to --mission'
+description: 'Migration from the --feature flag to --mission, deprecated in mission 077 and partially removed in 3.2.x (#1060-A): the timeline and the required call-site changes.'
+doc_status: active
+updated: '2026-06-15'
 ---
-
 > Migration note: This page documents a migration path or historical transition. It is not the current 3.2 happy path.
 
 # Migration: `--feature` to `--mission`
 
 **Status**: Deprecated as of Mission `077-mission-terminology-cleanup`.
-**Removal**: Gated on named conditions. No calendar date is set.
+**Partial removal (3.2.x, #1060-A)**: the alias has been **removed from the
+internal/agent command cluster** (`agent status/tasks/action/context/mission`,
+`charter lint`, `materialize`, `validate-encoding`, `validate-tasks`,
+`verify`/`verify-setup`). On those commands `--feature` is no longer accepted —
+the parser rejects it with "No such option". It remains a hidden alias only on
+the deferred user-facing top-level commands (`implement`, `merge`, `next`,
+`research`, `context`, `accept`, `lifecycle`, `mission-type`) pending full
+removal (gated by #1059).
+**Full removal**: Gated on named conditions. No calendar date is set.
 
 ## Why This Change
 
@@ -20,9 +29,10 @@ canonical terminology boundary:
 - **Mission** = concrete tracked item under `kitty-specs/<mission-slug>/`
 - **Mission Run** = runtime/session execution instance only
 
-`--feature` remains available only as a hidden deprecated alias during the
-migration window so older scripts can keep running while first-party surfaces
-finish moving to `--mission`.
+`--feature` remains available only as a hidden deprecated alias **on the deferred
+user-facing top-level commands** during the migration window so older scripts can
+keep running while first-party surfaces finish moving to `--mission`. On the
+internal/agent command cluster it has already been removed (3.2.x, #1060-A).
 
 ## What Changed
 
@@ -30,13 +40,20 @@ finish moving to `--mission`.
 | --- | --- |
 | `spec-kitty mission current --feature 077-foo` | `spec-kitty mission current --mission 077-foo` |
 | `spec-kitty next --feature 077-foo` | `spec-kitty next --mission 077-foo` |
-| `spec-kitty agent tasks status --feature 077-foo` | `spec-kitty agent tasks status --mission 077-foo` |
+| `spec-kitty agent tasks status --feature 077-foo` | `spec-kitty agent tasks status --mission 077-foo` (the `--feature` form is now **removed** — it errors) |
 
-The alias still resolves, but it emits a deprecation warning on stderr.
+On the deferred user-facing commands the alias still resolves but emits a
+deprecation warning on stderr. On the internal/agent cluster (3.2.x, #1060-A) the
+alias is gone and `--feature` is rejected with "No such option".
 
 ## Behavioral Changes
 
-1. Passing both `--mission` and `--feature` with different values now fails fast with a deterministic conflict error.
+On the internal/agent command cluster, any `--feature` occurrence is now a
+parser error. The command exits before selector resolution.
+
+On the deferred user-facing commands that still carry the hidden alias:
+
+1. Passing both `--mission` and `--feature` with different values fails fast with a deterministic conflict error.
 2. Passing both flags with the same value succeeds, but still emits the deprecation warning once.
 3. `--feature` is hidden from `--help` output. New examples and docs must use `--mission`.
 
@@ -85,6 +102,6 @@ Removal is a separate change. There is no date-based removal promise.
 ## References
 
 - [Mission spec](https://github.com/Priivacy-ai/spec-kitty/blob/main/kitty-specs/077-mission-terminology-cleanup/spec.md)
-- [Mission Type / Mission / Mission Run Terminology Boundary ADR](https://github.com/Priivacy-ai/spec-kitty/blob/main/architecture/2.x/adr/2026-04-04-2-mission-type-mission-and-mission-run-terminology-boundary.md)
-- [Mission Nomenclature Reconciliation initiative](https://github.com/Priivacy-ai/spec-kitty/blob/main/architecture/2.x/initiatives/2026-04-mission-nomenclature-reconciliation/README.md)
+- [Mission Type / Mission / Mission Run Terminology Boundary ADR](https://github.com/Priivacy-ai/spec-kitty/blob/main/docs/adr/3.x/2026-04-04-2-mission-type-mission-and-mission-run-terminology-boundary.md)
+- [Mission Nomenclature Reconciliation initiative](https://github.com/Priivacy-ai/spec-kitty/blob/main/docs/plans/initiatives/2026-04-mission-nomenclature-reconciliation/README.md)
 - [Tracking issue #241](https://github.com/Priivacy-ai/spec-kitty/issues/241)

@@ -20,9 +20,22 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from specify_cli.core.atomic import atomic_write
+from specify_cli.core.paths import safe_mission_slug
+
+# Hoisted S1192 literals (campsite #1970) -- the meta.json filename and the two
+# decode encodings appear across this module and the legacy contracts it absorbs.
+META_FILENAME: str = "meta.json"
+_UTF8: str = "utf-8"
+_UTF8_SIG: str = "utf-8-sig"  # BOM-tolerant decode preserved from contract (b).
+
+# Malformed-JSON policy for :func:`load_meta` (FR-006a). One of:
+#   "raise" -- raise ValueError (canonical contract (a)).
+#   "empty" -- swallow and return ``{}`` (silent contract (c)).
+#   "none"  -- swallow and return ``None``.
+OnMalformed = Literal["raise", "empty", "none"]
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +235,17 @@ def resolve_mission_identity(feature_dir: Path) -> MissionIdentity:
     raw_number = meta.get("mission_number")
     mission_number: int | None = _coerce_mission_number(raw_number)
 
-    resolved_slug = str(meta.get("mission_slug") or meta.get("slug") or feature_dir.name)
+    # FR-009 chokepoint (IC-05): meta.json's ``mission_slug`` is UNTRUSTED and is
+    # consumed by ``status/views.py:_stale_check_slug`` and the ``status/lifecycle.py``
+    # empty-event-slug fallback, both of which join it into ``derived/<slug>/`` and
+    # ``mkdir``/write. A hostile ``"../../../../evil"`` slug would escape the derived
+    # root via this live write-path (the #2036 reducer seam covers only the event
+    # slug, not this meta read). Route through the canonical fail-closed seam (C-002):
+    # a valid slug passes through unchanged (display preserved); an unsafe slug
+    # downgrades to the trusted ``feature_dir.name``.
+    raw_slug = meta.get("mission_slug") or meta.get("slug")
+    raw_slug_str = str(raw_slug) if raw_slug is not None else None
+    resolved_slug = safe_mission_slug(raw_slug_str, feature_dir.name)
     resolved_type = str(meta.get("mission_type") or meta.get("mission") or "").strip() or "software-dev"
 
     return MissionIdentity(
@@ -238,23 +261,129 @@ def resolve_mission_identity(feature_dir: Path) -> MissionIdentity:
 # ---------------------------------------------------------------------------
 
 
-def load_meta(feature_dir: Path) -> dict[str, Any] | None:
-    """Load ``meta.json`` from *feature_dir*.  Returns ``None`` if missing.
+def _absorbed_missing(on_malformed: OnMalformed) -> dict[str, Any] | None:
+    """Return value for an *allowed* missing file, matched to *on_malformed*.
 
-    Raises :class:`ValueError` when the file exists but contains malformed
-    JSON.
+    The silent contract (c) absorbs both missing and malformed to ``{}``; the
+    canonical/none contracts absorb a missing file to ``None``.  Keeping the
+    missing-return shape aligned with the malformed policy lets one
+    ``allow_missing``/``on_malformed`` pair reproduce all three legacy contracts.
     """
-    meta_path = feature_dir / "meta.json"
+    return {} if on_malformed == "empty" else None
+
+
+def load_meta(
+    feature_dir: Path,
+    *,
+    allow_missing: bool = True,
+    on_malformed: OnMalformed = "raise",
+    encoding: str = _UTF8,
+) -> dict[str, Any] | None:
+    """Load ``meta.json`` from *feature_dir* -- the ONE canonical reader (FR-006a).
+
+    This polymorphic reader absorbs the three error contracts the codebase used
+    to spell ad-hoc.  Pick the contract via the keyword-only parameters:
+
+    - **Canonical (a)** ``allow_missing=True, on_malformed="raise"`` (defaults):
+      ``None`` on a missing file; raises :class:`ValueError` on malformed JSON
+      or a non-object top level.  This preserves the historical default.
+    - **Strict (b)** ``allow_missing=False`` (see :func:`load_meta_strict`):
+      raises :class:`FileNotFoundError` on a missing file.  Combine with
+      ``encoding="utf-8-sig"`` for the BOM-tolerant decode of the legacy
+      task-helper contract.
+    - **Silent (c)** ``on_malformed="empty"`` (see :func:`load_meta_or_empty`):
+      returns ``{}`` on a missing file *and* on any malformed/non-object
+      content -- never raises for content errors.
+
+    Args:
+        feature_dir: Directory containing ``meta.json``.
+        allow_missing: When ``True`` (default), a missing file yields ``None``
+            (or ``{}`` under ``on_malformed="empty"``).  When ``False``, a
+            missing file raises :class:`FileNotFoundError`.
+        on_malformed: Policy for malformed JSON / non-object top level --
+            ``"raise"`` (default), ``"empty"`` (``{}``), or ``"none"``
+            (``None``).
+        encoding: Decode encoding.  Use ``"utf-8-sig"`` to tolerate a UTF-8 BOM.
+
+    Returns:
+        The parsed ``meta.json`` mapping, or the absorbed sentinel
+        (``None`` / ``{}``) per the selected contract.
+
+    Raises:
+        FileNotFoundError: When the file is missing and ``allow_missing`` is
+            ``False``.
+        ValueError: When the file is malformed (or not a JSON object) and
+            ``on_malformed`` is ``"raise"``.
+    """
+    meta_path = feature_dir / META_FILENAME
     if not meta_path.exists():
-        return None
-    text = meta_path.read_text(encoding="utf-8")
+        if allow_missing:
+            return _absorbed_missing(on_malformed)
+        raise FileNotFoundError(f"No {META_FILENAME} in {feature_dir}")
+    return _parse_meta_text(meta_path, on_malformed=on_malformed, encoding=encoding)
+
+
+def _parse_meta_text(
+    meta_path: Path,
+    *,
+    on_malformed: OnMalformed,
+    encoding: str,
+) -> dict[str, Any] | None:
+    """Decode and parse an existing ``meta.json`` per *on_malformed*.
+
+    A read/decode error (``OSError``) or a JSON syntax error or a non-object top
+    level is "malformed".  Under ``"raise"`` it surfaces as :class:`ValueError`;
+    under ``"empty"``/``"none"`` it is absorbed to ``{}``/``None``.
+    """
     try:
+        text = meta_path.read_text(encoding=encoding)
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Malformed JSON in {meta_path}: {exc}") from exc
+    except (json.JSONDecodeError, OSError) as exc:
+        if on_malformed == "raise":
+            raise ValueError(f"Malformed JSON in {meta_path}: {exc}") from exc
+        return {} if on_malformed == "empty" else None
     if not isinstance(data, dict):
-        raise ValueError(f"Expected JSON object in {meta_path}, got {type(data).__name__}")
+        if on_malformed == "raise":
+            raise ValueError(
+                f"Expected JSON object in {meta_path}, got {type(data).__name__}"
+            )
+        return {} if on_malformed == "empty" else None
     return data
+
+
+def load_meta_strict(feature_dir: Path, *, bom_tolerant: bool = True) -> dict[str, Any]:
+    """Raise-on-missing adapter (legacy contract (b)).
+
+    Reproduces ``task_utils.support.load_meta`` / the old ``task_helpers``
+    loader: raises :class:`FileNotFoundError` when ``meta.json`` is absent, and
+    decodes BOM-tolerantly (``utf-8-sig``) by default.  A non-object top level
+    is coerced to ``{}`` (matching the legacy ``isinstance`` guard), never
+    raised.
+
+    Returns the parsed mapping (never ``None``).
+    """
+    result = load_meta(
+        feature_dir,
+        allow_missing=False,
+        on_malformed="empty",
+        encoding=_UTF8_SIG if bom_tolerant else _UTF8,
+    )
+    # allow_missing=False raises before returning; on_malformed="empty" never
+    # returns None -- so ``result`` is always a dict.  ``or {}`` narrows the
+    # ``| None`` for the type checker without an assert that ``-O`` would strip.
+    return result or {}
+
+
+def load_meta_or_empty(feature_dir: Path) -> dict[str, Any]:
+    """Silent empty-dict adapter (legacy contract (c)).
+
+    Reproduces ``retrospective.generator._load_meta`` / ``review._load_meta``:
+    returns ``{}`` when ``meta.json`` is missing *or* malformed -- never raises.
+    """
+    result = load_meta(feature_dir, allow_missing=True, on_malformed="empty")
+    # on_malformed="empty" never yields None; ``or {}`` narrows ``| None`` for
+    # the type checker (value-preserving: ``{} or {}`` is ``{}``).
+    return result or {}
 
 
 def validate_meta(meta: dict[str, Any]) -> list[str]:
@@ -570,6 +699,79 @@ def set_change_mode(
     meta["change_mode"] = mode
     write_meta(feature_dir, meta)
     return meta
+
+
+_MERGE_FIELDS: tuple[str, ...] = (
+    "merged_at",
+    "merged_by",
+    "merged_into",
+    "merged_strategy",
+    "merged_push",
+    "merged_commit",
+)
+
+
+def clear_merge_metadata(feature_dir: Path) -> dict[str, Any]:
+    """Remove the ``merged_*`` fields from ``meta.json`` and return a snapshot.
+
+    Used by ``spec-kitty mission reopen`` (WP02 / FR-002): a re-open clears the
+    top-level merge markers so a later ``spec-kitty merge`` can re-stamp them.
+    The returned dict is the snapshot of the cleared fields (empty when none were
+    present), retained by the caller for audit / reversibility in the
+    ``MissionReopened`` event's ``cleared_merge`` payload.
+
+    ``merge_history`` is intentionally preserved — re-open is reversible and the
+    bounded history remains a durable audit trail. The write is tolerant
+    (``validate=False``) so it never fails on legacy missions whose ``meta.json``
+    predates a required field; clearing optional merge markers must not be gated
+    on full required-field validation.
+
+    Raises:
+        FileNotFoundError: If ``meta.json`` does not exist in *feature_dir*.
+    """
+    meta = load_meta(feature_dir)
+    if meta is None:
+        raise FileNotFoundError(f"No meta.json in {feature_dir}")
+
+    cleared: dict[str, Any] = {}
+    for field in _MERGE_FIELDS:
+        if field in meta:
+            cleared[field] = meta.pop(field)
+
+    if cleared:
+        write_meta(feature_dir, meta, validate=False)
+    return cleared
+
+
+def clear_coordination_metadata(feature_dir: Path) -> dict[str, Any]:
+    """Remove the ``coordination_branch`` marker from ``meta.json`` (flatten).
+
+    Used by ``spec-kitty mission close --discard``: once the coordination branch
+    and worktree have been torn down, the mission is intentionally flattened to a
+    single-branch/primary topology. Leaving a dangling ``coordination_branch`` key
+    pointing at a now-deleted branch makes ``resolve_action_context`` fail closed
+    (``CoordinationBranchDeleted`` — "data loss") on every subsequent command for
+    that mission. Clearing it is the canonical "flatten the mission" recovery the
+    surface resolver itself recommends.
+
+    Returns a snapshot of the cleared fields (empty when none were present). The
+    write is tolerant (``validate=False``) so it never fails on legacy missions
+    whose ``meta.json`` predates a required field.
+
+    Raises:
+        FileNotFoundError: If ``meta.json`` does not exist in *feature_dir*.
+    """
+    meta = load_meta(feature_dir)
+    if meta is None:
+        raise FileNotFoundError(f"No meta.json in {feature_dir}")
+
+    cleared: dict[str, Any] = {}
+    if "coordination_branch" in meta:
+        cleared["coordination_branch"] = meta.pop("coordination_branch")
+
+    if cleared:
+        write_meta(feature_dir, meta, validate=False)
+    return cleared
 
 
 def get_change_mode(feature_dir: Path) -> str | None:

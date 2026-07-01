@@ -31,6 +31,7 @@ from typer.testing import CliRunner
 
 from specify_cli.cli.commands.agent.mission import app
 from specify_cli.coordination.status_transition import read_events_transactional
+from specify_cli.core.commit_guard import GuardCapability
 from specify_cli.status.bootstrap import bootstrap_canonical_state
 from specify_cli.status.store import EVENTS_FILENAME
 
@@ -141,6 +142,12 @@ def _build_coord_topology(
     mission_id = "01CLOBBR000000000000000000"  # 26-char ULID (mid8 + 18 zeros)
     mission_dirname = f"{mission_slug}-{mid8}"
     coord_branch = f"kitty/mission-{mission_dirname}"
+    # write-surface-coherence (FR-002 / FR-008): planning artifacts (TASKS_INDEX)
+    # land on the primary feature target_branch — a NON-protected branch the
+    # operator is on. A protected ``main`` target would be REFUSED (G-4). Status
+    # still routes to the coordination branch (the partition), so the event-log
+    # survival subject of this test is unchanged.
+    target_branch = "feat/clobber-target"
 
     feature_dir = repo / "kitty-specs" / mission_dirname
     tasks_dir = feature_dir / "tasks"
@@ -153,7 +160,7 @@ def _build_coord_topology(
                 "mission_id": mission_id,
                 "mid8": mid8,
                 "coordination_branch": coord_branch,
-                "target_branch": "main",
+                "target_branch": target_branch,
             }
         )
         + "\n",
@@ -170,6 +177,9 @@ def _build_coord_topology(
     _git(repo, "commit", "-q", "-m", "seed mission")
     # Create the coordination branch pointing at same commit
     _git(repo, "branch", coord_branch)
+    # The operator is ON the feature target_branch (D-3 invariant): the planning
+    # commit lands there directly. Check it out as HEAD.
+    _git(repo, "checkout", "-q", "-b", target_branch)
 
     # Return mission_dirname as the CLI handle (what --mission expects)
     return repo, mission_dirname, mid8, coord_branch, feature_dir
@@ -212,7 +222,7 @@ class TestT024CoordFinalizePreservesBootstrapEvents:
         # Step 1: bootstrap seeded events into the coord worktree (genesis → planned).
         bootstrap_result = bootstrap_canonical_state(
             feature_dir, mission_slug, dry_run=False,
-            allow_protected_branch_in_test_mode=True,
+            capability=GuardCapability.TEST_MODE,
         )
         assert bootstrap_result.newly_seeded == 2, (
             f"bootstrap should have seeded 2 WPs, got {bootstrap_result.newly_seeded}"
@@ -418,7 +428,7 @@ class TestT026CoordReFinalizeEmptyChangeset:
         # Bootstrap the coord events first.
         bootstrap_canonical_state(
             feature_dir, mission_slug, dry_run=False,
-            allow_protected_branch_in_test_mode=True,
+            capability=GuardCapability.TEST_MODE,
         )
 
         _finalize_patches = [

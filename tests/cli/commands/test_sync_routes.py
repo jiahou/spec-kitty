@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 
 from specify_cli.auth.session import StoredSession, Team
 from specify_cli.cli.commands import sync as sync_module
-from specify_cli.sync.batch import BatchEventResult, BatchSyncResult
+from specify_cli.delivery.dispatcher import DispatchSummary
 
 runner = CliRunner()
 pytestmark = pytest.mark.fast
@@ -158,6 +158,77 @@ def test_share_command_retries_after_materializing_private_source(monkeypatch: p
     assert "Waiting for a team admin" in result.stdout
 
 
+def test_share_command_requires_persisted_project_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_tm = Mock()
+    fake_tm.get_current_session.return_value = _session()
+    request_share = Mock()
+    monkeypatch.setattr(sync_module, "is_saas_sync_enabled", lambda: True)
+    monkeypatch.setattr("specify_cli.auth.get_token_manager", lambda: fake_tm)
+    monkeypatch.setattr(
+        "specify_cli.sync.routing.resolve_checkout_sync_routing",
+        lambda start=None: type(
+            "Routing",
+            (),
+            {
+                "repo_root": None,
+                "repo_slug": "acme/spec-kitty",
+                "project_uuid": None,
+                "project_slug": "spec-kitty-local",
+                "build_id": None,
+                "effective_sync_enabled": True,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "specify_cli.sync.sharing_client.request_repository_share_sync",
+        request_share,
+    )
+
+    with patch.object(sync_module, "_materialize_private_source_project") as mock_materialize:
+        result = runner.invoke(sync_module.app, ["share", "product-team"])
+
+    assert result.exit_code == 1
+    assert "Run `spec-kitty init` first" in result.stdout
+    request_share.assert_not_called()
+    mock_materialize.assert_not_called()
+
+
+def test_routes_command_skips_share_lookup_without_project_uuid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_tm = Mock()
+    fake_tm.get_current_session.return_value = _session()
+    list_shares = Mock()
+    monkeypatch.setattr(sync_module, "is_saas_sync_enabled", lambda: True)
+    monkeypatch.setattr("specify_cli.auth.get_token_manager", lambda: fake_tm)
+    monkeypatch.setattr(
+        "specify_cli.sync.routing.resolve_checkout_sync_routing",
+        lambda start=None: type(
+            "Routing",
+            (),
+            {
+                "repo_slug": "acme/spec-kitty",
+                "project_uuid": None,
+                "project_slug": "spec-kitty-local",
+                "build_id": None,
+                "effective_sync_enabled": True,
+                "local_sync_enabled": None,
+                "repo_default_sync_enabled": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "specify_cli.sync.sharing_client.list_repository_shares_sync",
+        list_shares,
+    )
+
+    result = runner.invoke(sync_module.app, ["routes"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "Run `spec-kitty init` first" in result.stdout
+    list_shares.assert_not_called()
+
+
 def test_share_command_blocks_when_teamspace_mission_state_migration_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -294,56 +365,61 @@ def test_now_logged_out_nonempty_queue_reports_unauthenticated_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    """Issue #829: logged-out sync now is unauthenticated, not generic sync failure.
+    """Issue #829: a logged-out ``sync now`` with events to deliver is a
+    *graceful* unauthenticated failure (exit 1), NOT a generic/teamspace-state
+    exit (4).
 
-    The autouse ``_isolate_home_for_preflight`` fixture above redirects
-    ``Path.home()`` to a tmp dir so the WP03 boundary preflight transitively
-    invoked by ``sync now`` evaluates against a clean state. The preflight in
-    ``sync now`` is called with ``require_auth=False`` by design — auth-absent
-    falls through to the existing ``service.sync_now()`` graceful
-    failure-report path (the behavior this test exercises).
+    WP12 retired the destructive legacy ``service.sync_now()`` event drain in
+    favour of the journal dispatcher (the single, non-destructive delivery
+    path). A logged-out delivery now surfaces as a dispatch where events were
+    *selected* and attempted but none were delivered — a 401 maps the whole
+    batch to ``transient`` (see ``specify_cli.delivery.receivers``). That
+    "attempted but nothing delivered" outcome is the dispatch analogue of the
+    legacy per-event ``unauthenticated`` result and must keep the Issue #829
+    exit-1 UX. It must NOT be reclassified as the "nothing attempted / blocked"
+    teamspace-recovery exit (4) — verified passing on merge-base ``7530597a``.
+
+    The autouse ``_isolate_home_for_preflight`` fixture redirects ``Path.home()``
+    to a tmp dir so the WP03 boundary preflight (``require_auth=False``)
+    evaluates against a clean state and falls through to the delivery path.
     """
-    unauthenticated_result = BatchSyncResult()
-    unauthenticated_result.total_events = 3
-    unauthenticated_result.error_count = 3
-    unauthenticated_result.failed_ids = ["evt-1", "evt-2", "evt-3"]
-    unauthenticated_result.error_messages = [
-        "Not authenticated: no valid access token. Run `spec-kitty auth login`."
-    ]
-    unauthenticated_result.event_results = [
-        BatchEventResult(
-            event_id=f"evt-{index}",
-            status="rejected",
-            error="Not authenticated: no valid access token. Run `spec-kitty auth login`.",
-            error_category="unauthenticated",
-        )
-        for index in range(1, 4)
-    ]
     service = Mock()
     service.queue.size.return_value = 3
-    service.sync_now.return_value = unauthenticated_result
+    service.drain_body_uploads_only.return_value = None
+
+    # A logged-out dispatch: 3 events selected and attempted, none delivered
+    # (the whole batch came back transient — the 401 classification).
+    unauthenticated_summary = DispatchSummary(
+        target_id="t-1",
+        selected=3,
+        delivered=0,
+        duplicate=0,
+        pending=0,
+        rejected=0,
+        transient=3,
+        terminal_failed=0,
+    )
 
     monkeypatch.setattr(sync_module, "is_saas_sync_enabled", lambda: True)
     monkeypatch.setattr(
         "specify_cli.sync.background.get_sync_service",
         lambda: service,
     )
-    report_path = tmp_path / "sync-failures.json"
+    monkeypatch.setattr(
+        sync_module, "_run_event_sync_dispatch", lambda: unauthenticated_summary
+    )
+    report_path = tmp_path / "sync-report.json"
 
     result = runner.invoke(sync_module.app, ["now", "--report", str(report_path)])
 
-    assert result.exit_code == 1
-    assert "unauthenticated" in result.stdout
+    # Issue #829: graceful unauthenticated exit 1, not the teamspace-state exit 4.
+    assert result.exit_code == 1, result.stdout
     assert "spec-kitty auth login" in result.stdout
-    assert "Errors:" in result.stdout
-    assert "3" in result.stdout
-    assert "Failure report written" in result.stdout
-    assert "server_error" not in result.stdout
+    assert "not authenticated" in result.stdout.lower()
+    # The dispatch report (the single delivery path's observable surface) lands.
+    assert "report written" in result.stdout.lower()
     report = json.loads(report_path.read_text())
-    assert report["summary"]["failed"] == 3
-    assert report["summary"]["categories"] == {"unauthenticated": 3}
-    assert [failure["category"] for failure in report["failures"]] == [
-        "unauthenticated",
-        "unauthenticated",
-        "unauthenticated",
-    ]
+    assert report["dispatched"] is True
+    assert report["selected"] == 3
+    assert report["transient"] == 3
+    assert report["delivered"] == 0

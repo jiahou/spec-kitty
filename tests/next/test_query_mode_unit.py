@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -76,7 +75,7 @@ class TestQueryModeDoesNotAdvance:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision) as mock_query,
             patch("specify_cli.cli.commands.next_cmd.decide_next") as mock_decide,
         ):
@@ -93,7 +92,7 @@ class TestQueryModeDoesNotAdvance:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision) as mock_query,
         ):
             result = runner.invoke(
@@ -107,7 +106,7 @@ class TestQueryModeDoesNotAdvance:
     def test_result_success_still_requires_agent(self, tmp_path: Path) -> None:
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
         ):
             result = runner.invoke(
                 cli_app,
@@ -132,7 +131,7 @@ class TestQueryModeDoesNotAdvance:
         )
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
         ):
             result = runner.invoke(
                 cli_app,
@@ -156,7 +155,7 @@ class TestQueryModeDoesNotAdvance:
     def test_answer_requires_result_when_used_without_result(self, tmp_path: Path) -> None:
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
         ):
             result = runner.invoke(
                 cli_app,
@@ -172,7 +171,7 @@ class TestQueryModeDoesNotAdvance:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.cli.commands.next_cmd._handle_answer", return_value="input:approval") as mock_answer,
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision) as mock_query,
         ):
@@ -192,7 +191,7 @@ class TestQueryModeDoesNotAdvance:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.cli.commands.next_cmd._handle_answer", return_value="input:approval"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
@@ -212,7 +211,7 @@ class TestQueryModeOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
             result = runner.invoke(
@@ -242,7 +241,7 @@ class TestQueryModeOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
             result = runner.invoke(
@@ -260,7 +259,7 @@ class TestQueryModeOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
             result = runner.invoke(
@@ -292,7 +291,7 @@ class TestQueryModeOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
             result = runner.invoke(
@@ -312,7 +311,7 @@ class TestQueryModeOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
             result = runner.invoke(
@@ -334,7 +333,7 @@ class TestQueryModeOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
             result = runner.invoke(
@@ -352,7 +351,7 @@ class TestQueryModeOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.next.runtime_bridge.query_current_state", return_value=mock_decision),
         ):
             result = runner.invoke(
@@ -400,16 +399,51 @@ class TestQueryCurrentStateErrorPaths:
     unreachable via CLI-level tests.
     """
 
-    def test_missing_feature_dir_returns_unknown_state(self, tmp_path: Path) -> None:
-        """Line 575: feature_dir does not exist → Decision with mission_state='unknown'."""
-        from specify_cli.next.runtime_bridge import query_current_state
+    def test_missing_feature_dir_raises_mission_not_found(self, tmp_path: Path) -> None:
+        """Missing mission dirs fail closed instead of emitting synthetic unknown state."""
+        from specify_cli.next.runtime_bridge import MissionNotFoundError, query_current_state
 
         # tmp_path / "kitty-specs" / "069-missing" does NOT exist
-        decision = query_current_state("claude", "069-missing", tmp_path)
+        with pytest.raises(MissionNotFoundError, match="069-missing"):
+            query_current_state("claude", "069-missing", tmp_path)
 
-        assert decision.is_query is True
-        assert decision.mission_state == "unknown"
-        assert decision.kind == "query"
+    def test_resolved_missing_feature_dir_raises_mission_not_found(self, tmp_path: Path) -> None:
+        """Resolved-but-absent paths also fail closed."""
+        from mission_runtime import MissionArtifactContext, MissionArtifactKind, MissionContext, MissionTopology
+        from specify_cli.next.runtime_bridge import MissionNotFoundError, query_current_state
+
+        missing = tmp_path / "kitty-specs" / "069-missing"
+
+        with patch(
+            "mission_runtime.mission_context_for",
+            return_value=MissionContext(
+                mission_slug="069-missing",
+                mission_type="software-dev",
+                topology=MissionTopology.SINGLE_BRANCH,
+                artifacts=(
+                    MissionArtifactContext(
+                        kind=MissionArtifactKind.PRIMARY_METADATA,
+                        read_dir=missing,
+                        write_dir=missing,
+                        commit_target=None,
+                    ),
+                    MissionArtifactContext(
+                        kind=MissionArtifactKind.WORK_PACKAGE_TASK,
+                        read_dir=missing,
+                        write_dir=missing,
+                        commit_target=None,
+                    ),
+                    MissionArtifactContext(
+                        kind=MissionArtifactKind.STATUS_STATE,
+                        read_dir=missing,
+                        write_dir=missing,
+                        commit_target=None,
+                    ),
+                ),
+            ),
+        ):
+            with pytest.raises(MissionNotFoundError, match="069-missing"):
+                query_current_state("claude", "069-missing", tmp_path)
 
     def test_ephemeral_query_run_exception_raises_validation_error(self, tmp_path: Path) -> None:
         """Fresh-query bootstrap failures surface an actionable query error."""
@@ -770,7 +804,7 @@ class TestQueryModeErrorOutput:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch(
                 "specify_cli.next.runtime_bridge.query_current_state",
                 side_effect=QueryModeValidationError("Mission 'software-dev' has no issuable first step for run '069-test'"),
@@ -788,7 +822,7 @@ class TestQueryModeErrorOutput:
     def test_json_answer_failure_returns_single_error_document(self, tmp_path: Path) -> None:
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.cli.commands.next_cmd._handle_answer", side_effect=typer.Exit("No pending decisions to answer")),
         ):
             result = runner.invoke(
@@ -824,7 +858,7 @@ class TestResultSuccessStillAdvances:
 
         with (
             patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.next_cmd.resolve_selector", return_value=SimpleNamespace(canonical_value="069-test")),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-test"),
             patch("specify_cli.cli.commands.next_cmd.decide_next", return_value=mock_decision) as mock_decide,
             patch("specify_cli.next.runtime_bridge.query_current_state") as mock_query,
             patch("specify_cli.mission_v1.events.emit_event"),
@@ -836,3 +870,67 @@ class TestResultSuccessStillAdvances:
 
         mock_decide.assert_called_once()
         mock_query.assert_not_called()
+
+
+class TestMissionNotFoundNextStep:
+    """MissionNotFoundError carries + surfaces an actionable next_step (#1911)."""
+
+    def test_error_populates_next_step(self) -> None:
+        """The exception exposes a concrete operator remediation by default."""
+        from runtime.next.runtime_bridge import MissionNotFoundError
+
+        err = MissionNotFoundError("069-missing")
+
+        # Affordance restored: actionable, mentions how to list missions and
+        # echoes the bad handle so the operator can self-correct.
+        assert err.next_step
+        assert "mission list" in err.next_step
+        assert "069-missing" in err.next_step
+        # #1910 contract preserved exactly.
+        assert err.handle == "069-missing"
+        assert err.error_code == "MISSION_NOT_FOUND"
+
+    def test_query_mode_json_payload_surfaces_next_step(self, tmp_path: Path) -> None:
+        """The query-mode JSON envelope includes next_step beside error_code."""
+        from runtime.next.runtime_bridge import MissionNotFoundError
+
+        with (
+            patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-missing"),
+            patch(
+                "specify_cli.next.runtime_bridge.query_current_state",
+                side_effect=MissionNotFoundError("069-missing"),
+            ),
+        ):
+            result = runner.invoke(
+                cli_app,
+                ["next", "--mission", "069-missing", "--json"],
+            )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["error_code"] == "MISSION_NOT_FOUND"
+        assert payload["handle"] == "069-missing"
+        assert "next_step" in payload
+        assert "mission list" in payload["next_step"]
+
+    def test_query_mode_human_prints_next_line(self, tmp_path: Path) -> None:
+        """The human-readable query-mode path prints a 'Next:' remediation line."""
+        from runtime.next.runtime_bridge import MissionNotFoundError
+
+        with (
+            patch("specify_cli.cli.commands.next_cmd.locate_project_root", return_value=tmp_path),
+            patch("specify_cli.cli.commands.next_cmd._resolve_mission_slug", return_value="069-missing"),
+            patch(
+                "specify_cli.next.runtime_bridge.query_current_state",
+                side_effect=MissionNotFoundError("069-missing"),
+            ),
+        ):
+            result = runner.invoke(
+                cli_app,
+                ["next", "--mission", "069-missing"],
+            )
+
+        assert result.exit_code == 1
+        assert "Next:" in result.output
+        assert "mission list" in result.output

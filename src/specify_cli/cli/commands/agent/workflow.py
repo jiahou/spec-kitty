@@ -34,8 +34,17 @@ contract.
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
-from specify_cli.missions.feature_dir_resolver import candidate_feature_dir_for_mission, resolve_feature_dir_for_mission
+from specify_cli.core.constants import (
+    KITTY_SPECS_DIR,
+    MISSION_TYPE_RESEARCH,
+)
+from specify_cli.missions._read_path_resolver import (
+    _canonicalize_primary_read_handle,
+    candidate_feature_dir_for_mission,
+    primary_feature_dir_for_mission,
+    resolve_feature_dir_for_mission,
+    resolve_planning_read_dir,
+)
 import json
 import logging
 import re
@@ -44,14 +53,20 @@ import tempfile
 import contextlib
 from datetime import UTC
 from pathlib import Path
-from typing import Annotated
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Annotated
 
 import typer
+
+if TYPE_CHECKING:
+    from rich.console import Console
+
+    from specify_cli.bulk_edit.gate import DiffCheckResult
 
 from charter.context import build_charter_context
 from specify_cli.cli.commands.agent.tasks import _collect_status_artifacts
 from specify_cli.cli.commands.implement import implement as top_level_implement
-from specify_cli.cli.selector_resolution import resolve_mission_handle, resolve_selector
+from specify_cli.cli.selector_resolution import resolve_mission_handle
 from specify_cli.coordination.types import CommitReceipt
 from specify_cli.core.dependency_graph import (
     build_dependency_graph,
@@ -59,8 +74,9 @@ from specify_cli.core.dependency_graph import (
     get_dependents,
 )
 from specify_cli.core.paths import get_feature_target_branch, get_main_repo_root, is_worktree_context, locate_project_root
-from specify_cli.lanes.branch_naming import mid8_from_slug
 from specify_cli.core.utils import write_text_within_directory
+from mission_runtime import CommitTarget, MissionArtifactKind
+from specify_cli.core.commit_guard import GuardCapability
 from specify_cli.git import safe_commit
 from specify_cli.git.commit_helpers import SafeCommitRecoveryFailed
 from specify_cli.mission import get_deliverables_path, get_mission_type
@@ -89,7 +105,11 @@ from specify_cli.task_utils import (
     set_scalar,
     split_frontmatter,
 )
-from specify_cli.workspace.context import resolve_workspace_for_wp
+from specify_cli.workspace.context import (
+    ResolvedWorkspace,
+    husk_resolution_error,
+    resolve_workspace_for_wp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +132,63 @@ _STATUS_FILENAME = "status.json"
 # Module-level accumulator of CommitReceipts for the T029 terminal
 # summary. Reset by each top-level invocation.
 _WORKFLOW_COMMIT_RECEIPTS: list[dict[str, object]] = []
+
+
+def _enforce_bulk_edit_diff_compliance(
+    *,
+    feature_dir: Path,
+    main_repo_root: Path,
+    target_branch: str,
+    review_workspace: ResolvedWorkspace,
+    check_review_diff_compliance: Callable[..., DiffCheckResult | None],
+    render_diff_check_failure: Callable[..., None],
+    rich_console: Console,
+) -> None:
+    """Enforce per-file bulk-edit diff compliance for a WP under review (FR-007/8).
+
+    Inspects the WP's diff against its lane base branch and rejects modifications
+    to forbidden or unclassified surfaces. Raises ``typer.Exit(1)`` on failure;
+    surfaces ``manual_review`` warnings without blocking.
+    """
+    # The mission branch is the canonical base for a WP lane diff. If the
+    # review is running from the main repo (not a lane worktree), this
+    # still resolves because the mission branch exists until merge
+    # cleanup. If the branch cannot be resolved, fall back to the
+    # target_branch captured earlier in this function.
+    try:
+        from specify_cli.lanes.persistence import read_lanes_json as _read_lanes_json
+
+        _lanes_manifest = _read_lanes_json(feature_dir)
+        _base_ref = _lanes_manifest.mission_branch if _lanes_manifest is not None else target_branch
+    except Exception:
+        _base_ref = target_branch
+    # The WP diff must be the lane branch's changes on top of the mission
+    # branch, NOT `HEAD`. When review runs from the main repo checkout,
+    # `HEAD` is the mission's *target* branch (e.g. feat/...), so diffing
+    # base..HEAD surfaces the entire target-branch delta (hundreds of
+    # unrelated files) and the bulk-edit gate false-blocks. Use the WP's
+    # resolved lane branch as head; fall back to HEAD only for repo_root
+    # (direct-to-target / planning) workspaces where the changes really
+    # are on the current HEAD.
+    _head_ref = review_workspace.branch_name or "HEAD"
+    _diff_result = check_review_diff_compliance(
+        feature_dir=feature_dir,
+        repo_root=main_repo_root,
+        base_ref=_base_ref,
+        head_ref=_head_ref,
+    )
+    if _diff_result is None:
+        # Non-bulk-edit mission — skip silently. check_review_diff_compliance
+        # returns None when change_mode is not bulk_edit, which shouldn't
+        # happen here given the outer guard, but belt-and-braces.
+        pass
+    elif not _diff_result.passed:
+        render_diff_check_failure(_diff_result, rich_console)
+        raise typer.Exit(1)
+    elif _diff_result.warnings:
+        # Surface manual_review notes but don't block.
+        for _w in _diff_result.warnings:
+            rich_console.print(f"[yellow]manual_review:[/] {_w}")
 
 
 def _reset_workflow_receipts() -> None:
@@ -203,6 +280,7 @@ def _load_coord_branch_meta(feature_dir: Path) -> tuple[str | None, str | None, 
     Returns ``(None, None, None)`` for legacy missions or when meta.json
     is missing / unreadable. Never raises.
     """
+    from specify_cli.lanes.branch_naming import resolve_mid8
     from specify_cli.mission_metadata import load_meta
 
     try:
@@ -213,29 +291,37 @@ def _load_coord_branch_meta(feature_dir: Path) -> tuple[str | None, str | None, 
         return (None, None, None)
     coord = meta.get("coordination_branch") or None
     mid = meta.get("mission_id") or None
+    # Route the mission_id truncation through the canonical resolver (FR-001);
+    # the isinstance/>= 8 guard keeps the ``else None`` fallback byte-identical.
     mid8 = meta.get("mid8") or (
-        mid[:8] if isinstance(mid, str) and len(mid) >= 8 else None
+        resolve_mid8(feature_dir.name, mission_id=mid)
+        if isinstance(mid, str) and len(mid) >= 8
+        else None
     )
     return (coord, mid, mid8)
 
 
-def _mid8_for_mission_read_path(primary_feature_dir: Path, mission_slug: str) -> str:
-    """Return the mission mid8 token for topology-aware status reads."""
-    _, _, meta_mid8 = _load_coord_branch_meta(primary_feature_dir)
-    if meta_mid8:
-        return str(meta_mid8)
-
-    return mid8_from_slug(mission_slug)
-
-
 def _canonical_status_feature_dir(main_repo_root: Path, mission_slug: str) -> Path:
-    """Resolve the canonical read-side mission directory for status state."""
-    primary_feature_dir = candidate_feature_dir_for_mission(main_repo_root, mission_slug)
-    mid8 = _mid8_for_mission_read_path(primary_feature_dir, mission_slug)
+    """Resolve the canonical read-side mission directory for status state.
 
-    from specify_cli.missions._read_path_resolver import resolve_mission_read_path
+    Routes through the single guarded read-side seam
+    (:func:`resolve_handle_to_read_path`, WP01/IC-01): the seam reads the
+    PRIMARY ``meta.json`` to learn the declared identity, runs the ONE
+    sanctioned mid8 cascade (``resolve_declared_mid8``), and returns the
+    existence-gated topology-aware directory. This subsumes the prior bespoke
+    ``candidate_feature_dir_for_mission`` → ``_load_coord_branch_meta`` →
+    ``resolve_mid8`` → ``resolve_mission_read_path`` cascade. (FR-002, C-007)
 
-    return resolve_mission_read_path(main_repo_root, mission_slug, mid8)
+    Subsumption note: the retired ``_mid8_for_mission_read_path`` read the COORD
+    branch's meta via ``_load_coord_branch_meta`` to derive mid8, while the seam
+    anchors on PRIMARY meta. mid8 is mission *identity* (``mission_id`` / ``mid8``
+    are identical on both surfaces), so the primary anchor yields the same mid8;
+    no caller of ``_canonical_status_feature_dir`` consumed any coord-branch-only
+    meta field (all three read callers only need the resolved directory).
+    """
+    from specify_cli.missions._read_path_resolver import resolve_handle_to_read_path
+
+    return resolve_handle_to_read_path(main_repo_root, mission_slug)
 
 
 def _merge_event_log_bytes(existing: bytes, incoming: bytes) -> bytes:
@@ -340,16 +426,17 @@ def _render_lane_auto_rebase_failure(exc: BaseException) -> None:
 def _sync_lane_after_coordination_commit(
     *,
     repo_root: Path,
-    feature_dir: Path,
     mission_slug: str,
     wp_id: str,
     coord_branch: str,
 ) -> None:
     from specify_cli.lanes.lifecycle_sync import sync_lane_after_coordination_commit
 
+    # No ``feature_dir``: ``sync_lane_after_coordination_commit`` self-resolves the
+    # LANE_STATE (lanes.json) read onto the PRIMARY anchor (#2185). Passing the
+    # coord-aware STATUS dir here previously routed the lanes read onto the husk.
     sync_lane_after_coordination_commit(
         repo_root=repo_root,
-        feature_dir=feature_dir,
         mission_slug=mission_slug,
         wp_id=wp_id,
         coordination_branch=coord_branch,
@@ -406,13 +493,17 @@ def _commit_via_legacy_safe_commit(
     wp_id: str,
 ) -> None:
     """Commit workflow changes directly on legacy mission branches."""
+    # Legacy mission-branch workflow commits land on ``target_branch`` (a lane /
+    # mission branch), which is normally not protected. STANDARD asserts no
+    # protected-branch flow: a protected ``target_branch`` (legacy missions
+    # tracking ``main``) is REFUSED by the guard, never waived (FR-008).
     result = safe_commit(
         repo_root=repo_root,
         worktree_root=repo_root,
-        destination_ref=target_branch,
+        target=CommitTarget(ref=target_branch),
         message=message,
         paths=tuple(paths),
-        allow_protected_branch_in_test_mode=True,
+        capability=GuardCapability.STANDARD,
     )
     _record_receipt(
         target_branch,
@@ -504,7 +595,6 @@ def _commit_workflow_change(
             try:
                 _sync_lane_after_coordination_commit(
                     repo_root=repo_root,
-                    feature_dir=feature_dir,
                     mission_slug=mission_slug,
                     wp_id=wp_id,
                     coord_branch=str(coord_branch),
@@ -590,13 +680,19 @@ def _print_commit_summary(*, command_name: str, json_output: bool = False) -> No
 
 def _write_prompt_to_file(
     command_type: str,
+    mission_slug: str,
     wp_id: str,
     content: str,
 ) -> Path:
     """Write full prompt content to a temp file for agents with output limits.
 
+    The filename is scoped by ``mission_slug`` so that concurrent missions
+    sharing a WP id (e.g. two missions both with ``WP01``) do not collide on the
+    same ``/tmp`` path and overwrite each other's prompt (#1831).
+
     Args:
         command_type: "implement" or "review"
+        mission_slug: Mission slug used to scope the temp filename
         wp_id: Work package ID (e.g., "WP01")
         content: Full prompt content to write
 
@@ -604,7 +700,10 @@ def _write_prompt_to_file(
         Path to the written file
     """
     # Use system temp directory (gets cleaned up automatically)
-    prompt_file = Path(tempfile.gettempdir()) / f"spec-kitty-{command_type}-{wp_id}.md"
+    prompt_file = (
+        Path(tempfile.gettempdir())
+        / f"spec-kitty-{command_type}-{mission_slug}-{wp_id}.md"
+    )
     prompt_file.write_text(content, encoding="utf-8")
     return prompt_file
 
@@ -767,12 +866,19 @@ def _shared_artifact_guidance(workspace, repo_root: Path, mission_slug: str) -> 
 
 app = typer.Typer(name="action", help="Mission action commands that display prompts and instructions for agents", no_args_is_help=True)
 
-_CANONICAL_STATUS_NOT_FOUND = "canonical status not found"
-
-
 def _is_missing_canonical_status_error(exc: BaseException) -> bool:
-    """Return True when *exc* indicates missing canonical status bootstrap."""
-    return _CANONICAL_STATUS_NOT_FOUND in str(exc).lower()
+    """Return True when *exc* indicates missing canonical status bootstrap.
+
+    Uses a structured ``isinstance`` check against the typed
+    :class:`CanonicalStatusNotFoundError` (exported from the status facade)
+    rather than matching prose in the exception message. ``locate_work_package``
+    raises this type unwrapped (via ``get_wp_lane`` → ``get_lane_from_frontmatter``),
+    so the type is visible at the call sites; a substring gate on the message
+    would silently break the moment the wording is reworded (Cluster D).
+    """
+    from specify_cli.status import CanonicalStatusNotFoundError
+
+    return isinstance(exc, CanonicalStatusNotFoundError)
 
 
 def _missing_canonical_status_message(
@@ -883,7 +989,6 @@ def _ensure_target_branch_checked_out(repo_root: Path, mission_slug: str) -> tup
 
 def _find_mission_slug(
     explicit_mission: str | None = None,
-    explicit_feature: str | None = None,
     repo_root: Path | None = None,
 ) -> str:
     """Require an explicit mission slug (no auto-detection).
@@ -894,39 +999,32 @@ def _find_mission_slug(
 
     Args:
         explicit_mission: Mission slug provided explicitly.
-        explicit_feature: Mission slug provided via hidden --feature alias.
         repo_root: Repository root; if provided, enables canonical resolver.
 
     Returns:
         Mission slug (e.g., "008-unified-python-cli")
 
     Raises:
-        typer.Exit: If mission slug is not provided or selectors conflict.
+        typer.Exit: If mission slug is not provided.
     """
-    try:
-        selector = resolve_selector(
-            canonical_value=explicit_mission,
-            canonical_flag="--mission",
-            alias_value=explicit_feature,
-            alias_flag="--feature",
-            suppress_env_var="SPEC_KITTY_SUPPRESS_FEATURE_DEPRECATION",
-            command_hint="--mission <slug>",
-        )
-    except typer.BadParameter as e:
-        print(f"Error: {e}")
+    if not explicit_mission or not explicit_mission.strip():
+        print("Error: --mission <slug> is required")
         raise typer.Exit(1)
 
-    raw_handle = selector.canonical_value
-    if raw_handle is not None and repo_root is not None:
+    raw_handle = explicit_mission.strip()
+    if repo_root is not None:
         legacy_dir = candidate_feature_dir_for_mission(get_main_repo_root(repo_root), raw_handle)
         if legacy_dir.exists():
-            return raw_handle
+            # F-001: the candidate resolver canonicalizes mid8/ULID/numeric
+            # handles, so the resolved directory's NAME — not the raw operator
+            # handle — is the canonical mission slug downstream consumers need.
+            return legacy_dir.name
         try:
             resolved = resolve_mission_handle(raw_handle, repo_root)
             return resolved.mission_slug
         except (SystemExit, typer.Exit):
             if legacy_dir.exists():
-                return raw_handle
+                return legacy_dir.name
             raise
 
     return raw_handle
@@ -956,21 +1054,28 @@ def _normalize_wp_id(wp_arg: str) -> str:
 def _preview_claimable_wp_for_mission(repo_root: Path, mission_slug: str):
     """Return the shared claimable preview for *mission_slug*, if tasks exist.
 
-    The readiness preview is always computed against the repository-root
-    checkout's canonical status event log — never a worktree-local copy, which
-    may lag the latest status commit. This keeps the displayed auto-claim
-    candidate and ``selection_reason`` in agreement with the authoritative
-    dependency gate that governs the implement action (which also reads from the
-    repository-root checkout), so a genuinely-ready WP is never falsely reported
-    as ``dependencies_not_satisfied`` when this command runs from a stale
-    worktree.
+    WP04 / T016 / FR-002: tasks/ and dependency reads route to the PRIMARY
+    checkout via ``resolve_planning_read_dir(kind=WORK_PACKAGE_TASK)`` so a
+    coord-topology mission (whose tasks/ live on PRIMARY, not the STATUS-only
+    coord husk) is never reported as having no tasks.  The status-event read
+    uses the coord-aware ``candidate_feature_dir_for_mission`` so lanes come
+    from the authoritative coord husk — never a worktree-local copy, which may
+    lag the latest status commit (dependency gate invariant preserved).
     """
     from runtime.next.discovery import preview_claimable_wp
 
-    feature_dir = resolve_feature_dir_for_mission(get_main_repo_root(repo_root), mission_slug)
-    if not (feature_dir / "tasks").is_dir():
+    main_root = get_main_repo_root(repo_root)
+    # WORK_PACKAGE_TASK is PRIMARY-partition: routes to the primary checkout
+    # regardless of coord topology (no shadowing by STATUS-only coord husk).
+    planning_dir = resolve_planning_read_dir(
+        main_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
+    if not (planning_dir / "tasks").is_dir():
         return None
-    return preview_claimable_wp(feature_dir)
+    # status_dir: coord-aware so events come from the coord husk under coord
+    # topology (candidate_feature_dir_for_mission is the STATUS-partition leg).
+    status_dir = candidate_feature_dir_for_mission(main_root, mission_slug)
+    return preview_claimable_wp(planning_dir, status_dir=status_dir)
 
 
 def _auto_claim_failure_message(preview: object | None) -> str:
@@ -985,31 +1090,135 @@ def _auto_claim_failure_message(preview: object | None) -> str:
     return "No planned work packages found. Specify a WP ID explicitly."
 
 
+def _analysis_report_gate_dir(main_repo_root: Path, mission_slug: str) -> Path:
+    """Resolve the mission dir the implement gate reads ``analysis-report.md`` from.
+
+    #1989: this MUST be the topology-blind primary checkout — where
+    ``record-analysis`` writes the report — NOT the coord-aware
+    ``candidate_feature_dir_for_mission`` (which resolves to the coordination
+    worktree once one exists, and that worktree lacks the report + ``spec.md`` for
+    the freshness hash, so the gate would falsely report it missing). Extracted as
+    a named seam so the read-anchor decision is unit-testable in isolation.
+    """
+    # WP05/FR-005: route through _canonicalize_primary_read_handle so every handle
+    # form (bare mid8 / ULID / numeric prefix / bare human slug) lands on the
+    # correct composed primary dir.
+    return primary_feature_dir_for_mission(
+        main_repo_root,
+        _canonicalize_primary_read_handle(main_repo_root, mission_slug),
+    )
+
+
 def _require_current_analysis_report(feature_dir: Path, repo_root: Path, mission_slug: str) -> None:
     """Block implementation until `/spec-kitty.analyze` is persisted and fresh."""
-    from specify_cli.analysis_report import check_analysis_report_current
+    from specify_cli.analysis_report import (
+        ANALYSIS_REPORT_REASON_CARRIER_FORMAT,
+        check_analysis_report_current,
+    )
 
     analysis_freshness = check_analysis_report_current(feature_dir, repo_root)
     if analysis_freshness.ok:
         return
+
+    # Header line is always emitted first, in every branch.
     print("Error: analysis_report_required: /spec-kitty.analyze must be run before implementation.")
-    if analysis_freshness.missing:
+
+    if analysis_freshness.reason == ANALYSIS_REPORT_REASON_CARRIER_FORMAT:
+        print(
+            "  Reason: analysis-report.md is in carrier format (analysis-findings/v1) — written directly\n"
+            "          rather than via record-analysis. The implement gate requires the persisted\n"
+            "          outer-wrapper format (artifact_type: spec-kitty.analysis-report)."
+        )
+        print(
+            "  Recovery: spec-kitty agent mission record-analysis "
+            f"--mission {mission_slug} --input-file {analysis_freshness.path}"
+        )
+    elif analysis_freshness.missing:
         print(f"  Missing: {analysis_freshness.path}")
-    elif analysis_freshness.reason:
+        print("  Run step 1: /spec-kitty.analyze")
+        print(
+            "  Run step 2: spec-kitty agent mission record-analysis "
+            f"--mission {mission_slug} --input-file -"
+        )
+    elif analysis_freshness.mismatches:
         print(f"  Reason: {analysis_freshness.reason}")
-    if analysis_freshness.mismatches:
         print("  Stale inputs:")
         for artifact_name in sorted(analysis_freshness.mismatches):
             print(f"    - {artifact_name}")
-    print(f"  Run: /spec-kitty.analyze --mission {mission_slug}")
+        print(f"  Run: /spec-kitty.analyze --mission {mission_slug}")
+    else:
+        if analysis_freshness.reason:
+            print(f"  Reason: {analysis_freshness.reason}")
+        print(f"  Run: /spec-kitty.analyze --mission {mission_slug}")
+
     raise typer.Exit(1)
+
+
+def _ensure_workspace_materialized(
+    workspace: ResolvedWorkspace,
+    wp_id: str,
+    create_workspace: Callable[[], None],
+) -> None:
+    """Ensure the already-resolved *workspace* is materialized on disk.
+
+    FR-008/#1832 (C-IC05) — single resolution path. *workspace* is the
+    canonical resolution produced once by the caller. This helper consumes that
+    resolved context; it never re-runs ``resolve_workspace_for_wp``. A husk
+    (path present, no ``.git``) is absent-but-blocked (#1833). When the
+    workspace does not yet exist, *create_workspace* is invoked to materialize
+    the worktree at the already-resolved path; ``ResolvedWorkspace.exists`` then
+    re-stats disk, so the same contract reflects the freshly-created worktree.
+    A second resolution authority — which could independently report "no
+    workspace could be resolved" on a verified read-path — is exactly what this
+    function eliminates.
+
+    A pure side-effect seam: it mutates disk (and re-stats the resolved context
+    in place) but returns nothing — the caller already holds the canonical
+    ``ResolvedWorkspace`` and must not rebind it to a second value.
+
+    Raises:
+        typer.Exit: husk detected, creation attempted from a worktree, or the
+            path was not materialized after creation.
+    """
+    if workspace.is_husk:
+        print(f"Error: {husk_resolution_error(workspace.worktree_path)}")
+        raise typer.Exit(1)
+
+    if workspace.exists:
+        return
+
+    cwd = Path.cwd().resolve()
+    if is_worktree_context(cwd):
+        print("Error: Workspace does not exist and cannot be created from a worktree.")
+        print("Run this command from the main repository:")
+        print(f"  spec-kitty agent action implement {wp_id} --agent <your-name>")
+        raise typer.Exit(1)
+
+    print(f"Creating workspace for {wp_id}...")
+    try:
+        create_workspace()
+    except typer.Exit:
+        # Worktree creation failed - propagate error
+        raise
+    except Exception as e:
+        print(f"Error creating worktree: {e}")
+        raise typer.Exit(1) from e
+
+    # Single resolution path: re-stat the already-resolved workspace; do NOT
+    # re-resolve via a second authority.
+    if not workspace.exists:
+        print(
+            f"Error: implement completed but the workspace at {workspace.worktree_path} "
+            f"for {wp_id} was not materialized."
+        )
+        raise typer.Exit(1)
+    return
 
 
 @app.command(name="implement")
 def implement(
     wp_id: Annotated[str | None, typer.Argument(help="Work package ID (e.g., WP01, wp01, WP01-slug) - auto-detects first planned if omitted")] = None,
     mission: Annotated[str | None, typer.Option("--mission", help="Mission slug")] = None,
-    feature: Annotated[str | None, typer.Option("--feature", hidden=True, help="(deprecated) Use --mission")] = None,
     agent: Annotated[str | None, typer.Option("--agent", help="Agent name (required for auto-move to in_progress)")] = None,
     allow_sparse_checkout: Annotated[
         bool,
@@ -1053,7 +1262,7 @@ def implement(
             raise typer.Exit(1)
         repo_root = get_main_repo_root(repo_root)
 
-        mission_slug = _find_mission_slug(explicit_mission=mission, explicit_feature=feature, repo_root=repo_root)
+        mission_slug = _find_mission_slug(explicit_mission=mission, repo_root=repo_root)
 
         # -- WP05/T021 FR-007: Sparse-checkout preflight --
         # Runs BEFORE any worktree creation or state changes. Same surface as
@@ -1070,8 +1279,16 @@ def implement(
         try:
             from specify_cli.mission_metadata import resolve_mission_identity
 
+            # FR-005 (#2186): anchor the preflight ``mission_id`` on the PRIMARY
+            # checkout. The coord-aware resolver lands on the STATUS-only husk (no
+            # meta.json) — a wrong/empty id for the sparse-checkout override log.
             _identity = resolve_mission_identity(
-                resolve_feature_dir_for_mission(_main_repo_for_preflight, mission_slug)
+                primary_feature_dir_for_mission(
+                    _main_repo_for_preflight,
+                    _canonicalize_primary_read_handle(
+                        _main_repo_for_preflight, mission_slug
+                    ),
+                )
             )
             _mission_id_for_preflight = _identity.mission_id
         except Exception:  # noqa: BLE001 — meta.json may not exist for legacy missions
@@ -1195,47 +1412,35 @@ def implement(
             print("Re-run move-task with --review-feedback-file so the fix cycle can attach the canonical review artifact.")
             raise typer.Exit(1)
 
+        # #1989 (read-side companion to WP01): read the report from the PRIMARY
+        # checkout where record-analysis writes it (see _analysis_report_gate_dir).
         _require_current_analysis_report(
-            candidate_feature_dir_for_mission(main_repo_root, mission_slug),
+            _analysis_report_gate_dir(main_repo_root, mission_slug),
             main_repo_root,
             mission_slug,
         )
 
+        # FR-008/#1832 (C-IC05): SINGLE resolution path. Resolve the workspace
+        # exactly once here, then *consume* that resolved context for the rest
+        # of the implement flow (creation + verification) via
+        # ``_ensure_workspace_materialized`` — never re-resolve through a second
+        # authority that could independently report "no workspace could be
+        # resolved" on a verified read-path.
         workspace = resolve_workspace_for_wp(main_repo_root, mission_slug, normalized_wp_id)
-        workspace_path = workspace.worktree_path
         status_execution_mode = "direct_repo" if workspace.resolution_kind == "repo_root" else "worktree"
 
-        # Ensure workspace exists (delegate to top-level implement for creation)
-        if not workspace.exists:
-            cwd = Path.cwd().resolve()
-            if is_worktree_context(cwd):
-                print("Error: Workspace does not exist and cannot be created from a worktree.")
-                print("Run this command from the main repository:")
-                print(f"  spec-kitty agent action implement {normalized_wp_id} --agent <your-name>")
-                raise typer.Exit(1)
+        def _create_workspace() -> None:
+            top_level_implement(
+                wp_id=normalized_wp_id,
+                mission=mission_slug,
+                json_output=False,
+                recover=False,
+                acknowledge_not_bulk_edit=acknowledge_not_bulk_edit,
+                actor=agent,
+            )
 
-            print(f"Creating workspace for {normalized_wp_id}...")
-            try:
-                top_level_implement(
-                    wp_id=normalized_wp_id,
-                    mission=mission_slug,
-                    json_output=False,
-                    recover=False,
-                    acknowledge_not_bulk_edit=acknowledge_not_bulk_edit,
-                    actor=agent,
-                )
-            except typer.Exit:
-                # Worktree creation failed - propagate error
-                raise
-            except Exception as e:
-                print(f"Error creating worktree: {e}")
-                raise typer.Exit(1)
-
-            workspace = resolve_workspace_for_wp(main_repo_root, mission_slug, normalized_wp_id)
-            workspace_path = workspace.worktree_path
-            if not workspace.exists:
-                print(f"Error: implement completed but no workspace could be resolved for {normalized_wp_id}.")
-                raise typer.Exit(1)
+        _ensure_workspace_materialized(workspace, normalized_wp_id, _create_workspace)
+        workspace_path = workspace.worktree_path
 
         subtask_ids = [str(item) for item in wp_meta.subtasks if isinstance(item, str)]
         subtask_cmd = " ".join(subtask_ids) if subtask_ids else "<subtask-ids>"
@@ -1279,8 +1484,11 @@ def implement(
             from datetime import datetime
             import os
 
-            review_workspace = resolve_workspace_for_wp(main_repo_root, mission_slug, normalized_wp_id)
-            status_execution_mode = "direct_repo" if review_workspace.resolution_kind == "repo_root" else "worktree"
+            # FR-008/#1832 (C-IC05): single resolution path — ``status_execution_mode``
+            # was already derived from the resolved ``workspace`` above; consume that
+            # resolved context instead of re-resolving (the value is identical, and a
+            # second resolution authority is exactly what this WP eliminates).
+            status_execution_mode = "direct_repo" if workspace.resolution_kind == "repo_root" else "worktree"
 
             # Capture current shell PID
             shell_pid = str(os.getppid())  # Parent process ID (the shell running this command)
@@ -1428,7 +1636,7 @@ def implement(
                         mission_slug=mission_slug,
                         wp_id=normalized_wp_id,
                     )
-                    _fix_prompt_file = _write_prompt_to_file("implement", normalized_wp_id, _fix_prompt_text)
+                    _fix_prompt_file = _write_prompt_to_file("implement", mission_slug, normalized_wp_id, _fix_prompt_text)
                     print()
                     print(f"📍 Workspace: cd {workspace_path}")
                     print(f"🔧 Fix mode — Cycle {_latest_artifact.cycle_number}: focused prompt from review artifact")
@@ -1440,11 +1648,19 @@ def implement(
             except Exception as _fix_mode_err:
                 logger.warning("Fix-mode prompt generation failed, falling through to full prompt: %s", _fix_mode_err)
 
-        # Detect mission type and get deliverables_path for research missions
-        mission_type = get_mission_type(feature_dir)
+        # Detect mission type and get deliverables_path for research missions.
+        # FR-005 (#2186): the mission TYPE is a meta.json read and meta.json lives
+        # ONLY on PRIMARY. ``feature_dir`` here is bound from the coord-aware
+        # resolver (it is the STATUS leg for this loop), so read the type off its
+        # OWN PRIMARY-anchored dir — do NOT re-point the shared ``feature_dir``
+        # (it carries STATUS semantics the surrounding code depends on, C-001).
+        _mission_type_dir = primary_feature_dir_for_mission(
+            repo_root, _canonicalize_primary_read_handle(repo_root, mission_slug)
+        )
+        mission_type = get_mission_type(_mission_type_dir)
         deliverables_path = None
-        if mission_type == "research":
-            deliverables_path = get_deliverables_path(feature_dir, mission_slug)
+        if mission_type == MISSION_TYPE_RESEARCH:
+            deliverables_path = get_deliverables_path(_mission_type_dir, mission_slug)
 
         # Capture baseline test results (one-time, cached) before the agent starts coding
         # wp.path.stem is e.g. "WP04-baseline-test-capture"
@@ -1467,13 +1683,18 @@ def implement(
                 if _baseline_artifact.exists():
                     # Mechanical WP06 pre-step migration.
                     try:
+                        # Baseline artifact lands on the mission/lane
+                        # ``target_branch`` (normally unprotected); STANDARD
+                        # asserts no protected-branch flow, so a protected
+                        # target is refused — the best-effort handler below
+                        # logs the refusal (FR-008).
                         safe_commit(
                             repo_root=main_repo_root,
                             worktree_root=main_repo_root,
-                            destination_ref=target_branch,
+                            target=CommitTarget(ref=target_branch),
                             message=f"chore: Capture baseline tests for {normalized_wp_id}",
                             paths=(_baseline_artifact,),
-                            allow_protected_branch_in_test_mode=True,
+                            capability=GuardCapability.STANDARD,
                         )
                     except Exception as _bl_commit_exc:  # noqa: BLE001 — best-effort
                         import logging as _bl_logging2
@@ -1594,7 +1815,7 @@ def implement(
             lines.append("")
 
         # Research mission: Show deliverables path prominently
-        if mission_type == "research" and deliverables_path:
+        if mission_type == MISSION_TYPE_RESEARCH and deliverables_path:
             lines.append("╔" + "=" * 78 + "╗")
             lines.append("║  🔬 RESEARCH MISSION - TWO ARTIFACT TYPES                                 ║")
             lines.append("╠" + "=" * 78 + "╣")
@@ -1653,7 +1874,7 @@ def implement(
 
         # Write full prompt to file
         full_content = "\n".join(lines)
-        prompt_file = _write_prompt_to_file("implement", normalized_wp_id, full_content)
+        prompt_file = _write_prompt_to_file("implement", mission_slug, normalized_wp_id, full_content)
 
         # Output concise summary with directive to read the prompt
         print()
@@ -1670,7 +1891,7 @@ def implement(
                     print("   Warning: legacy feedback:// reference detected; readable but deprecated.")
             else:
                 print("⚠️  Has review feedback - but no review_feedback reference is set")
-        if mission_type == "research" and deliverables_path:
+        if mission_type == MISSION_TYPE_RESEARCH and deliverables_path:
             print(f"🔬 Research deliverables: {deliverables_path}")
             print("   (NOT in kitty-specs/ - those are planning artifacts)")
         print()
@@ -1732,12 +1953,23 @@ def _resolve_review_context(
         return ctx
 
     workspace = resolve_workspace_for_wp(repo_root, mission_slug, wp_id)
-    feature_dir = candidate_feature_dir_for_mission(repo_root, mission_slug)
+    # WP04 / T017 / FR-002: lanes.json (LANE_STATE — PRIMARY-partition) and
+    # tasks/ (WORK_PACKAGE_TASK — PRIMARY-partition) both route to the primary
+    # checkout.  Under coord topology, candidate_feature_dir_for_mission returned
+    # the STATUS-only coord husk (no lanes.json, no tasks/) — a wrong-leg read.
+    feature_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
+    # lanes.json is LANE_STATE (PRIMARY-partition) — use its truthful kind so a
+    # future LANE_STATE re-partition does not silently misroute.
+    _lanes_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+    )
     lanes_manifest = None
     try:
         from specify_cli.lanes.persistence import read_lanes_json
 
-        lanes_manifest = read_lanes_json(feature_dir)
+        lanes_manifest = read_lanes_json(_lanes_dir)
     except Exception:
         lanes_manifest = None
 
@@ -1889,29 +2121,21 @@ def _find_first_for_review_wp(repo_root: Path, mission_slug: str) -> str | None:
     Returns:
         WP ID of first for_review task, or None if not found
     """
-    from specify_cli.core.paths import is_worktree_context
-
-    cwd = Path.cwd().resolve()
-
-    # Check if we're in a worktree - if so, use worktree's kitty-specs
-    if is_worktree_context(cwd):
-        # We're in a worktree, look for kitty-specs relative to cwd
-        if (candidate_feature_dir_for_mission(cwd, mission_slug)).exists():
-            tasks_dir = candidate_feature_dir_for_mission(cwd, mission_slug) / "tasks"
-        else:
-            # Walk up to find kitty-specs
-            current = cwd
-            while current != current.parent:
-                if (candidate_feature_dir_for_mission(current, mission_slug)).exists():
-                    tasks_dir = candidate_feature_dir_for_mission(current, mission_slug) / "tasks"
-                    break
-                current = current.parent
-            else:
-                # Fallback to repo_root
-                tasks_dir = resolve_feature_dir_for_mission(repo_root, mission_slug) / "tasks"
-    else:
-        # We're in main repo
-        tasks_dir = resolve_feature_dir_for_mission(repo_root, mission_slug) / "tasks"
+    # WP04 / T017 / FR-002: tasks/ reads route through the planning seam
+    # (WORK_PACKAGE_TASK → PRIMARY) so coord-topology missions find tasks/ on
+    # the primary checkout, not the STATUS-only coord husk.
+    # resolve_planning_read_dir is cwd-invariant for PRIMARY-partition kinds:
+    # primary_feature_dir_for_mission anchors on get_main_repo_root(repo_root),
+    # so cwd / walk-up / repo_root all resolve the same primary dir — the
+    # multi-branch walk was vestigial after WP04.
+    # The STATUS leg uses candidate_feature_dir_for_mission(repo_root, ...) so
+    # events come from the authoritative coord husk under coord topology (C-001).
+    tasks_dir = (
+        resolve_planning_read_dir(
+            repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+        )
+        / "tasks"
+    )
 
     if not tasks_dir.exists():
         return None
@@ -1919,14 +2143,16 @@ def _find_first_for_review_wp(repo_root: Path, mission_slug: str) -> str | None:
     # Find all WP files
     wp_files = sorted(tasks_dir.glob("WP*.md"))
 
-    # Load lanes from canonical event log (lane is event-log-only)
-    feature_dir = tasks_dir.parent
+    # Load lanes from canonical event log (lane is event-log-only).
+    # WP04: status events stay on the coord-aware resolver so coord-topology
+    # missions read the authoritative event log, not the primary decoy (C-001).
+    _status_feature_dir = candidate_feature_dir_for_mission(repo_root, mission_slug)
     _fr_events = []
     try:
         from specify_cli.status import read_events as _fr_read_events
         from specify_cli.status import reduce as _fr_reduce
 
-        _fr_events = _fr_read_events(feature_dir)
+        _fr_events = _fr_read_events(_status_feature_dir)
         _fr_snapshot = _fr_reduce(_fr_events) if _fr_events else None
         _fr_lanes: dict = {}
         if _fr_snapshot:
@@ -1964,11 +2190,86 @@ def _find_first_for_review_wp(repo_root: Path, mission_slug: str) -> str | None:
     return None
 
 
+def _prepare_review_workspace(
+    workspace: ResolvedWorkspace,
+    main_repo_root: Path,
+    wp_id: str,
+    agent: str | None,
+) -> ResolvedWorkspace:
+    """Validate/create the review workspace, then acquire review isolation.
+
+    Order is load-bearing (#1833 AC-D2): ``ReviewLock`` persists its lock file
+    INSIDE the workspace (``.spec-kitty/review-lock.json``), so acquiring it
+    before the worktree exists used to mint a husk directory. The workspace
+    existence/creation block must succeed first; only then is the lock
+    acquired, and a failed ``git worktree add`` is a hard error (not a
+    warning), leaving no lock behind.
+    """
+    workspace_path = workspace.worktree_path
+
+    # A husk (directory without a .git entry) is absent-but-blocked: never
+    # silently recreate a worktree on top of it — that hides the anomaly.
+    if workspace.is_husk:
+        print(f"Error: {husk_resolution_error(workspace_path)}")
+        raise typer.Exit(1)
+
+    if not workspace.exists:
+        # Ensure .worktrees directory exists
+        worktrees_dir = main_repo_root / ".worktrees"
+        worktrees_dir.mkdir(parents=True, exist_ok=True)
+
+        branch_name = workspace.branch_name
+        if branch_name is None:
+            print(f"Error: cannot create review workspace {workspace_path} for {wp_id}: resolved workspace has no branch name.")
+            raise typer.Exit(1)
+        branch_exists = subprocess.run(
+            ["git", "rev-parse", "--verify", branch_name],
+            cwd=main_repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if branch_exists.returncode == 0:
+            worktree_cmd = ["git", "worktree", "add", str(workspace_path), branch_name]
+        else:
+            worktree_cmd = ["git", "worktree", "add", str(workspace_path), "-b", branch_name]
+        result = subprocess.run(worktree_cmd, cwd=main_repo_root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+
+        if result.returncode != 0:
+            print(
+                f"Error: could not create review workspace {workspace_path} for {wp_id}: "
+                f"`{' '.join(worktree_cmd)}` failed: {result.stderr.strip()}"
+            )
+            raise typer.Exit(1)
+
+        print(f"✓ Created workspace: {workspace_path}")
+        if not workspace.exists:
+            print(f"Error: workspace creation reported success but {workspace_path} is not a git worktree.")
+            raise typer.Exit(1)
+
+    # Concurrent review isolation: acquire review lock or apply env-var
+    # isolation — only after the workspace is proven to exist.
+    from specify_cli.review.lock import ReviewLock, ReviewLockError, _get_isolation_config, _apply_env_var_isolation
+
+    isolation_config = _get_isolation_config(main_repo_root)
+    if isolation_config and isolation_config.get("strategy") == "env_var":
+        _apply_env_var_isolation(isolation_config, agent or "unknown", wp_id)
+    else:
+        try:
+            ReviewLock.acquire(Path(workspace.worktree_path), wp_id, agent or "unknown")
+        except ReviewLockError as e:
+            print(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
+
+    return workspace
+
+
 @app.command(name="review")
 def review(
     wp_id: Annotated[str | None, typer.Argument(help="Work package ID (e.g., WP01) - auto-detects first for_review if omitted")] = None,
     mission: Annotated[str | None, typer.Option("--mission", help="Mission slug")] = None,
-    feature: Annotated[str | None, typer.Option("--feature", hidden=True, help="(deprecated) Use --mission")] = None,
     agent: Annotated[str | None, typer.Option("--agent", help="Agent name (required for auto-move to in_progress)")] = None,
 ) -> None:
     """Display work package prompt with review instructions.
@@ -1992,7 +2293,7 @@ def review(
             print("Error: Could not locate project root")
             raise typer.Exit(1)
 
-        mission_slug = _find_mission_slug(explicit_mission=mission, explicit_feature=feature, repo_root=repo_root)
+        mission_slug = _find_mission_slug(explicit_mission=mission, repo_root=repo_root)
 
         # Ensure planning repo is on the target branch before we start
         # (needed for auto-commits and status tracking inside this command)
@@ -2076,45 +2377,15 @@ def review(
         # When this is a bulk_edit mission, inspect the WP's diff against its lane
         # base branch and reject modifications to forbidden or unclassified surfaces.
         if _gate_result.change_mode == "bulk_edit":
-            # The mission branch is the canonical base for a WP lane diff. If the
-            # review is running from the main repo (not a lane worktree), this
-            # still resolves because the mission branch exists until merge
-            # cleanup. If the branch cannot be resolved, fall back to the
-            # target_branch captured earlier in this function.
-            try:
-                from specify_cli.lanes.persistence import read_lanes_json as _read_lanes_json
-
-                _lanes_manifest = _read_lanes_json(feature_dir)
-                _base_ref = _lanes_manifest.mission_branch if _lanes_manifest is not None else target_branch
-            except Exception:
-                _base_ref = target_branch
-            # The WP diff must be the lane branch's changes on top of the mission
-            # branch, NOT `HEAD`. When review runs from the main repo checkout,
-            # `HEAD` is the mission's *target* branch (e.g. feat/...), so diffing
-            # base..HEAD surfaces the entire target-branch delta (hundreds of
-            # unrelated files) and the bulk-edit gate false-blocks. Use the WP's
-            # resolved lane branch as head; fall back to HEAD only for repo_root
-            # (direct-to-target / planning) workspaces where the changes really
-            # are on the current HEAD.
-            _head_ref = review_workspace.branch_name or "HEAD"
-            _diff_result = check_review_diff_compliance(
+            _enforce_bulk_edit_diff_compliance(
                 feature_dir=feature_dir,
-                repo_root=main_repo_root,
-                base_ref=_base_ref,
-                head_ref=_head_ref,
+                main_repo_root=main_repo_root,
+                target_branch=target_branch,
+                review_workspace=review_workspace,
+                check_review_diff_compliance=check_review_diff_compliance,
+                render_diff_check_failure=render_diff_check_failure,
+                rich_console=_rich_console,
             )
-            if _diff_result is None:
-                # Non-bulk-edit mission — skip silently. check_review_diff_compliance
-                # returns None when change_mode is not bulk_edit, which shouldn't
-                # happen here given the outer guard, but belt-and-braces.
-                pass
-            elif not _diff_result.passed:
-                render_diff_check_failure(_diff_result, _rich_console)
-                raise typer.Exit(1)
-            elif _diff_result.warnings:
-                # Surface manual_review notes but don't block.
-                for _w in _diff_result.warnings:
-                    _rich_console.print(f"[yellow]manual_review:[/] {_w}")
 
         if current_lane == Lane.FOR_REVIEW or (current_lane == Lane.IN_REVIEW and agent):
             # Require --agent parameter to track who is reviewing
@@ -2210,64 +2481,31 @@ def review(
             print(f"⚠️  {normalized_wp_id} is already in lane: {current_lane}. Workflow review will not move it to in_review.")
 
         workspace = resolve_workspace_for_wp(main_repo_root, mission_slug, normalized_wp_id)
+        workspace = _prepare_review_workspace(workspace, main_repo_root, normalized_wp_id, agent)
         workspace_path = workspace.worktree_path
-
-        # Concurrent review isolation: acquire review lock or apply env-var isolation
-        from specify_cli.review.lock import ReviewLock, ReviewLockError, _get_isolation_config, _apply_env_var_isolation
-
-        isolation_config = _get_isolation_config(main_repo_root)
-        if isolation_config and isolation_config.get("strategy") == "env_var":
-            _apply_env_var_isolation(isolation_config, agent or "unknown", normalized_wp_id)
-        else:
-            try:
-                ReviewLock.acquire(Path(workspace_path), normalized_wp_id, agent or "unknown")
-            except ReviewLockError as e:
-                print(f"[red]{e}[/red]")
-                raise typer.Exit(1)
-
-        # Ensure workspace exists (attach to the real branch if needed).
-        if not workspace.exists:
-            # Ensure .worktrees directory exists
-            worktrees_dir = main_repo_root / ".worktrees"
-            worktrees_dir.mkdir(parents=True, exist_ok=True)
-
-            branch_name = workspace.branch_name
-            branch_exists = subprocess.run(
-                ["git", "rev-parse", "--verify", branch_name],
-                cwd=main_repo_root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-            if branch_exists.returncode == 0:
-                worktree_cmd = ["git", "worktree", "add", str(workspace_path), branch_name]
-            else:
-                worktree_cmd = ["git", "worktree", "add", str(workspace_path), "-b", branch_name]
-            result = subprocess.run(worktree_cmd, cwd=main_repo_root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
-
-            if result.returncode != 0:
-                print(f"Warning: Could not create workspace: {result.stderr}")
-            else:
-                print(f"✓ Created workspace: {workspace_path}")
-                workspace = resolve_workspace_for_wp(main_repo_root, mission_slug, normalized_wp_id)
 
         # Resolve git context (branch name, base branch, commit count)
         review_ctx = _resolve_review_context(workspace_path, main_repo_root, mission_slug, normalized_wp_id, wp.frontmatter)
 
         # Capture dependency warning for both file and summary
         dependents_warning = []
-        feature_dir = resolve_feature_dir_for_mission(repo_root, mission_slug)
-        graph = build_dependency_graph(feature_dir)
+        # WP04 / T018 / FR-002: build_dependency_graph reads tasks/ (PRIMARY-partition)
+        # → route through the planning seam.  Status-event reads stay on the coord-aware
+        # resolver (C-001) so dependents' lane comes from the authoritative event log.
+        _review_planning_dir = resolve_planning_read_dir(
+            repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+        )
+        graph = build_dependency_graph(_review_planning_dir)
         dependents = get_dependents(normalized_wp_id, graph)
         if dependents:
-            # Load lanes from event log (lane is event-log-only)
+            # Load lanes from event log (lane is event-log-only).
+            # Status reads stay coord-aware (C-001).
+            _review_status_dir = candidate_feature_dir_for_mission(repo_root, mission_slug)
             try:
                 from specify_cli.status import read_events as _rw_read_events
                 from specify_cli.status import reduce as _rw_reduce
 
-                _rw_events = _rw_read_events(feature_dir)
+                _rw_events = _rw_read_events(_review_status_dir)
                 _rw_snapshot = _rw_reduce(_rw_events) if _rw_events else None
                 _rw_lanes: dict = {}
                 if _rw_snapshot:
@@ -2514,7 +2752,15 @@ def review(
 
         # Write full prompt to file
         full_content = "\n".join(lines)
-        _mission_identity = resolve_mission_identity(resolve_feature_dir_for_mission(main_repo_root, mission_slug))
+        # FR-005 (#2186): the review-prompt metadata ``mission_id`` is a meta.json
+        # read → PRIMARY only. Anchor on the topology-blind PRIMARY dir, not the
+        # coord-aware resolver (which selects the meta-less husk).
+        _mission_identity = resolve_mission_identity(
+            primary_feature_dir_for_mission(
+                main_repo_root,
+                _canonicalize_primary_read_handle(main_repo_root, mission_slug),
+            )
+        )
         _review_metadata = build_review_prompt_metadata(
             repo_root=main_repo_root,
             mission_id=_mission_identity.mission_id,

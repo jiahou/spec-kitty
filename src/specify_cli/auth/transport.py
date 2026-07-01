@@ -41,7 +41,7 @@ sole exception.
 
 ADR
 ---
-See ``architecture/2.x/adr/2026-04-26-2-auth-transport-boundary.md``
+See ``docs/adr/3.x/2026-04-26-2-auth-transport-boundary.md``
 (DIRECTIVE_003).
 """
 
@@ -79,6 +79,10 @@ REFRESH_LOCK_TIMEOUT_ERROR_CODE = "refresh_lock_timeout"
 # ---------------------------------------------------------------------------
 
 
+# Adopt-on-next-touch: this family predates the shared
+# ``specify_cli.core.errors.StructuredError`` base (#1893). It inherits from
+# ``AuthenticationError`` (not ``RuntimeError``), so adoption requires
+# reconciling that hierarchy; defer until this class is materially edited.
 class AuthRefreshFailed(AuthenticationError):
     """Raised when a forced token refresh fails inside the centralized client.
 
@@ -139,7 +143,7 @@ def _emit_user_facing_failure_once(message: str) -> None:
             _user_facing_failure_emitted = True
     if first:
         # Lazy import to avoid a hard cycle at module load.
-        from specify_cli.sync import emit_diagnostic
+        from specify_cli.sync.diagnose import emit_diagnostic
 
         # Single user-facing line, routed through the canonical helper
         # so it CANNOT accidentally land on stdout.
@@ -524,5 +528,5 @@ __all__ = [
     "get_client",
     "get_async_client",
     "reset_clients",
-    "reset_user_facing_dedup",
+    # reset_user_facing_dedup: demoted — no cross-module src/ callers (WP01).
 ]

@@ -16,19 +16,74 @@ Explicitly does not scan:
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.contract]
-
+pytestmark = [pytest.mark.contract, pytest.mark.fast]
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# ---------------------------------------------------------------------------
+# T013 in-scope cluster: the 10 internal command files from which the
+# ``--feature`` alias was fully removed (WP01 + WP02).  Any reintroduction
+# of the literal ``--feature`` string in these files — whether inside a
+# typer.Option block, an alias_flag argument, a resolve_selector call, or
+# any other construct — must fail this gate.
+# Authority: spec.md FR-003, FR-004.
+# ---------------------------------------------------------------------------
+INSCOPE_FEATURE_FREE_FILES: tuple[str, ...] = (
+    # Original 10 internal command files cleaned in the prior mission (WP01/WP02
+    # of release-3-2-0a5-tranche-1).
+    "src/specify_cli/cli/commands/agent/status.py",
+    "src/specify_cli/cli/commands/agent/tasks.py",
+    "src/specify_cli/cli/commands/agent/workflow.py",
+    "src/specify_cli/cli/commands/agent/context.py",
+    "src/specify_cli/cli/commands/agent/mission.py",
+    "src/specify_cli/cli/commands/charter/lint.py",
+    "src/specify_cli/cli/commands/materialize.py",
+    "src/specify_cli/cli/commands/validate_encoding.py",
+    "src/specify_cli/cli/commands/validate_tasks.py",
+    "src/specify_cli/cli/commands/verify.py",
+    # 8 user-facing command files de-aliased in mission feature-alias-removal-
+    # 01KW0N87 WP01–WP03.  Authority: spec.md FR-007.
+    "src/specify_cli/cli/commands/implement.py",
+    "src/specify_cli/cli/commands/merge.py",
+    "src/specify_cli/cli/commands/next_cmd.py",
+    "src/specify_cli/cli/commands/research.py",
+    "src/specify_cli/cli/commands/context.py",
+    "src/specify_cli/cli/commands/accept.py",
+    "src/specify_cli/cli/commands/lifecycle.py",
+    "src/specify_cli/cli/commands/mission_type.py",
+)
 
 CLI_COMMAND_GLOBS = ("src/specify_cli/cli/commands/**/*.py",)
 DOCTRINE_SKILL_GLOBS = ("src/doctrine/skills/**/*.md",)
 AGENT_DOC_GLOBS = ("docs/**/*.md",)
 TOP_LEVEL_DOCS = ("README.md", "CONTRIBUTING.md")
-FORBIDDEN_SCAN_ROOTS = ("kitty-specs/", "architecture/", ".kittify/", "tests/", "docs/migration/")
+# Exemption policy and rationale for each exempt surface:
+# docs/development/terminology-exemptions.md
+FORBIDDEN_SCAN_ROOTS = (
+    "kitty-specs/",
+    "architecture/",
+    ".kittify/",
+    "tests/",
+    "docs/migration/",
+    # docs/adr/ holds immutable historical decision records (the common-docs move
+    # relocated them from the unscanned architecture/ tree). Their bodies are
+    # byte-invariant under C-002/C-006 and legitimately reference era-correct
+    # wording (--feature, main-centric workflow). Mirrors the narrow docs/adr/
+    # exemption in tests/architectural/test_no_legacy_terminology.py.
+    "docs/adr/",
+    # Historical/archival sub-areas relocated under docs/plans/ by the common-docs
+    # move (the old, unscanned engineering_notes/initiatives world): completed
+    # initiative records, retained 1.x deep-dive notes, and engineering notes.
+    # These are archival records of era-correct decisions, not live first-party
+    # docs — the active planning pages at docs/plans/*.md stay scanned.
+    "docs/plans/engineering-notes/",
+    "docs/plans/initiatives/",
+    "docs/plans/notes/",
+)
 
 
 def _glob(pattern: str) -> list[Path]:
@@ -39,7 +94,7 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _iter_typer_option_blocks(content: str):
+def _iter_typer_option_blocks(content: str) -> Iterator[tuple[int, str]]:
     """Yield `(offset, block)` tuples for each `typer.Option(...)` call."""
     pattern = re.compile(r"typer\.Option\((?:[^()]|\([^()]*\))*\)", re.DOTALL)
     for match in pattern.finditer(content):
@@ -70,16 +125,33 @@ def _live_doc_scan_targets() -> list[tuple[Path, str]]:
     for path_pattern in AGENT_DOC_GLOBS:
         for path in _glob(path_pattern):
             relative_path = path.relative_to(REPO_ROOT).as_posix()
-            if relative_path.startswith("docs/migration/"):
+            # docs/migration/, docs/adr/, and the relocated archival sub-areas of
+            # docs/plans/ are historical/immutable surfaces, not live first-party
+            # docs (docs/adr/ holds byte-invariant ADR records).
+            if relative_path.startswith(
+                (
+                    "docs/migration/",
+                    "docs/adr/",
+                    "docs/plans/engineering-notes/",
+                    "docs/plans/initiatives/",
+                    "docs/plans/notes/",
+                )
+            ):
+                continue
+            # The relocated canonical CHANGELOG is handled like root CHANGELOG.md
+            # below (only the Unreleased section is scanned; historical version
+            # sections legitimately carry era-correct terminology). Its sibling
+            # docs/changelog/index.md stays a normally-scanned live doc.
+            if relative_path == "docs/changelog/CHANGELOG.md":
                 continue
             scan_targets.append((path, _read(path)))
     for top_level in TOP_LEVEL_DOCS:
         path = REPO_ROOT / top_level
         if path.exists():
             scan_targets.append((path, _read(path)))
-    changelog_path = REPO_ROOT / "CHANGELOG.md"
-    if changelog_path.exists():
-        scan_targets.append((changelog_path, _extract_changelog_unreleased(changelog_path)))
+    for changelog_path in (REPO_ROOT / "CHANGELOG.md", REPO_ROOT / "docs" / "changelog" / "CHANGELOG.md"):
+        if changelog_path.exists():
+            scan_targets.append((changelog_path, _extract_changelog_unreleased(changelog_path)))
     return scan_targets
 
 
@@ -102,7 +174,7 @@ def _line_number(content: str, offset: int) -> int:
     return content.count("\n", 0, offset) + 1
 
 
-def test_no_mission_run_alias_in_tracked_mission_selectors():
+def test_no_mission_run_alias_in_tracked_mission_selectors() -> None:
     """Live CLI command files must not declare --mission-run for mission selection.
 
     Authority: spec.md FR-002, FR-003.
@@ -122,7 +194,7 @@ def test_no_mission_run_alias_in_tracked_mission_selectors():
                 )
 
 
-def test_no_mission_run_slug_help_text_in_cli_commands():
+def test_no_mission_run_slug_help_text_in_cli_commands() -> None:
     """Tracked-mission CLI help text must not say 'Mission run slug'.
 
     Authority: spec.md FR-008.
@@ -139,8 +211,12 @@ def test_no_mission_run_slug_help_text_in_cli_commands():
             )
 
 
-def test_no_visible_feature_alias_in_cli_commands():
-    """--feature is acceptable only as a hidden=True alias.
+def test_no_visible_feature_alias_in_cli_commands() -> None:
+    """--feature must not appear at all in CLI-command Typer option blocks.
+
+    The alias was fully removed (#1060); it is no longer permitted even as a
+    ``hidden=True`` option. This is consistent with
+    ``test_zero_feature_flags_exist_cli_wide``.
 
     Authority: spec.md FR-005 and charter terminology canon.
     """
@@ -150,17 +226,15 @@ def test_no_visible_feature_alias_in_cli_commands():
             for offset, option_block in _iter_typer_option_blocks(content):
                 if '"--feature"' not in option_block:
                     continue
-                if "hidden=True" in option_block:
-                    continue
                 line = _line_number(content, offset)
                 pytest.fail(
-                    f"{path.relative_to(REPO_ROOT)}:{line}: --feature declared without hidden=True. "
+                    f"{path.relative_to(REPO_ROOT)}:{line}: --feature declared in a Typer option block. "
                     "Authority: spec.md FR-005 and charter terminology canon. "
-                    "Fix: declare --feature only as a hidden deprecated alias."
+                    "Fix: --feature must not appear at all — it was fully removed, not hidden."
                 )
 
 
-def test_no_mission_run_instructions_in_doctrine_skills():
+def test_no_mission_run_instructions_in_doctrine_skills() -> None:
     """Doctrine skills must teach --mission for tracked-mission selection.
 
     Authority: spec.md FR-009.
@@ -182,7 +256,7 @@ def test_no_mission_run_instructions_in_doctrine_skills():
                     )
 
 
-def test_no_mission_run_instructions_in_agent_facing_docs():
+def test_no_mission_run_instructions_in_agent_facing_docs() -> None:
     """Live docs must teach --mission for tracked-mission selection.
 
     Authority: spec.md FR-010 and FR-022.
@@ -203,7 +277,7 @@ def test_no_mission_run_instructions_in_agent_facing_docs():
                 )
 
 
-def test_no_feature_flag_in_live_first_party_docs():
+def test_no_feature_flag_in_live_first_party_docs() -> None:
     """Live docs must not document --feature as a live CLI option.
 
     Authority: spec.md FR-005, FR-022, and the charter terminology canon.
@@ -227,7 +301,7 @@ def test_no_feature_flag_in_live_first_party_docs():
                 )
 
 
-def test_no_removed_orchestrator_api_command_names_in_live_docs():
+def test_no_removed_orchestrator_api_command_names_in_live_docs() -> None:
     """Live docs must not teach removed host orchestrator-api subcommands.
 
     Authority: spec.md FR-010, FR-022.
@@ -247,7 +321,7 @@ def test_no_removed_orchestrator_api_command_names_in_live_docs():
                 )
 
 
-def test_orchestrator_api_docs_do_not_teach_removed_json_flag_or_unpinned_provider_source():
+def test_orchestrator_api_docs_do_not_teach_removed_json_flag_or_unpinned_provider_source() -> None:
     """Live docs must not teach host/provider patterns known to fail today.
 
     Authority: orchestrator-api JSON-default contract and host/provider
@@ -268,7 +342,7 @@ def test_orchestrator_api_docs_do_not_teach_removed_json_flag_or_unpinned_provid
                 )
 
 
-def test_no_mission_used_to_mean_mission_type_in_cli_commands():
+def test_no_mission_used_to_mean_mission_type_in_cli_commands() -> None:
     """CLI command files must not declare --mission with mission-type semantics.
 
     Authority: spec.md FR-021.
@@ -291,17 +365,17 @@ def test_no_mission_used_to_mean_mission_type_in_cli_commands():
                 )
 
 
-def test_reference_examples_match_runtime_requirements():
+def test_reference_examples_match_runtime_requirements() -> None:
     """Reference docs must not teach invocation patterns that now hard-fail.
 
     Authority: spec.md FR-010, FR-013, FR-022.
     """
 
-    cli_reference = _read(REPO_ROOT / "docs/reference/cli-commands.md")
+    cli_reference = _read(REPO_ROOT / "docs/api/cli-commands.md")
     assert "spec-kitty next --json" not in cli_reference
     assert "bare call (no `--agent`)" not in cli_reference
 
-    agent_reference = _read(REPO_ROOT / "docs/reference/agent-subcommands.md")
+    agent_reference = _read(REPO_ROOT / "docs/api/agent-subcommands.md")
     forbidden_example_lines = (
         r"^spec-kitty agent mission accept$",
         r"^spec-kitty agent mission accept --json$",
@@ -335,7 +409,7 @@ def test_reference_examples_match_runtime_requirements():
         assert re.search(pattern, agent_reference, flags=re.MULTILINE) is None
 
 
-def test_no_main_branch_workflow_language_in_live_docs_and_skills():
+def test_no_main_branch_workflow_language_in_live_docs_and_skills() -> None:
     """Live docs and doctrine skills must not teach generic main-branch workflow rules.
 
     Authority: charter branch-intent terminology governance and spec.md FR-022.
@@ -367,7 +441,7 @@ def test_no_main_branch_workflow_language_in_live_docs_and_skills():
                 )
 
 
-def test_orchestrator_api_envelope_width_unchanged():
+def test_orchestrator_api_envelope_width_unchanged() -> None:
     """The orchestrator-api envelope must remain the canonical 7-key shape.
 
     Authority: spec.md C-010.
@@ -394,7 +468,7 @@ def test_orchestrator_api_envelope_width_unchanged():
     )
 
 
-def test_grep_guards_do_not_scan_historical_artifacts():
+def test_grep_guards_do_not_scan_historical_artifacts() -> None:
     """Verify the grep guard scope excludes historical artifacts.
 
     Authority: spec.md FR-022 and C-011.
@@ -412,3 +486,100 @@ def test_grep_guards_do_not_scan_historical_artifacts():
         "CHANGELOG.md must be handled through _extract_changelog_unreleased(), not a raw glob. "
         "Authority: spec.md FR-022."
     )
+
+
+def test_docs_adr_exemption_is_narrow() -> None:
+    """docs/adr/ is exempt (immutable historical ADRs), but the rest of docs/ is not.
+
+    The common-docs move relocated ADRs from the unscanned architecture/ tree into
+    docs/adr/. Their byte-invariant bodies legitimately carry era-correct wording,
+    so they must not be scanned — but the exemption must stay narrow: every other
+    docs/ page is still a live first-party surface. This pins both halves so a future
+    glob change cannot silently widen the carve-out to all of docs/.
+    """
+    scanned = {p.relative_to(REPO_ROOT).as_posix() for p, _ in _live_doc_scan_targets()}
+    assert not any(p.startswith("docs/adr/") for p in scanned), (
+        "docs/adr/ ADR records must be excluded from the live-docs terminology scan"
+    )
+    # Non-vacuity / narrowness: live docs/ pages outside the exempt roots ARE scanned.
+    assert any(
+        p.startswith("docs/")
+        and not p.startswith(("docs/adr/", "docs/migration/"))
+        for p in scanned
+    ), "the exemption widened too far — no live docs/ page is being scanned"
+
+
+def test_no_feature_alias_in_internal_command_cluster() -> None:
+    """The in-scope internal command cluster must contain zero occurrences of ``--feature``.
+
+    This gate complements ``test_no_visible_feature_alias_in_cli_commands``
+    (which forbids ``--feature`` in any Typer Option block) by scanning the
+    in-scope files for ANY ``--feature`` literal, not just option declarations.
+    The WP01/WP02 removals eliminated the alias entirely from these 10 files.
+    ANY reintroduction
+    — whether inside a typer.Option call, an ``alias_flag="--feature"`` argument,
+    a ``resolve_selector(... "--feature" ...)`` call, or a stray comment-free
+    string literal — must fail this gate.
+
+    Authority: spec.md FR-003, FR-004.  Defined by INSCOPE_FEATURE_FREE_FILES.
+    """
+    offenders: list[str] = []
+    for rel_path in INSCOPE_FEATURE_FREE_FILES:
+        path = REPO_ROOT / rel_path
+        if not path.exists():
+            pytest.fail(
+                f"In-scope file not found: {rel_path}. "
+                "Update INSCOPE_FEATURE_FREE_FILES or restore the file."
+            )
+        content = _read(path)
+        if "--feature" in content:
+            # Report each hit with line number for fast triage
+            for lineno, line in enumerate(content.splitlines(), start=1):
+                if "--feature" in line:
+                    offenders.append(f"{rel_path}:{lineno}: {line.strip()!r}")
+    assert not offenders, (
+        "FR-003/FR-004 regression: '--feature' literal found in in-scope command files "
+        "(INSCOPE_FEATURE_FREE_FILES).  Remove the alias entirely — do not hide it.\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+@pytest.mark.fast
+def test_terminology_exemption_policy_doc_is_present_and_consistent() -> None:
+    """The exemption policy doc exists, is referenced from this file, and covers all three exemptions.
+
+    Confirms that the policy rationale captured in the comment above
+    FORBIDDEN_SCAN_ROOTS is also reflected in a human-readable policy document,
+    and that both the document and this test agree on the three exempt surfaces.
+
+    Authority: FR-013 (policy doc linked from the guard test).
+    """
+    policy_doc = REPO_ROOT / "docs" / "development" / "terminology-exemptions.md"
+    assert policy_doc.exists(), (
+        "docs/development/terminology-exemptions.md must exist. "
+        "Authority: FR-013. The exemption policy must be documented in a human-readable form."
+    )
+
+    # This guard test must reference the policy doc by its canonical path so
+    # a reader can navigate from the exemption comment to the full rationale.
+    guard_source = Path(__file__).read_text(encoding="utf-8")
+    assert "docs/development/terminology-exemptions.md" in guard_source, (
+        "test_terminology_guards.py must reference docs/development/terminology-exemptions.md. "
+        "Authority: FR-013. The link must appear in the guard test itself."
+    )
+
+    # The policy doc must cover ALL four exempt surfaces in FORBIDDEN_SCAN_ROOTS.
+    # Each token is a substring that must appear in the document to confirm
+    # coverage — keeps the doc honest if a future exemption is added/dropped.
+    policy_content = policy_doc.read_text(encoding="utf-8")
+    required_tokens = (
+        "docs/adr/",
+        "docs/migration/",
+        "docs/plans/engineering-notes/",
+        "Unreleased",
+    )
+    for token in required_tokens:
+        assert token in policy_content, (
+            f"docs/development/terminology-exemptions.md must contain exemption token {token!r}. "
+            "Authority: FR-013. All four exempt surfaces must be documented."
+        )

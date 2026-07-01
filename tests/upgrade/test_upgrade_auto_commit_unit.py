@@ -20,8 +20,7 @@ from specify_cli.upgrade.runner import UpgradeResult
 # ---------------------------------------------------------------------------
 
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 def test_git_status_paths_parses_modified_files(tmp_path: Path, monkeypatch) -> None:
     """Porcelain output with modified files is parsed correctly."""
     # Simulate: " M src/foo.py\0 M src/bar.py\0"
@@ -135,7 +134,7 @@ def test_prepare_upgrade_commit_files_excludes_root_files(
             "kitty-specs/001-test/tasks/WP01.md",
             "README.md",
             "AGENTS.md",
-            "docs/how-to/upgrade.md",
+            "docs/guides/upgrade.md",
         },
     )
 
@@ -144,7 +143,7 @@ def test_prepare_upgrade_commit_files_excludes_root_files(
     assert {str(path) for path in files} == {
         ".kittify/metadata.yaml",
         "kitty-specs/001-test/tasks/WP01.md",
-        "docs/how-to/upgrade.md",
+        "docs/guides/upgrade.md",
     }
 
 
@@ -308,9 +307,14 @@ def test_auto_commit_upgrade_changes_calls_safe_commit(
         ".kittify/metadata.yaml",
         "kitty-specs/001-test/tasks/WP01.md",
     ]
+    from specify_cli.core.commit_guard import GuardCapability
+
     assert captured["repo_root"] == project_path
     assert captured["worktree_root"] == project_path
-    assert captured["destination_ref"] == "main"
+    # T009: the upgrade flow constructs a ref-only CommitTarget (C-007) for the
+    # current branch and asserts UPGRADE_BOOKKEEPING (no message-prefix channel).
+    assert captured["target"].ref == "main"
+    assert captured["capability"] is GuardCapability.UPGRADE_BOOKKEEPING
     assert captured["paths"] == (
         Path(".kittify/metadata.yaml"),
         Path("kitty-specs/001-test/tasks/WP01.md"),
@@ -646,6 +650,66 @@ def test_upgrade_no_migrations_stamps_existing_worktree_schema_version(
             ".worktrees/001-feature-lane-a/.kittify/metadata.yaml",
         ]
     ]
+
+
+def test_upgrade_no_migrations_keeps_current_worktree_metadata_clean(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """A clean, already-current upgrade must not rewrite worktree timestamps."""
+    from specify_cli.migration.schema_version import REQUIRED_SCHEMA_VERSION
+    from specify_cli.upgrade.metadata import ProjectMetadata
+    from specify_cli.upgrade.runner import MigrationRunner
+
+    project_path = _setup_upgrade_project(tmp_path)
+    metadata_path = project_path / ".kittify" / "metadata.yaml"
+    metadata = ProjectMetadata.load(project_path / ".kittify")
+    assert metadata is not None
+    metadata.save(project_path / ".kittify")
+    MigrationRunner._stamp_schema_version(project_path / ".kittify", REQUIRED_SCHEMA_VERSION)
+    root_before = metadata_path.read_text(encoding="utf-8")
+
+    worktree_kittify = project_path / ".worktrees" / "001-feature-lane-a" / ".kittify"
+    worktree_kittify.mkdir(parents=True)
+    worktree_metadata_path = worktree_kittify / "metadata.yaml"
+    worktree_metadata_path.write_text(root_before, encoding="utf-8")
+
+    worktree_before = worktree_metadata_path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(Path, "cwd", lambda: project_path)
+
+    status_calls = {"count": 0}
+
+    def _fake_status(_repo_path: Path) -> set[str]:
+        status_calls["count"] += 1
+        return set()
+
+    monkeypatch.setattr(upgrade_cmd, "_git_status_paths", _fake_status)
+    monkeypatch.setattr(
+        upgrade_cmd,
+        "safe_commit",
+        lambda **_kw: (_ for _ in ()).throw(AssertionError("safe_commit should not run")),
+    )
+
+    _run_upgrade(
+        dry_run=False,
+        force=True,
+        target="1.0.0a1",
+        json_output=True,
+        verbose=False,
+        no_worktrees=False,
+        cli=False,
+        project=False,
+    )
+
+    data = json.loads(capsys.readouterr().out.strip())
+    assert data["status"] == "up_to_date"
+    assert data["auto_committed"] is False
+    assert data["auto_commit_paths"] == []
+    assert status_calls["count"] >= 1
+    assert metadata_path.read_text(encoding="utf-8") == root_before
+    assert worktree_metadata_path.read_text(encoding="utf-8") == worktree_before
 
 
 def test_upgrade_no_migrations_respects_no_worktrees_for_schema_stamp(

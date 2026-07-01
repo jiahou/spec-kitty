@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from specify_cli.dashboard.charter_path import resolve_project_charter_path
-from specify_cli.legacy_detector import is_legacy_format
+from specify_cli.lanes.branch_naming import resolve_mid8
+from specify_cli.upgrade.legacy_detector import is_legacy_format
 from specify_cli.status import wp_state_for
 from specify_cli.status import Lane
 from specify_cli.text_sanitization import sanitize_file
@@ -39,10 +40,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "build_mission_registry",
     "format_path_for_display",
-    "gather_feature_paths",
+    # gather_feature_paths: demoted — no cross-module src/ from-import callers
+    # (WP01 harden-dead-symbol-gate-01KW0RJR).
     "get_feature_artifacts",
     "get_workflow_status",
-    "read_file_resilient",
+    # read_file_resilient: demoted — no cross-module src/ from-import callers
+    # (WP01 harden-dead-symbol-gate-01KW0RJR).
+    "read_only_weighted_percentage",
     "resolve_feature_dir",
     "resolve_active_feature",
     "scan_all_features",
@@ -301,32 +305,67 @@ def get_workflow_status(artifacts: dict[str, dict[str, any]]) -> dict[str, str]:
 def gather_feature_paths(project_dir: Path) -> dict[str, Path]:
     """Collect candidate feature directories from root and worktrees.
 
-    Main repo (kitty-specs/) paths take priority over worktree copies.
-    Worktrees may have stale data from when they were created, so the
-    main repo should be the source of truth for feature status.
+    Resolution priority:
+      1. Coordination worktree copies, when present, because they hold the
+         authoritative live mission state during active coordination-topology
+         missions.
+      2. Main repo copies under ``kitty-specs/``.
+      3. Lane worktree copies, which may be stale and should never outrank the
+         coordination worktree or main checkout.
     """
-    feature_paths: dict[str, Path] = {}
+    from specify_cli.coordination.surface_resolver import (
+        WorktreeRegistryUnavailable,
+        WorktreeTopology,
+        classify_worktree_topology,
+        read_worktree_registry,
+    )
 
-    # First scan worktrees (lower priority - may have stale data)
+    feature_paths: dict[str, Path] = {}
+    coord_paths: dict[str, Path] = {}
+
+    # First scan worktrees. Lane worktrees stay low priority, while the
+    # coordination worktree for a mission is remembered and applied last.
     worktrees_root = project_dir / ".worktrees"
     if worktrees_root.exists():
+        # Read the git worktree registry once for the whole scan pass (name
+        # proposes coord-ness; the registry disposes). A husk ``-coord`` dir
+        # (suffix present, not registered) must NOT shadow the primary surface.
+        try:
+            registry = read_worktree_registry(project_dir)
+        except WorktreeRegistryUnavailable:
+            # No readable registry (e.g. project_dir is not a git repo in tests):
+            # degrade to scanning all dirs as non-coord rather than failing the
+            # whole dashboard scan. Coord copies simply do not outrank here.
+            registry = None
         for worktree_dir in worktrees_root.iterdir():
             if not worktree_dir.is_dir():
                 continue
             wt_specs = worktree_dir / KITTY_SPECS_DIR
             if not wt_specs.exists():
                 continue
+            is_coord_worktree = (
+                registry is not None
+                and classify_worktree_topology(
+                    worktree_dir, repo_root=project_dir, registry=registry
+                )
+                is WorktreeTopology.COORD_WORKTREE
+            )
             for feature_dir in wt_specs.iterdir():
                 if feature_dir.is_dir():
+                    if is_coord_worktree:
+                        coord_paths[feature_dir.name] = feature_dir
+                        continue
                     feature_paths[feature_dir.name] = feature_dir
 
-    # Then scan main repo (higher priority - source of truth)
-    # This will overwrite any worktree paths with the same feature name
+    # Main checkout beats lane worktrees.
     root_specs = project_dir / KITTY_SPECS_DIR
     if root_specs.exists():
         for feature_dir in root_specs.iterdir():
             if feature_dir.is_dir():
                 feature_paths[feature_dir.name] = feature_dir
+
+    # Coordination worktrees beat everything else.
+    feature_paths.update(coord_paths)
 
     return feature_paths
 
@@ -398,8 +437,15 @@ def build_mission_registry(project_dir: Path) -> dict[str, dict[str, Any]]:
         key = _mission_record_key(feature_dir, mission_id, mission_number)
 
         # mid8 is meaningful only when key is an actual mission_id (ULID).
+        # Route through the authoritative resolver (WP03 / FR-009); ``or None``
+        # preserves the registry's ``mid8 is None`` contract for pseudo keys and
+        # missing identities (resolve_mid8 declines to ``""``, never ``None``).
         is_pseudo = key.startswith(("legacy:", "orphan:"))
-        mid8: str | None = None if is_pseudo else (mission_id[:8] if mission_id else None)
+        mid8: str | None = (
+            None
+            if is_pseudo
+            else (resolve_mid8(feature_dir.name, mission_id=mission_id) or None)
+        )
 
         registry[key] = {
             "mission_id": key,  # canonical key, may be pseudo
@@ -528,6 +574,23 @@ def _read_dashboard_feature_meta(feature_dir: Path) -> tuple[str, dict[str, Any]
     return friendly_name, meta_data
 
 
+def _resolve_feature_worktree_info(project_dir: Path, feature_dir: Path) -> dict[str, Any]:
+    """Return dashboard worktree metadata for a selected feature directory."""
+    worktrees_root = project_dir / ".worktrees"
+    if feature_dir.is_relative_to(worktrees_root):
+        worktree_root = feature_dir.parents[1]
+        return {
+            "path": format_path_for_display(str(worktree_root)),
+            "exists": True,
+        }
+
+    worktree_path = worktrees_root / feature_dir.name
+    return {
+        "path": format_path_for_display(str(worktree_path)),
+        "exists": worktree_path.exists(),
+    }
+
+
 def _build_legacy_kanban_stats(tasks_dir: Path) -> dict[str, int]:
     kanban_stats = {"total": 0, "planned": 0, "doing": 0, "for_review": 0, "approved": 0, "done": 0}
     for lane in ["planned", "doing", "for_review", "done"]:
@@ -537,6 +600,63 @@ def _build_legacy_kanban_stats(tasks_dir: Path) -> dict[str, int]:
             kanban_stats[lane] = count
             kanban_stats["total"] += count
     return kanban_stats
+
+
+def read_only_weighted_percentage(feature_dir: Path) -> float | None:
+    """Return the weighted-progress percentage for ``feature_dir`` read-only.
+
+    WP11 / FR-014(a) / IC-12: the dashboard is a *viewer*. Computing progress
+    for a kanban request MUST NOT write tracked status (``status.json``) as a
+    side-effect — the writing ``materialize()`` clobbers tracked status during
+    git operations (#1789, the dashboard half). This helper reduces the event
+    log via the read-only ``materialize_snapshot`` and never writes.
+
+    The dashboard shares WP07's single git-op detection source
+    (``git_operation_in_progress``) rather than duplicating it (C-005): during
+    an active git op this path is *guaranteed* write-free, so the helper short-
+    circuits early with the same detection WP07's runtime writers consult. The
+    snapshot returns the exact reduced view ``materialize()`` would have written
+    (C-004 — rendered data is unchanged), only without the write.
+
+    Returns the rounded percentage, or ``None`` when progress is unavailable.
+    """
+    from specify_cli.status import compute_weighted_progress
+    from specify_cli.status import git_operation_in_progress
+    from specify_cli.status import materialize_snapshot
+
+    # Single-source git-op detection (C-005): the dashboard consumes WP07's
+    # shared helper rather than re-implementing marker probing. Reads here are
+    # always write-free (materialize_snapshot), so a git op never forces a
+    # different code path; we surface it for observability and to make the
+    # write-free-during-git-op contract explicit and testable (SC-6a).
+    repo_root = _resolve_checkout_root(feature_dir)
+    if repo_root is not None and git_operation_in_progress(repo_root):
+        logger.debug(
+            "Git operation in progress at '%s'; serving kanban for '%s' "
+            "read-only (no tracked status write).",
+            repo_root,
+            feature_dir.name,
+        )
+
+    snapshot = materialize_snapshot(feature_dir)
+    progress = compute_weighted_progress(snapshot)
+    return round(progress.percentage, 1)
+
+
+def _resolve_checkout_root(feature_dir: Path) -> Path | None:
+    """Return the checkout root (the dir holding ``.git``) for ``feature_dir``.
+
+    WP07's :func:`git_operation_in_progress` expects the checkout root (where
+    ``.git`` lives, file or directory), then internally resolves both the
+    per-worktree and shared common gitdirs. The dashboard receives a mission
+    ``feature_dir`` (``<root>/kitty-specs/<slug>``), so we walk up to the
+    nearest ancestor that owns a ``.git`` entry. Returns ``None`` when no
+    enclosing checkout is found (conservative: callers then skip the probe).
+    """
+    for candidate in (feature_dir, *feature_dir.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
 
 
 def _build_event_log_kanban_stats(feature_dir: Path, tasks_dir: Path) -> dict[str, Any]:
@@ -551,12 +671,9 @@ def _build_event_log_kanban_stats(feature_dir: Path, tasks_dir: Path) -> dict[st
             kanban_stats["total"] += count
 
         try:
-            from specify_cli.status import compute_weighted_progress
-            from specify_cli.status import materialize
-
-            snap = materialize(feature_dir)
-            progress = compute_weighted_progress(snap)
-            kanban_stats["weighted_percentage"] = round(progress.percentage, 1)
+            weighted = read_only_weighted_percentage(feature_dir)
+            if weighted is not None:
+                kanban_stats["weighted_percentage"] = weighted
         except Exception:
             logger.debug(
                 "Could not compute weighted progress for '%s'",
@@ -604,9 +721,7 @@ def scan_all_features(project_dir: Path) -> list[dict[str, Any]]:
         workflow = get_workflow_status(artifacts)
         kanban_stats = _build_kanban_stats(feature_dir, artifacts)
 
-        worktree_root = project_dir / ".worktrees"
-        worktree_path = worktree_root / feature_dir.name
-        worktree_exists = worktree_path.exists()
+        worktree = _resolve_feature_worktree_info(project_dir, feature_dir)
         display_name = format_feature_display_name(feature_id, friendly_name)
 
         features.append(
@@ -619,10 +734,7 @@ def scan_all_features(project_dir: Path) -> list[dict[str, Any]]:
                 "workflow": workflow,
                 "kanban_stats": kanban_stats,
                 "meta": meta_data or {},
-                "worktree": {
-                    "path": format_path_for_display(str(worktree_path)),
-                    "exists": worktree_exists,
-                },
+                "worktree": worktree,
             }
         )
 
@@ -662,7 +774,12 @@ def _process_wp_file(
         return None
 
     title_match = re.search(r"^#\s+Work Package Prompt:\s+(.+)$", content, re.MULTILINE)
-    title = title_match.group(1) if title_match else prompt_file.stem
+    if title_match:
+        title = title_match.group(1)
+    elif wp_meta_dict.title is not None:
+        title = wp_meta_dict.title.strip()
+    else:
+        title = prompt_file.stem
 
     wp_id = wp_meta_dict.work_package_id
     from specify_cli.status import has_event_log, get_wp_lane
@@ -737,49 +854,35 @@ def scan_feature_kanban(project_dir: Path, feature_id: str) -> dict[str, list[di
     if not tasks_dir.exists():
         return lanes
 
-    use_legacy = is_legacy_format(feature_dir)
+    if is_legacy_format(feature_dir):
+        # Pre-3.0 layout: the boundary guard blocks mutation commands from
+        # reaching this path; the dashboard read-only scan annotates the feature
+        # as legacy without iterating lane subdirectories.
+        return lanes
 
-    if use_legacy:
-        # Legacy format: scan lane subdirectories
-        for lane in lanes:
-            lane_dir = tasks_dir / lane
-            if not lane_dir.exists():
-                continue
+    # New format: scan flat tasks/ directory, lane from event log
+    from specify_cli.status import CanonicalStatusNotFoundError
 
-            for prompt_file in lane_dir.rglob("WP*.md"):
-                try:
-                    task_data = _process_wp_file(prompt_file, project_dir, lane)
-                    if task_data is not None:
-                        lanes[lane].append(task_data)
-                except Exception as exc:
-                    logger.error(f"Unexpected error processing {prompt_file.name}: {exc}")
-                    continue
+    for prompt_file in tasks_dir.glob("WP*.md"):
+        try:
+            task_data = _process_wp_file(prompt_file, project_dir, "planned")
+            if task_data is not None:
+                raw_lane = task_data.get("lane", "planned")
+                state = wp_state_for(raw_lane)
+                column = _KANBAN_COLUMN_FOR_LANE.get(state.lane, "planned")
+                lanes[column].append(task_data)
+        except CanonicalStatusNotFoundError:
+            logger.warning(
+                "No event log for feature '%s' — cannot render kanban",
+                feature_dir.name,
+            )
+            return lanes  # Return empty kanban — feature not finalized
+        except Exception as exc:
+            logger.error(f"Unexpected error processing {prompt_file.name}: {exc}")
+            continue
 
-            lanes[lane].sort(key=work_package_sort_key)
-    else:
-        # New format: scan flat tasks/ directory, lane from event log
-        from specify_cli.status import CanonicalStatusNotFoundError
-
-        for prompt_file in tasks_dir.glob("WP*.md"):
-            try:
-                task_data = _process_wp_file(prompt_file, project_dir, "planned")
-                if task_data is not None:
-                    raw_lane = task_data.get("lane", "planned")
-                    state = wp_state_for(raw_lane)
-                    column = _KANBAN_COLUMN_FOR_LANE.get(state.lane, "planned")
-                    lanes[column].append(task_data)
-            except CanonicalStatusNotFoundError:
-                logger.warning(
-                    "No event log for feature '%s' — cannot render kanban",
-                    feature_dir.name,
-                )
-                return lanes  # Return empty kanban — feature not finalized
-            except Exception as exc:
-                logger.error(f"Unexpected error processing {prompt_file.name}: {exc}")
-                continue
-
-        # Sort all lanes
-        for lane in lanes:
-            lanes[lane].sort(key=work_package_sort_key)
+    # Sort all lanes
+    for lane in lanes:
+        lanes[lane].sort(key=work_package_sort_key)
 
     return lanes

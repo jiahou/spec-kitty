@@ -17,12 +17,28 @@ from specify_cli.events.decision_log import DecisionGitLog
 from specify_cli.sync.runtime_event_emitter import SyncRuntimeEventEmitter
 from runtime.next._internal_runtime.events import NullEmitter
 
-pytestmark = [pytest.mark.unit]
-
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _write_coord_meta(repo_root: Path, slug: str) -> Path:
+    """Write a coord-topology ``meta.json`` so ``ensure_topology`` classifies COORD.
+
+    WP03 routes coord decisions by the STORED topology (FR-004), so a coord-routing
+    test must declare the topology in meta (via ``coordination_branch`` →
+    ``ensure_topology`` derives/persists ``topology: coord``) rather than relying on
+    a disk-stat. Anchored on the canonical PRIMARY mission dir.
+    """
+    mission_dir = repo_root / "kitty-specs" / slug
+    mission_dir.mkdir(parents=True, exist_ok=True)
+    (mission_dir / "meta.json").write_text(
+        '{"coordination_branch":"kitty/mission-' + slug + '",'
+        '"mission_id":"01KT3YBDABCDEFGHIJKLMNOP"}',
+        encoding="utf-8",
+    )
+    return mission_dir
+
 
 def _make_log(
     repo_root: Path,
@@ -91,14 +107,25 @@ class TestWrapWithDecisionGitLogCoordRouting:
     """_wrap_with_decision_git_log selects worktree_root based on coord existence (T018, T019)."""
 
     def test_coord_worktree_used_when_exists(self, tmp_path: Path) -> None:
-        """When coord worktree directory exists, it becomes worktree_root (T018)."""
+        """Coord-routing topology + materialized coord worktree ⇒ worktree_root (T018).
+
+        WP03 (single-planning-surface-authority): coord ROUTING is now decided by
+        the STORED MissionTopology (FR-004 / SC-001), not by ``_coord_path.exists()``
+        (the retired C-004 disk-stat). The on-disk materialization probe survives
+        ONLY to select the worktree_root for an already-coord-routing mission
+        (C-006). So this asserts: stored coord topology AND the coord worktree
+        materialized ⇒ the coord path is the worktree_root.
+        """
         from runtime.next.runtime_bridge import _wrap_with_decision_git_log
 
         slug = "my-feature-01KT3YBD"
         mid8 = "01KT3YBD"
         base_slug = "my-feature"
 
-        # Create coord worktree directory on disk
+        # Stored topology authority (WP02): declare coord-branch topology in meta
+        # so ``ensure_topology`` classifies/persists COORD — the routing signal.
+        _write_coord_meta(tmp_path, slug)
+        # Create coord worktree directory on disk (the C-006 materialization probe).
         coord_path = tmp_path / ".worktrees" / f"{base_slug}-{mid8}-coord"
         coord_path.mkdir(parents=True)
 
@@ -114,6 +141,7 @@ class TestWrapWithDecisionGitLogCoordRouting:
             *,
             inner: Any,
             mission_id: str = "",
+            target: Any = None,
         ) -> Any:
             captured["worktree_root"] = worktree_root
             return inner  # return inner unchanged for simplicity
@@ -137,6 +165,39 @@ class TestWrapWithDecisionGitLogCoordRouting:
         assert "worktree_root" in captured
         assert captured["worktree_root"] == coord_path
 
+    def test_resolve_mission_ulid_reads_primary_not_coord_worktree(self, tmp_path: Path) -> None:
+        """#2091 red-first: identity (``mission_id``) is persisted ONLY on the
+        primary checkout's meta.json. Under coordination topology the coord-aware
+        resolver returns the materialized coord worktree, whose mission dir has NO
+        meta.json — so reading identity there loses the ULID, ``_declared_id``
+        becomes ``None``, ``resolve_mid8`` declines to ``""`` (its #1918 contract),
+        and ``_wrap_with_decision_git_log`` composes the malformed
+        ``kitty/mission-<slug>-`` branch. ``_resolve_mission_ulid`` must read the
+        PRIMARY surface and return the ULID. RED on the unfixed code (returns the
+        slug), GREEN once the identity read is primary-anchored.
+        """
+        from runtime.next.runtime_bridge import _resolve_mission_ulid
+
+        slug = "my-feature-01KT3YBD"
+        mid8 = "01KT3YBD"
+        base_slug = "my-feature"
+        ulid = "01KT3YBDABCDEFGHIJKLMNOP"
+
+        # mission_id persisted on the PRIMARY checkout's meta.json only.
+        _write_coord_meta(tmp_path, slug)
+        # Materialized coord worktree whose mission dir has NO meta.json — the
+        # surface the coord-aware resolver would (wrongly) read identity from.
+        coord_mission_dir = (
+            tmp_path / ".worktrees" / f"{base_slug}-{mid8}-coord" / "kitty-specs" / slug
+        )
+        coord_mission_dir.mkdir(parents=True)
+        assert not (coord_mission_dir / "meta.json").exists()
+
+        assert _resolve_mission_ulid(slug, tmp_path) == ulid, (
+            "identity read must anchor on the primary checkout's meta.json, not "
+            "the coord worktree (which has no meta.json) — #2091"
+        )
+
     def test_repo_root_used_when_coord_absent(self, tmp_path: Path) -> None:
         """When coord worktree does not exist, repo_root becomes worktree_root (T019)."""
         from runtime.next.runtime_bridge import _wrap_with_decision_git_log
@@ -154,6 +215,7 @@ class TestWrapWithDecisionGitLogCoordRouting:
             *,
             inner: Any,
             mission_id: str = "",
+            target: Any = None,
         ) -> Any:
             captured["worktree_root"] = worktree_root
             return inner
@@ -211,6 +273,7 @@ class TestWrapWithDecisionGitLogCoordRouting:
             *,
             inner: Any,
             mission_id: str = "",
+            target: Any = None,
         ) -> Any:
             captured["worktree_root"] = worktree_root
             return inner
@@ -260,6 +323,82 @@ class TestWrapWithDecisionGitLogCoordRouting:
             pytest.raises(DecisionGitLogUnavailable),
         ):
             _wrap_with_decision_git_log(inner, slug, repo_root)
+
+
+# ---------------------------------------------------------------------------
+# WP04 (T010, C-011) — worktree_root selection PRESERVED through the .kind drain.
+# Non-identity fixture: primary root != coord root, so an identity fixture (where
+# the two coincide) could NOT distinguish a broken selection from a correct one.
+# ---------------------------------------------------------------------------
+
+class TestWorktreeRootPreservedThroughKindDrain:
+    """C-011: dropping the vestigial ``.kind`` carrier must NOT alter worktree_root."""
+
+    def test_coord_root_selected_over_distinct_primary_root(self, tmp_path: Path) -> None:
+        """Coord-routed mission ⇒ selected worktree_root is the COORD root (non-identity).
+
+        The C-011 risk pin. ``repo_root`` (primary) and the materialized coord
+        worktree are DISTINCT directories (``primary_root != coord_root``); the
+        producer must select the COORD root, not the primary. An identity fixture
+        (coord == primary) would pass even if WP04's ``.kind`` drain had broken the
+        selection — this non-identity fixture would NOT. Also asserts the converted
+        ref-only ``decision_target`` still carries the coordination branch ref (the
+        carrier conversion changed only ``.kind``, never ``.ref``).
+        """
+        from runtime.next.runtime_bridge import _wrap_with_decision_git_log
+
+        slug = "my-feature-01KT3YBD"
+        mid8 = "01KT3YBD"
+        base_slug = "my-feature"
+        coord_branch = "kitty/mission-my-feature-01KT3YBD"
+
+        # primary (repo) root and coord root are DISTINCT (non-identity).
+        repo_root = tmp_path / "primary-checkout"
+        repo_root.mkdir()
+        _write_coord_meta(repo_root, slug)
+        coord_root = repo_root / ".worktrees" / f"{base_slug}-{mid8}-coord"
+        coord_root.mkdir(parents=True)
+        assert coord_root != repo_root
+
+        inner = MagicMock(spec=SyncRuntimeEventEmitter)
+        captured: dict[str, Any] = {}
+
+        def _fake_decision_git_log(
+            repo_root: Path,
+            worktree_root: Path,
+            destination_ref: str,
+            mission_slug: str,
+            *,
+            inner: Any,
+            mission_id: str = "",
+            target: Any = None,
+        ) -> Any:
+            captured["worktree_root"] = worktree_root
+            captured["target"] = target
+            return inner
+
+        with (
+            patch(
+                "specify_cli.events.decision_log.DecisionGitLog",
+                side_effect=_fake_decision_git_log,
+            ),
+            patch(
+                "runtime.next.runtime_bridge._resolve_coordination_branch",
+                return_value=coord_branch,
+            ),
+            patch(
+                "runtime.next.runtime_bridge._resolve_mission_ulid",
+                return_value="01KT3YBDABCDEFGHIJKLMNOP",
+            ),
+        ):
+            _wrap_with_decision_git_log(inner, slug, repo_root)
+
+        # The risk pin: COORD root selected, NOT the distinct primary root.
+        assert captured["worktree_root"] == coord_root
+        assert captured["worktree_root"] != repo_root
+        # The ref-only carrier still routes to the coordination branch ref.
+        assert captured["target"] is not None
+        assert captured["target"].ref == coord_branch
 
 
 # ---------------------------------------------------------------------------

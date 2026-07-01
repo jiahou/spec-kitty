@@ -15,7 +15,9 @@ from specify_cli.cli.commands.merge import (
     _assert_baseline_merge_commit_on_target,
     _assert_merged_wps_reached_done,
     _mark_wp_merged_done,
+    _project_status_bookkeeping_to_target,
     _record_baseline_merge_commit,
+    _restore_final_bookkeeping_snapshots,
 )
 
 pytestmark = pytest.mark.fast
@@ -253,13 +255,17 @@ def test_mark_wp_merged_done_uses_typed_frontmatter(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    """Verify _mark_wp_merged_done uses read_wp_frontmatter (typed) not read_frontmatter (raw dict)."""
-    import specify_cli.cli.commands.merge as merge_mod
+    """Verify _mark_wp_merged_done uses read_wp_frontmatter (typed) not read_frontmatter (raw dict).
 
-    # The old read_frontmatter import should not exist on the module
-    assert not hasattr(merge_mod, "read_frontmatter"), "merge module still imports read_frontmatter; should use read_wp_frontmatter"
-    # The new typed import must be present
-    assert hasattr(merge_mod, "read_wp_frontmatter"), "merge module must import read_wp_frontmatter"
+    WP08 (#2057): _mark_wp_merged_done moved to the ``done_bookkeeping`` seam, so
+    the typed-frontmatter import now lives there (not on the command shim).
+    """
+    import specify_cli.merge.done_bookkeeping as db_mod
+
+    # The old read_frontmatter (raw dict) import must not exist on the seam.
+    assert not hasattr(db_mod, "read_frontmatter"), "done_bookkeeping still imports read_frontmatter; should use read_wp_frontmatter"
+    # The new typed import must be present where _mark_wp_merged_done now lives.
+    assert hasattr(db_mod, "read_wp_frontmatter"), "done_bookkeeping must import read_wp_frontmatter"
 
 
 def test_assert_merged_wps_reached_done_allows_done_snapshot(
@@ -273,6 +279,9 @@ def test_assert_merged_wps_reached_done_allows_done_snapshot(
         encoding="utf-8",
     )
 
+    # Patch the re-exported binding _assert_merged_wps_reached_done actually
+    # imports (`from specify_cli.status import get_wp_lane`, resolved at call
+    # time) — patching the lane_reader original would not intercept it.
     monkeypatch.setattr(
         "specify_cli.status.get_wp_lane",
         lambda *_a, **_kw: "done",
@@ -293,6 +302,9 @@ def test_assert_merged_wps_reached_done_fails_when_wp_not_done(
     )
 
     lanes = {"WP01": "done", "WP02": "planned"}
+    # Same call-time re-export binding as the allows_done_snapshot test above;
+    # with the lane_reader target this passed for the WRONG reason (the real
+    # get_wp_lane raised CanonicalStatusNotFoundError -> Exit, not the lane check).
     monkeypatch.setattr(
         "specify_cli.status.get_wp_lane",
         lambda _feature_dir, wp_id: lanes[wp_id],
@@ -405,7 +417,7 @@ def test_assert_baseline_on_target_passes_when_committed_meta_matches(tmp_path: 
     committed_meta = json.dumps({"baseline_merge_commit": "base123"})
 
     with patch(
-        "specify_cli.cli.commands.merge.run_command",
+        "specify_cli.merge.baseline.run_command",
         return_value=(0, committed_meta, ""),
     ):
         # Must not raise.
@@ -425,7 +437,7 @@ def test_assert_baseline_on_target_raises_when_baseline_absent(tmp_path: Path) -
     committed_meta = json.dumps({"mission_slug": "021-test"})  # no baseline_merge_commit
 
     with patch(
-        "specify_cli.cli.commands.merge.run_command",
+        "specify_cli.merge.baseline.run_command",
         return_value=(0, committed_meta, ""),
     ), pytest.raises(BaselineMergeCommitError):
         _assert_baseline_merge_commit_on_target(
@@ -444,7 +456,7 @@ def test_assert_baseline_on_target_raises_when_baseline_mismatches(tmp_path: Pat
     committed_meta = json.dumps({"baseline_merge_commit": "other999"})
 
     with patch(
-        "specify_cli.cli.commands.merge.run_command",
+        "specify_cli.merge.baseline.run_command",
         return_value=(0, committed_meta, ""),
     ), pytest.raises(BaselineMergeCommitError):
         _assert_baseline_merge_commit_on_target(
@@ -462,7 +474,7 @@ def test_assert_baseline_on_target_raises_when_git_show_fails(tmp_path: Path) ->
     _write_meta(feature_dir, "021-test")
 
     with patch(
-        "specify_cli.cli.commands.merge.run_command",
+        "specify_cli.merge.baseline.run_command",
         return_value=(128, "", "fatal: path does not exist"),
     ), pytest.raises(BaselineMergeCommitError):
         _assert_baseline_merge_commit_on_target(
@@ -483,7 +495,7 @@ def test_assert_baseline_on_target_skips_legacy_mission(tmp_path: Path) -> None:
     def _boom(*_a: Any, **_kw: Any):
         raise AssertionError("run_command must not be called for legacy missions")
 
-    with patch("specify_cli.cli.commands.merge.run_command", side_effect=_boom):
+    with patch("specify_cli.merge.baseline.run_command", side_effect=_boom):
         _assert_baseline_merge_commit_on_target(
             tmp_path,
             "021-test",
@@ -515,7 +527,7 @@ def test_assert_baseline_on_target_resume_uses_recorded_baseline_not_live_head(
     committed_meta = json.dumps({"baseline_merge_commit": "original_sha_a"})
 
     with patch(
-        "specify_cli.cli.commands.merge.run_command",
+        "specify_cli.merge.baseline.run_command",
         return_value=(0, committed_meta, ""),
     ):
         # expected_baseline is the RE-DERIVED, now-advanced target HEAD on
@@ -540,7 +552,7 @@ def test_assert_baseline_on_target_raises_when_committed_differs_from_recorded(
     committed_meta = json.dumps({"baseline_merge_commit": "drifted_sha_c"})
 
     with patch(
-        "specify_cli.cli.commands.merge.run_command",
+        "specify_cli.merge.baseline.run_command",
         return_value=(0, committed_meta, ""),
     ), pytest.raises(BaselineMergeCommitError):
         _assert_baseline_merge_commit_on_target(
@@ -559,7 +571,7 @@ def test_assert_baseline_on_target_raises_when_committed_differs_from_recorded(
 
 
 def test_assert_merged_wps_reads_coord_surface_when_coord_branch_set(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """ATDD anchor [RED]: _assert_merged_wps_reached_done must read from the
     coordination worktree when coordination_branch is set in meta.json.
@@ -613,16 +625,10 @@ def test_assert_merged_wps_reads_coord_surface_when_coord_branch_set(
         json.dumps(done_event) + "\n", encoding="utf-8"
     )
 
-    # Stub resolve_feature_dir_for_mission → primary checkout (no events).
-    # On unfixed code this causes get_wp_lane to raise CanonicalStatusNotFoundError.
-    # On fixed code _assert_merged_wps_reached_done calls resolve_status_surface
-    # instead, bypassing this stub entirely.
-    monkeypatch.setattr(
-        "specify_cli.cli.commands.merge.resolve_feature_dir_for_mission",
-        lambda *_a, **_kw: primary_dir,
-    )
-
-    # Must NOT raise. Will fail (CanonicalStatusNotFoundError) until WP02 fix.
+    # The primary checkout has meta.json but NO status.events.jsonl, while the
+    # coordination worktree carries the done event. _assert_merged_wps_reached_done
+    # must read the coord surface (via resolve_status_surface): if it read the
+    # primary checkout instead, get_wp_lane would raise CanonicalStatusNotFoundError.
     _assert_merged_wps_reached_done(tmp_path, mission_slug, ["WP01"])
 
 
@@ -755,3 +761,171 @@ def test_coord_branch_assert_ignores_primary_checkout(
     # Must RAISE — coord surface only has approved, not done
     with pytest.raises(typer.Exit):
         _assert_merged_wps_reached_done(repo_root, _COORD_SLUG, ["WP01"])
+
+
+def test_project_status_bookkeeping_copies_coord_surface_to_primary_target(
+    coord_branch_mission: dict,
+) -> None:
+    """Final merge bookkeeping must stage primary paths, not .worktrees paths."""
+    repo_root = coord_branch_mission["repo_root"]
+    primary_dir = coord_branch_mission["primary_dir"]
+    coord_specs = coord_branch_mission["coord_specs"]
+
+    (primary_dir / "status.events.jsonl").write_text("old-event\n", encoding="utf-8")
+    (primary_dir / "status.json").write_text('{"WP01": "approved"}\n', encoding="utf-8")
+    (coord_specs / "status.events.jsonl").write_text("new-done-event\n", encoding="utf-8")
+    (coord_specs / "status.json").write_text('{"WP01": "done"}\n', encoding="utf-8")
+
+    target_events, target_status = _project_status_bookkeeping_to_target(
+        main_repo=repo_root,
+        mission_slug=_COORD_SLUG,
+        status_feature_dir=coord_specs,
+    )
+
+    assert target_events == primary_dir / "status.events.jsonl"
+    assert target_status == primary_dir / "status.json"
+    assert ".worktrees" not in target_events.parts
+    assert ".worktrees" not in target_status.parts
+    assert target_events.read_text(encoding="utf-8") == "new-done-event\n"
+    assert target_status.read_text(encoding="utf-8") == '{"WP01": "done"}\n'
+
+
+def test_project_status_bookkeeping_restores_primary_on_projection_failure(
+    coord_branch_mission: dict,
+) -> None:
+    """Projection failure must not leave split-brain primary bookkeeping."""
+    repo_root = coord_branch_mission["repo_root"]
+    primary_dir = coord_branch_mission["primary_dir"]
+    coord_specs = coord_branch_mission["coord_specs"]
+
+    primary_events = primary_dir / "status.events.jsonl"
+    primary_status = primary_dir / "status.json"
+    primary_events.write_text("old-event\n", encoding="utf-8")
+    primary_status.write_text('{"WP01": "approved"}\n', encoding="utf-8")
+    (coord_specs / "status.events.jsonl").write_text("new-done-event\n", encoding="utf-8")
+    (coord_specs / "status.json").mkdir()
+
+    with pytest.raises(IsADirectoryError):
+        _project_status_bookkeeping_to_target(
+            main_repo=repo_root,
+            mission_slug=_COORD_SLUG,
+            status_feature_dir=coord_specs,
+        )
+
+    assert primary_events.read_text(encoding="utf-8") == "old-event\n"
+    assert primary_status.read_text(encoding="utf-8") == '{"WP01": "approved"}\n'
+
+
+def test_project_status_bookkeeping_rejects_paths_outside_primary_surface(
+    tmp_path: Path,
+) -> None:
+    """Projected bookkeeping must stay under kitty-specs/<slug>/ in primary checkout."""
+    repo_root = tmp_path
+    mission_slug = "outside-surface"
+    escaped_coord_specs = (
+        tmp_path
+        / ".worktrees"
+        / "outside-surface-coord"
+        / "kitty-specs"
+        / ".."
+        / ".."
+        / ".."
+    )
+
+    # The claimed topology (``.worktrees`` segment) does not match the resolved
+    # location (escapes above the worktrees root), so the topology guard rejects
+    # it before containment delegation.
+    with pytest.raises(ValueError, match="Untrusted status surface path"):
+        _project_status_bookkeeping_to_target(
+            main_repo=repo_root,
+            mission_slug=mission_slug,
+            status_feature_dir=escaped_coord_specs,
+        )
+
+
+def test_project_status_bookkeeping_rejects_wrong_primary_mission_surface(
+    tmp_path: Path,
+) -> None:
+    """Primary bookkeeping paths under kitty-specs must still match the mission slug."""
+    with pytest.raises(ValueError, match="outside trusted roots"):
+        _project_status_bookkeeping_to_target(
+            main_repo=tmp_path,
+            mission_slug="expected-mission",
+            status_feature_dir=tmp_path / "kitty-specs" / "other-mission",
+        )
+
+
+def test_project_status_bookkeeping_rejects_tainted_status_file_symlink(
+    coord_branch_mission: dict,
+) -> None:
+    """Coord status reads must stay pinned to the exact two trusted filenames."""
+    repo_root = coord_branch_mission["repo_root"]
+    coord_specs = coord_branch_mission["coord_specs"]
+
+    outside = repo_root / "outside.json"
+    outside.write_text('{"WP01": "stolen"}\n', encoding="utf-8")
+    (coord_specs / "status.events.jsonl").write_text("new-done-event\n", encoding="utf-8")
+    status_path = coord_specs / "status.json"
+    if status_path.exists() or status_path.is_symlink():
+        status_path.unlink()
+    status_path.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlinked status surface path"):
+        _project_status_bookkeeping_to_target(
+            main_repo=repo_root,
+            mission_slug=_COORD_SLUG,
+            status_feature_dir=coord_specs,
+        )
+
+
+def test_final_bookkeeping_rollback_restores_status_meta_and_state(tmp_path: Path) -> None:
+    """Final bookkeeping rollback restores every mutable surface it snapshots."""
+    coord_events = tmp_path / ".worktrees" / "m-coord" / "kitty-specs" / "m" / "status.events.jsonl"
+    coord_status = coord_events.parent / "status.json"
+    target_events = tmp_path / "kitty-specs" / "m" / "status.events.jsonl"
+    target_status = target_events.parent / "status.json"
+    target_meta = target_events.parent / "meta.json"
+    state_path = tmp_path / ".kittify" / "runtime" / "merge" / "01TESTSTATE" / "state.json"
+    for path, body in {
+        coord_events: b"approved-event\n",
+        coord_status: b'{"WP01": "approved"}\n',
+        target_meta: b'{"mission_slug": "m"}\n',
+        state_path: b'{"completed_wps": []}\n',
+    }.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+
+    snapshots = {
+        coord_events: coord_events.read_bytes(),
+        coord_status: coord_status.read_bytes(),
+        target_events: None,
+        target_status: None,
+        target_meta: target_meta.read_bytes(),
+        state_path: state_path.read_bytes(),
+    }
+
+    coord_events.write_text("approved-event\ndone-event\n", encoding="utf-8")
+    coord_status.write_text('{"WP01": "done"}\n', encoding="utf-8")
+    target_events.parent.mkdir(parents=True, exist_ok=True)
+    target_events.write_text("approved-event\ndone-event\n", encoding="utf-8")
+    target_status.write_text('{"WP01": "done"}\n', encoding="utf-8")
+    target_meta.write_text('{"mission_slug": "m", "baseline_merge_commit": "HEAD~1"}\n', encoding="utf-8")
+    state_path.write_text('{"completed_wps": ["WP01"]}\n', encoding="utf-8")
+
+    _restore_final_bookkeeping_snapshots(snapshots)
+
+    assert coord_events.read_bytes() == b"approved-event\n"
+    assert coord_status.read_bytes() == b'{"WP01": "approved"}\n'
+    assert not target_events.exists()
+    assert not target_status.exists()
+    assert target_meta.read_bytes() == b'{"mission_slug": "m"}\n'
+    assert state_path.read_bytes() == b'{"completed_wps": []}\n'
+
+
+def test_final_bookkeeping_rollback_trusts_legacy_merge_state_path(tmp_path: Path) -> None:
+    """Legacy merge state remains a trusted rollback snapshot target."""
+    legacy_state_path = tmp_path / ".kittify" / "merge-state.json"
+
+    _restore_final_bookkeeping_snapshots({legacy_state_path: b'{"completed_wps": []}\n'})
+
+    assert legacy_state_path.read_bytes() == b'{"completed_wps": []}\n'

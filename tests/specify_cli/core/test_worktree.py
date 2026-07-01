@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from specify_cli.core.worktree import create_wp_workspace
+from specify_cli.core.worktree import _existing_worktree_is_valid, create_wp_workspace
 
 
 # ---------------------------------------------------------------------------
@@ -23,8 +23,7 @@ from specify_cli.core.worktree import create_wp_workspace
 # ---------------------------------------------------------------------------
 
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 def _make_frontmatter(
     execution_mode: str = "code_change",
     wp_id: str = "WP01",
@@ -222,6 +221,38 @@ class TestCodeChangeWorkspace:
             )
 
 
+class TestExistingWorktreeValidity:
+    """Exercise the VCS/.git fallback matrix for existing worktree reuse."""
+
+    def test_returns_true_when_vcs_reports_repo(self, tmp_path: Path) -> None:
+        workspace_path = tmp_path / ".worktrees" / "lane-a"
+        workspace_path.mkdir(parents=True)
+
+        mock_vcs = MagicMock()
+        mock_vcs.is_repo.return_value = True
+
+        with patch("specify_cli.core.worktree.get_vcs", return_value=mock_vcs):
+            assert _existing_worktree_is_valid(workspace_path) is True
+
+    def test_falls_back_to_git_marker_when_vcs_probe_errors(self, tmp_path: Path) -> None:
+        workspace_path = tmp_path / ".worktrees" / "lane-b"
+        workspace_path.mkdir(parents=True)
+        (workspace_path / ".git").write_text("gitdir: /tmp/example\n", encoding="utf-8")
+
+        with patch("specify_cli.core.worktree.get_vcs", side_effect=RuntimeError("boom")):
+            assert _existing_worktree_is_valid(workspace_path) is True
+
+    def test_returns_false_when_vcs_false_and_no_git_marker(self, tmp_path: Path) -> None:
+        workspace_path = tmp_path / ".worktrees" / "lane-c"
+        workspace_path.mkdir(parents=True)
+
+        mock_vcs = MagicMock()
+        mock_vcs.is_repo.return_value = False
+
+        with patch("specify_cli.core.worktree.get_vcs", return_value=mock_vcs):
+            assert _existing_worktree_is_valid(workspace_path) is False
+
+
 # ---------------------------------------------------------------------------
 # T018: execution_mode default / unknown values
 # ---------------------------------------------------------------------------
@@ -363,3 +394,82 @@ class TestWPMetadataInput:
 
         assert result == workspace_path
         mock_vcs.create_workspace.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# #1880: typed preflight exception (NFR-007) — control flow by error_code,
+# not by substring-matching the human-readable message.
+# ---------------------------------------------------------------------------
+
+
+def _make_failed_vcs_result(error: str, error_code: str | None) -> MagicMock:
+    result = MagicMock()
+    result.success = False
+    result.error = error
+    result.error_code = error_code
+    return result
+
+
+class TestWorktreePreflightTypedException:
+    """``create_feature_worktree`` routes deterministic preflight failures by type."""
+
+    def test_deterministic_preflight_raises_typed_error_without_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        """A deterministic preflight code raises GitPreflightError and skips legacy git.
+
+        The message text is deliberately mutated (no "Git repository check
+        failed:" / "ownership trust" / "worktree discovery" substring) to prove
+        the routing is driven by ``error_code``, not the old substring markers.
+        """
+        from specify_cli.core.git_preflight import GitPreflightError
+        from specify_cli.core.worktree import create_feature_worktree
+
+        mock_vcs = MagicMock()
+        mock_vcs.create_workspace.return_value = _make_failed_vcs_result(
+            error="totally reworded message that matches no legacy marker",
+            error_code="NOT_A_GIT_REPOSITORY",
+        )
+
+        with (
+            patch("specify_cli.core.worktree.get_vcs", return_value=mock_vcs),
+            patch("specify_cli.core.worktree.subprocess.run") as mock_run,
+            pytest.raises(GitPreflightError) as excinfo,
+        ):
+            create_feature_worktree(
+                tmp_path,
+                "test-feature",
+                mission_id="01KNXQS9ATWWFXS3K5ZJ9E5008",
+            )
+
+        # Typed route: isinstance + stable error_code, not message substring.
+        assert excinfo.value.error_code == "NOT_A_GIT_REPOSITORY"
+        assert excinfo.value.is_deterministic is True
+        # Legacy direct-git fallback must NOT be attempted for preflight failures.
+        mock_run.assert_not_called()
+
+    def test_non_preflight_failure_falls_back_to_legacy_git(self, tmp_path: Path) -> None:
+        """A non-preflight failure (no deterministic code) still uses legacy fallback."""
+        from specify_cli.core.worktree import create_feature_worktree
+
+        mock_vcs = MagicMock()
+        mock_vcs.create_workspace.return_value = _make_failed_vcs_result(
+            error="some transient VCS-abstraction bug",
+            error_code=None,
+        )
+
+        with (
+            patch("specify_cli.core.worktree.get_vcs", return_value=mock_vcs),
+            patch("specify_cli.core.worktree.subprocess.run") as mock_run,
+            patch("specify_cli.core.worktree._ensure_spec_kitty_exclude"),
+            patch("specify_cli.core.worktree.setup_feature_directory"),
+            patch("warnings.warn"),
+        ):
+            create_feature_worktree(
+                tmp_path,
+                "test-feature",
+                mission_id="01KNXQS9ATWWFXS3K5ZJ9E5008",
+            )
+
+        # Legacy direct-git fallback IS attempted for non-preflight failures.
+        mock_run.assert_called_once()

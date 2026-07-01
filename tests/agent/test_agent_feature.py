@@ -11,7 +11,8 @@ import pytest
 from typer.testing import CliRunner
 from ulid import ULID
 
-from specify_cli.cli.commands.agent.mission import app
+from specify_cli.cli.commands.agent.mission import CommitToBranchResult, app
+from specify_cli.coordination.commit_router import CommitRouterResult
 
 pytestmark = [pytest.mark.integration, pytest.mark.git_repo]
 
@@ -125,11 +126,125 @@ class TestBranchContextCommand:
         assert output["branch_matches_target"] is False
         assert output["target_branch_source"] == "cli_arg"
 
+    @patch("specify_cli.cli.commands.agent.mission._resolve_primary_branch_for_recommendation")
+    @patch("specify_cli.cli.commands.agent.mission.locate_project_root")
+    @patch("specify_cli.cli.commands.agent.mission.is_git_repo")
+    @patch("specify_cli.cli.commands.agent.mission.get_current_branch")
+    def test_branch_context_recommends_feature_branch_on_primary(
+        self,
+        mock_branch: Mock,
+        mock_is_git: Mock,
+        mock_locate: Mock,
+        mock_primary: Mock,
+        tmp_path: Path,
+    ) -> None:
+        """On the primary branch, recommend starting a feature branch (issue #765)."""
+        mock_locate.return_value = tmp_path
+        mock_is_git.return_value = True
+        mock_branch.return_value = "main"
+        mock_primary.return_value = "main"
+
+        result = runner.invoke(app, ["branch-context", "--json"])
+
+        assert result.exit_code == 0
+        output = json.loads(result.stdout)
+        assert output["primary_branch"] == "main"
+        assert output["current_is_primary"] is True
+        assert output["recommended_strategy"] == "feature-branch"
+        assert "primary branch 'main'" in output["branch_recommendation_reason"]
+        # Mirrored into the structured branch_context payload the prompt reads.
+        assert output["branch_context"]["current_is_primary"] is True
+        assert output["branch_context"]["recommended_strategy"] == "feature-branch"
+        assert output["branch_context"]["primary_branch"] == "main"
+        assert "reason" in output["branch_context"]
+
+    @patch("specify_cli.cli.commands.agent.mission._resolve_primary_branch_for_recommendation")
+    @patch("specify_cli.cli.commands.agent.mission.locate_project_root")
+    @patch("specify_cli.cli.commands.agent.mission.is_git_repo")
+    @patch("specify_cli.cli.commands.agent.mission.get_current_branch")
+    def test_branch_context_recommends_stay_off_primary(
+        self,
+        mock_branch: Mock,
+        mock_is_git: Mock,
+        mock_locate: Mock,
+        mock_primary: Mock,
+        tmp_path: Path,
+    ) -> None:
+        """Off the primary branch, no switch is recommended (issue #765)."""
+        mock_locate.return_value = tmp_path
+        mock_is_git.return_value = True
+        mock_branch.return_value = "feat/checkout-upsell"
+        mock_primary.return_value = "main"
+
+        result = runner.invoke(app, ["branch-context", "--json"])
+
+        assert result.exit_code == 0
+        output = json.loads(result.stdout)
+        assert output["primary_branch"] == "main"
+        assert output["current_is_primary"] is False
+        assert output["recommended_strategy"] == "stay"
+        assert "feat/checkout-upsell" in output["branch_recommendation_reason"]
+
+    @patch("specify_cli.cli.commands.agent.mission.locate_project_root")
+    def test_branch_context_uses_main_when_feature_branch_has_no_origin_head(
+        self,
+        mock_locate: Mock,
+        tmp_path: Path,
+    ) -> None:
+        """Do not treat a feature branch as primary just because origin/HEAD is absent."""
+        mock_locate.return_value = tmp_path
+        subprocess.run(
+            ["git", "init", "--initial-branch=main"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.email", "spec-kitty-tests@example.invalid"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "Spec Kitty Tests"], cwd=tmp_path, check=True)
+        (tmp_path / "README.md").write_text("init\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", "switch", "-c", "feat/checkout-upsell"], cwd=tmp_path, check=True, capture_output=True)
+
+        result = runner.invoke(app, ["branch-context", "--json"])
+
+        assert result.exit_code == 0, result.output
+        output = json.loads(result.stdout)
+        assert output["primary_branch"] == "main"
+        assert output["current_branch"] == "feat/checkout-upsell"
+        assert output["current_is_primary"] is False
+        assert output["recommended_strategy"] == "stay"
+
+
+class TestInjectBranchContractRecommendation:
+    """The recommendation payload is opt-in (issue #765)."""
+
+    def test_legacy_contract_unchanged_without_primary_branch(self) -> None:
+        """Callers that omit primary_branch get the byte-identical legacy contract."""
+        from specify_cli.cli.commands.agent.mission import _inject_branch_contract
+
+        enriched = _inject_branch_contract(
+            {"result": "success"},
+            target_branch="main",
+            current_branch="main",
+        )
+
+        # No #765 recommendation keys leak into the legacy payload.
+        for key in (
+            "primary_branch",
+            "current_is_primary",
+            "recommended_strategy",
+            "branch_recommendation_reason",
+        ):
+            assert key not in enriched
+        assert "primary_branch" not in enriched["branch_context"]
+        assert "recommended_strategy" not in enriched["runtime_vars"]
+
 
 class TestCreateFeatureCommand:
     """Tests for create command."""
 
-    @patch("specify_cli.core.mission_creation.emit_mission_created")
+    @patch("specify_cli.status.fire_dossier_sync")
     @patch("specify_cli.core.mission_creation._commit_feature_file")
     @patch("specify_cli.core.mission_creation.is_worktree_context", return_value=False)
     @patch("specify_cli.cli.commands.agent.mission.locate_project_root")
@@ -197,7 +312,7 @@ class TestCreateFeatureCommand:
             "track the work from mission creation onward."
         )
 
-    @patch("specify_cli.core.mission_creation.emit_mission_created")
+    @patch("specify_cli.status.fire_dossier_sync")
     @patch("specify_cli.core.mission_creation._commit_feature_file")
     @patch("specify_cli.core.mission_creation.is_worktree_context", return_value=False)
     @patch("specify_cli.cli.commands.agent.mission.locate_project_root")
@@ -336,7 +451,7 @@ class TestCreateFeatureCommand:
         assert "error" in output
         assert "git" in output["error"].lower()
 
-    @patch("specify_cli.core.mission_creation.emit_mission_created")
+    @patch("specify_cli.status.fire_dossier_sync")
     @patch("specify_cli.core.mission_creation._commit_feature_file")
     @patch("specify_cli.core.mission_creation.is_worktree_context", return_value=False)
     @patch("specify_cli.cli.commands.agent.mission.locate_project_root")
@@ -367,7 +482,7 @@ class TestCreateFeatureCommand:
         output = json.loads(first_line)
         assert output["result"] == "success"
 
-    @patch("specify_cli.core.mission_creation.emit_mission_created")
+    @patch("specify_cli.status.fire_dossier_sync")
     @patch("specify_cli.core.mission_creation._commit_feature_file")
     @patch("specify_cli.core.mission_creation.is_worktree_context", return_value=False)
     @patch("specify_cli.cli.commands.agent.mission.locate_project_root")
@@ -922,8 +1037,10 @@ requirement_refs:
                 return_value=(None, "main"),
             ),
             patch(
-                "specify_cli.cli.commands.agent.mission.safe_commit",
-                return_value=True,
+                "specify_cli.coordination.commit_router.commit_for_mission",
+                return_value=CommitRouterResult(
+                    status="committed", placement_ref="main", commit_hash="a" * 40
+                ),
             ),
             patch(
                 "specify_cli.cli.commands.agent.mission.run_command",
@@ -975,11 +1092,22 @@ class TestSetupPlanCommand:
         mock_find: Mock,
         mock_locate: Mock,
         tmp_path: Path,
-    ):
+    ) -> None:
         """Should scaffold plan template and output JSON format."""
         # Setup
         mock_locate.return_value = tmp_path
         mock_show_branch.return_value = (tmp_path, "main")
+        # A SUBSTANTIVE plan template means setup-plan DOES commit plan.md, so
+        # ``_commit_to_branch`` is invoked and its typed result is serialized into
+        # the --json payload. A bare ``Mock`` return leaks an un-serializable
+        # MagicMock into the JSON ("Object of type MagicMock is not JSON
+        # serializable") → setup-plan exits 1. Return a real, JSON-clean
+        # ``CommitToBranchResult`` so the JSON emit succeeds.
+        mock_commit.return_value = CommitToBranchResult(
+            status="committed",
+            placement_ref="main",
+            commit_hash="0123456789abcdef0123456789abcdef01234567",
+        )
         feature_dir = tmp_path / "kitty-specs" / "001-test"
         feature_dir.mkdir(parents=True)
         _write_committed_substantive_spec(tmp_path, feature_dir)
@@ -1198,41 +1326,63 @@ class TestFindFeatureDirectory:
         # Verify
         assert result == kitty_specs / "001-test-feature"
 
-    def test_raises_error_when_no_explicit_slug(self, tmp_path: Path):
-        """Should raise ValueError when explicit_feature is None (auto-detection removed)."""
+    def test_strips_explicit_mission_slug(self, tmp_path: Path):
+        """Whitespace around the mission selector should not change resolution."""
         from specify_cli.cli.commands.agent.mission import _find_feature_directory
 
         kitty_specs = tmp_path / "kitty-specs"
         kitty_specs.mkdir()
         (kitty_specs / "001-test-feature").mkdir()
 
-        # Execute without explicit slug — must raise ValueError
-        with pytest.raises(ValueError):
+        result = _find_feature_directory(
+            tmp_path,
+            tmp_path,
+            explicit_feature="  001-test-feature  ",
+        )
+
+        assert result == kitty_specs / "001-test-feature"
+
+    def test_raises_error_when_no_explicit_slug(self, tmp_path: Path):
+        """WP06 / C-CTX-4: a missing handle raises a structured ActionContextError
+        (was ValueError before the read-primitive consolidation)."""
+        from mission_runtime import ActionContextError
+        from specify_cli.cli.commands.agent.mission import _find_feature_directory
+
+        kitty_specs = tmp_path / "kitty-specs"
+        kitty_specs.mkdir()
+        (kitty_specs / "001-test-feature").mkdir()
+
+        with pytest.raises(ActionContextError) as excinfo:
             _find_feature_directory(tmp_path, tmp_path, explicit_feature=None)
+        assert excinfo.value.code == "FEATURE_CONTEXT_UNRESOLVED"
 
     def test_raises_error_when_feature_dir_not_found(self, tmp_path: Path):
-        """Should raise ValueError when the specified mission directory does not exist."""
+        """WP06 / C-CTX-4: an unresolvable handle raises a structured
+        ActionContextError, NOT a silent fallback to a wrong-but-plausible dir."""
+        from mission_runtime import ActionContextError
         from specify_cli.cli.commands.agent.mission import _find_feature_directory
 
         kitty_specs = tmp_path / "kitty-specs"
         kitty_specs.mkdir()
 
-        # Execute & Verify (updated to match centralized error message)
-        with pytest.raises(ValueError, match="Mission directory not found"):
+        with pytest.raises(ActionContextError) as excinfo:
             _find_feature_directory(tmp_path, tmp_path, explicit_feature="001-nonexistent")
+        assert excinfo.value.code == "FEATURE_CONTEXT_UNRESOLVED"
 
     def test_raises_error_when_no_explicit_slug_with_multiple_features(self, tmp_path: Path):
-        """Should raise ValueError when no slug is given even with multiple features present."""
+        """WP06 / C-CTX-4: a missing handle raises a structured ActionContextError
+        even with multiple missions present (no auto-detection / no silent pick)."""
+        from mission_runtime import ActionContextError
         from specify_cli.cli.commands.agent.mission import _find_feature_directory
 
-        # Create main repo structure with multiple features
         kitty_specs = tmp_path / "kitty-specs"
         kitty_specs.mkdir()
         for slug in ("001-feature", "002-feature", "003-feature"):
             (kitty_specs / slug).mkdir()
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ActionContextError) as excinfo:
             _find_feature_directory(tmp_path, tmp_path, explicit_feature=None)
+        assert excinfo.value.code == "FEATURE_CONTEXT_UNRESOLVED"
 
     def test_finds_correct_feature_among_multiple(self, tmp_path: Path):
         """Should return the exact matching directory when explicit slug is given."""

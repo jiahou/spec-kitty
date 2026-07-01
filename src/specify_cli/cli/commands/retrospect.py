@@ -11,17 +11,17 @@ Source-of-truth contract:
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
-from specify_cli.missions.feature_dir_resolver import (
+from specify_cli.coordination.surface_resolver import resolve_status_surface
+from specify_cli.core.constants import KITTIFY_DIR, KITTY_SPECS_DIR, RETROSPECTIVE_FILENAME
+from specify_cli.missions._read_path_resolver import (
     candidate_feature_dir_for_mission,
-    resolve_feature_dir_for_mission,
 )
 import contextlib
 import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
@@ -47,7 +47,8 @@ from specify_cli.retrospective import (
     RecordExistsError,
     PolicyResolutionError,
 )
-from specify_cli.retrospective.schema import GenActor, GenProvenance
+from specify_cli.retrospective.writer import resolve_existing_record_path
+from specify_cli.retrospective.schema import GenActor, GenProvenance, ProvenanceKind
 from specify_cli.retrospective.summary import classify_mission_record
 from specify_cli.status import read_events
 from specify_cli.status import TERMINAL_LANES
@@ -82,9 +83,33 @@ def _gen_actor() -> GenActor:
     return GenActor(kind="human", id="cli", display="spec-kitty retrospect")
 
 
-def _canonical_record_path(repo_root: Path, mission_id: str) -> Path:
-    """Return the canonical path for a mission's retrospective.yaml."""
-    return repo_root / ".kittify" / "missions" / mission_id / "retrospective.yaml"
+def _canonical_record_path(repo_root: Path, mission_slug: str, mission_id: str = "") -> Path:
+    """Return the record path to read for a mission's retrospective.yaml.
+
+    FR-006 (#1771): the record lives in the tracked feature_dir
+    (``kitty-specs/<slug>/retrospective.yaml``). Prefers the tracked path; falls
+    back to the legacy gitignored ``.kittify/missions/<id>/`` location only when
+    a pre-relocation record still lives there (back-compat reads).
+    """
+    record_path: Path = resolve_existing_record_path(repo_root, mission_slug, mission_id)
+    return record_path
+
+
+def _canonical_events_path(repo_root: Path, mission_slug: str) -> Path:
+    """Return the canonical ``status.events.jsonl`` path for *mission_slug*.
+
+    FR-006 (#1735/#1771): retrospect status reads/commits resolve the event log
+    through the single canonical surface resolver (:func:`resolve_status_surface`,
+    coord-topology-aware, C-005) rather than re-deriving a primary-checkout-only
+    path. Falls back to the primary-checkout feature dir only when the surface
+    cannot be resolved (e.g. meta.json absent for a legacy mission).
+    """
+    try:
+        surface: Path = resolve_status_surface(repo_root, mission_slug)
+    except (FileNotFoundError, ValueError):
+        feature_dir: Path = candidate_feature_dir_for_mission(repo_root, mission_slug)
+        surface = feature_dir / "status.events.jsonl"
+    return surface
 
 
 def _resolve_handle(
@@ -138,9 +163,11 @@ def _check_mission_completed(
     """Check if mission has any open WPs. Returns non-empty list if not completed."""
     TERMINAL = TERMINAL_LANES  # frozenset{"done", "canceled"}
 
-    # Peek at status.events.jsonl for the mission feature dir
-    feature_dir = resolved.feature_dir
-    if feature_dir is None:
+    # FR-006 (#1735): peek at the canonical status surface (coord-aware), not the
+    # primary-checkout feature dir, so completion checks see coord-owned events.
+    events_path = _canonical_events_path(_repo_root, resolved.mission_slug)
+    feature_dir = events_path.parent
+    if not feature_dir.exists():
         return []
 
     try:
@@ -305,8 +332,13 @@ def create_cmd(
         raise typer.Exit(1) from exc
 
     # Determine write mode
-    write_mode = "overwrite" if overwrite else ("update" if update else "error")
-    provenance_kind = "explicit_create"
+    if overwrite:
+        write_mode: Literal["error", "overwrite", "update"] = "overwrite"
+    elif update:
+        write_mode = "update"
+    else:
+        write_mode = "error"
+    provenance_kind: ProvenanceKind = "explicit_create"
 
     # Generate the record
     try:
@@ -376,8 +408,9 @@ def create_cmd(
             actor=_cli_actor(),
         )
 
-    # Auto-commit if enabled
-    events_path = resolve_feature_dir_for_mission(repo_root, record.mission_slug) / "status.events.jsonl"
+    # Auto-commit if enabled. FR-006 (#1735/#1771): stage the canonical status
+    # surface (coord-aware), not the primary-checkout-only path.
+    events_path = _canonical_events_path(repo_root, record.mission_slug)
     _maybe_auto_commit(
         repo_root,
         [record_path, events_path],
@@ -472,7 +505,7 @@ def _discover_missions_for_backfill(
         mission_id, mission_slug, completed_at, meta_path
     """
     candidates: list[dict[str, object]] = []
-    missions_root = repo_root / ".kittify" / "missions"
+    missions_root = repo_root / KITTIFY_DIR / "missions"
 
     if not missions_root.is_dir():
         return candidates
@@ -649,7 +682,9 @@ def backfill_cmd(  # noqa: C901
             }
             if c.get("skip_reason") == "already_exists":
                 skip_entry["record_path"] = str(
-                    _canonical_record_path(repo_root, str(c["mission_id"]))
+                    _canonical_record_path(
+                        repo_root, str(c["mission_slug"]), str(c["mission_id"])
+                    )
                 )
             skipped.append(skip_entry)
             _maybe_emit_skip(str(c["mission_id"]), str(c["mission_slug"]), str(c["skip_reason"]))
@@ -660,7 +695,7 @@ def backfill_cmd(  # noqa: C901
     def _process_candidate(c: dict[str, object]) -> None:
         mid = str(c["mission_id"])
         mslug = str(c["mission_slug"])
-        record_path = _canonical_record_path(repo_root, mid)
+        record_path = _canonical_record_path(repo_root, mslug, mid)
 
         # Already exists?
         if record_path.exists():
@@ -787,8 +822,9 @@ def backfill_cmd(  # noqa: C901
 
     # Auto-commit created records
     if created_paths and not dry_run:
+        # FR-006 (#1735/#1771): stage the canonical status surface per mission.
         event_paths = [
-            candidate_feature_dir_for_mission(repo_root, str(c.get("mission_slug", ""))) / "status.events.jsonl"
+            _canonical_events_path(repo_root, str(c.get("mission_slug", "")))
             for c in created
             if not c.get("dry_run")
         ]
@@ -856,7 +892,7 @@ def backfill_cmd(  # noqa: C901
     "summary",
     help=(
         "Cross-mission retrospective summary.\n\n"
-        "Reads .kittify/missions/*/retrospective.yaml and "
+        "Reads kitty-specs/*/retrospective.yaml and "
         "kitty-specs/*/status.events.jsonl to produce a cross-mission view.\n\n"
         "Distinguishes four record states: has_findings / ran_no_findings / missing / failed.\n\n"
         "No mutation is performed."
@@ -909,7 +945,7 @@ def summary_cmd(  # noqa: C901
     # Resolve project root
     resolved_project: Path = project.resolve() if project is not None else Path.cwd()
 
-    has_kittify = (resolved_project / ".kittify").exists()
+    has_kittify = (resolved_project / KITTIFY_DIR).exists()
     has_mission_specs = (resolved_project / KITTY_SPECS_DIR).exists()
     if not has_kittify and not has_mission_specs:
         _err_console.print(
@@ -958,7 +994,7 @@ def summary_cmd(  # noqa: C901
         "failed": 0,
     }
 
-    missions_dir = resolved_project / ".kittify" / "missions"
+    missions_dir = resolved_project / KITTIFY_DIR / "missions"
     if missions_dir.is_dir():
         for mission_dir in sorted(missions_dir.iterdir()):
             if not mission_dir.is_dir():
@@ -986,7 +1022,7 @@ def summary_cmd(  # noqa: C901
             state = classify_mission_record(feature_dir_for_classify)
 
             # Also check .kittify/missions/<id>/retrospective.yaml
-            if (mission_dir / "retrospective.yaml").exists() and state == "missing":
+            if (mission_dir / RETROSPECTIVE_FILENAME).exists() and state == "missing":
                 state = classify_mission_record(mission_dir)
 
             aggregate_counts[state] = aggregate_counts.get(state, 0) + 1

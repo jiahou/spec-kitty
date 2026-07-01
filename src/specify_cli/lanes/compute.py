@@ -17,6 +17,7 @@ from datetime import datetime, timezone, UTC
 from itertools import combinations
 
 from specify_cli.core.dependency_graph import topological_sort
+from specify_cli.lanes.branch_naming import mission_branch_name
 from specify_cli.lanes.models import CollapseEvent, CollapseReport, ExecutionLane, LanesManifest
 from specify_cli.ownership.models import ExecutionMode, OwnershipManifest
 from specify_cli.ownership.validation import _globs_overlap
@@ -309,7 +310,7 @@ def compute_lanes(
     Returns:
         A LanesManifest ready for persistence.
     """
-    resolved_mission_id = mission_id or mission_slug
+    resolved_mission_id = mission_id  # WP04/FR-004: None for legacy; never substitute slug
 
     # Collect all WP IDs from the graph.
     all_wp_ids = sorted(dependency_graph.keys())
@@ -345,7 +346,7 @@ def compute_lanes(
             version=1,
             mission_slug=mission_slug,
             mission_id=resolved_mission_id,
-            mission_branch=f"kitty/mission-{mission_slug}",
+            mission_branch=mission_branch_name(mission_slug, mission_id=mission_id),
             target_branch=target_branch,
             lanes=[planning_lane],
             computed_at=datetime.now(UTC).isoformat(),
@@ -535,7 +536,7 @@ def compute_lanes(
             )
         )
 
-    mission_branch = f"kitty/mission-{mission_slug}"
+    mission_branch = mission_branch_name(mission_slug, mission_id=mission_id)
 
     # Assign planning-artifact WPs to a single canonical lane-planning lane.
     # This lane resolves to the main repository checkout, not a .worktrees/ directory.
@@ -661,15 +662,18 @@ def _compute_lane_depths(
 def _empty_manifest(
     mission_slug: str,
     target_branch: str,
-    mission_id: str,
+    mission_id: str | None,
     planning_artifact_wps: list[str] | None = None,
 ) -> LanesManifest:
     """Return an empty LanesManifest (no code WPs to lane)."""
+    # WP04/FR-004: mission_id is now str | None from the caller. When it is None
+    # (legacy mission without a backfilled ULID) the branch composer uses the
+    # legacy naming form (no mid8 suffix). The slug-as-sentinel idiom is removed.
     return LanesManifest(
         version=1,
         mission_slug=mission_slug,
         mission_id=mission_id,
-        mission_branch=f"kitty/mission-{mission_slug}",
+        mission_branch=mission_branch_name(mission_slug, mission_id=mission_id),
         target_branch=target_branch,
         lanes=[],
         computed_at=datetime.now(UTC).isoformat(),

@@ -19,23 +19,70 @@ callers were migrated to this package root). A few historical command-oriented
 names remain as compatibility attributes for first-party callers, but they are
 not part of the public ``__all__`` surface.
 
-See ADR ``architecture/3.x/adr/2026-06-07-1-execution-state-canonical-surface.md``.
+See ADR ``docs/adr/3.x/2026-06-07-1-execution-state-canonical-surface.md``.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from mission_runtime.context import ExecutionContext, ExecutionMode
+from mission_runtime.context import (
+    ArtifactPlacementFragment,
+    BranchRefFragment,
+    CommitTarget,
+    ExecutionContext,
+    ExecutionMode,
+    IdentityFragment,
+    MissionArtifactContext,
+    MissionContext,
+    MissionTopology,
+    StatusSurfaceFragment,
+    WorkspaceFragment,
+    classify_topology,
+    routes_through_coordination,
+)
+from mission_runtime.artifacts import (
+    MissionArtifactHome,
+    MissionArtifactKind,
+    artifact_home_for,
+    is_coordination_artifact_residue_path,
+    is_primary_artifact_kind,
+    is_self_bookkeeping_path,
+    kind_for_mission_file,
+)
 from mission_runtime.resolution import (
     ActionContextError,
+    mission_context_for,
     resolve_action_context,
+    resolve_placement_only,
+    resolve_topology,
 )
 
 __all__ = [
+    "ActionContextError",
+    "ArtifactPlacementFragment",
+    "BranchRefFragment",
+    "CommitTarget",
     "ExecutionContext",
     "ExecutionMode",
+    "IdentityFragment",
+    "MissionArtifactContext",
+    "MissionArtifactHome",
+    "MissionArtifactKind",
+    "MissionContext",
+    "MissionTopology",
+    "StatusSurfaceFragment",
+    "WorkspaceFragment",
+    "artifact_home_for",
+    "classify_topology",
+    "is_coordination_artifact_residue_path",
+    "is_primary_artifact_kind",
+    "is_self_bookkeeping_path",
+    "kind_for_mission_file",
+    "mission_context_for",
     "resolve_action_context",
-    "ActionContextError",
+    "resolve_placement_only",
+    "resolve_topology",
+    "routes_through_coordination",
 ]
 
 _COMPAT_ATTRS = frozenset(

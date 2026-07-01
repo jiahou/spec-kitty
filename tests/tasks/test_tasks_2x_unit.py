@@ -18,8 +18,7 @@ from specify_cli.status.store import append_event
 from specify_cli.status.models import StatusEvent, Lane
 
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 def _seed_wp_lane(feature_dir: Path, wp_id: str, lane: str) -> None:
     """Seed a WP into a specific lane in the event log."""
     _lane_alias = {"doing": "in_progress"}
@@ -51,7 +50,7 @@ class TestFindFeatureSlug:
         """
         from specify_cli.cli.commands.agent.tasks import _find_mission_slug
 
-        slug = _find_mission_slug(explicit_feature="008-test-feature")
+        slug = _find_mission_slug(explicit_mission="008-test-feature")
         assert slug == "008-test-feature"
 
     def test_find_raises_on_missing_slug(self):
@@ -60,7 +59,7 @@ class TestFindFeatureSlug:
         from typer import Exit
 
         with pytest.raises(Exit):
-            _find_mission_slug(explicit_feature=None)
+            _find_mission_slug(explicit_mission=None)
 
 
 class TestStatusInProgressLane:

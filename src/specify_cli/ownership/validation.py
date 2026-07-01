@@ -12,6 +12,7 @@ authoritative-surface, and execution-mode consistency checks.
 from __future__ import annotations
 
 from specify_cli.core.constants import KITTY_SPECS_DIR
+import difflib
 import fnmatch
 import logging
 from collections.abc import Mapping
@@ -37,6 +38,38 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def is_glob_pattern(path: str) -> bool:
+    """Return True when *path* contains glob metacharacters.
+
+    A path with any of ``*``, ``?``, ``[``, or ``{`` is treated as a glob
+    pattern.  A plain literal path (e.g. ``src/foo/bar.py``) has none of
+    these characters.
+    """
+    return any(c in path for c in ("*", "?", "[", "{"))
+
+
+@dataclass
+class GlobValidationResult:
+    """Result of :func:`validate_glob_matches`.
+
+    Separates hard errors (literal-path zero-match) from soft warnings
+    (glob-pattern zero-match) so the call site can route them independently.
+    """
+
+    errors: list[str] = field(default_factory=list)
+    """Literal-path entries that matched zero files — hard error."""
+    warnings: list[str] = field(default_factory=list)
+    """Glob-pattern entries that matched zero files — soft warning."""
+    info: list[str] = field(default_factory=list)
+    """Informational notes (e.g. create_intent suppression notices)."""
+
+    @property
+    def passed(self) -> bool:
+        """True when there are no hard errors."""
+        return len(self.errors) == 0
+
 
 # Paths considered "planning only" for execution_mode consistency checks.
 _PLANNING_PREFIXES = (f"{KITTY_SPECS_DIR}/", "docs/")
@@ -91,17 +124,62 @@ def _globs_overlap(pattern_a: str, pattern_b: str) -> bool:
     return False
 
 
-def validate_no_overlap(manifests: dict[str, OwnershipManifest]) -> list[str]:
-    """Check that no two WPs have overlapping owned_files glob patterns.
+def _dependency_reachability(
+    dependencies: Mapping[str, list[str]],
+) -> dict[str, set[str]]:
+    """Compute, for each WP, the set of WPs it transitively depends on.
 
-    Codebase-wide WPs are excluded from overlap checks because they are
-    expected to overlap with everything -- that is their purpose.
+    ``dependencies[wp]`` is the list of WP ids that ``wp`` directly depends on.
+    The returned mapping ``reach[wp]`` is the transitive closure of those edges
+    — every ancestor reachable by following ``depends-on`` edges from ``wp``.
+
+    Two WPs ``a`` and ``b`` are **sequential** (one runs strictly after the
+    other, never concurrently) iff ``b in reach[a]`` or ``a in reach[b]``; the
+    dependency DAG forces an execution order between them. WPs with no directed
+    path between them are **concurrent** (the lane allocator may place them on
+    parallel lanes), and only those must not share ``owned_files``.
+    """
+    reach: dict[str, set[str]] = {}
+
+    def _walk(node: str, seen: set[str]) -> set[str]:
+        if node in reach:
+            return reach[node]
+        acc: set[str] = set()
+        for dep in dependencies.get(node, ()):  # direct ancestors
+            if dep in seen:
+                continue  # defensive: ignore cycles (validated elsewhere)
+            acc.add(dep)
+            acc |= _walk(dep, seen | {dep})
+        reach[node] = acc
+        return acc
+
+    for wp_id in dependencies:
+        _walk(wp_id, {wp_id})
+    return reach
+
+
+def validate_no_overlap(
+    manifests: dict[str, OwnershipManifest],
+    dependencies: Mapping[str, list[str]] | None = None,
+) -> list[str]:
+    """Check that no two *concurrent* WPs have overlapping owned_files patterns.
+
+    Codebase-wide WPs are excluded (they are expected to overlap with
+    everything). When *dependencies* is supplied, **same-lane sequential** WPs —
+    those with a directed dependency path between them — are also exempt: a
+    linearized refactor chain shares one execution worktree and runs in
+    dependency order, so two such WPs legitimately own the same files. The
+    no-overlap guard exists to stop *parallel* (dependency-unordered) WPs from
+    colliding, so only concurrent pairs are flagged. When *dependencies* is
+    ``None`` the legacy all-pairs behaviour is preserved.
 
     Args:
         manifests: Mapping of WP ID (e.g. ``"WP01"``) to its OwnershipManifest.
+        dependencies: Optional mapping of WP ID to the WP ids it depends on.
+            Used to exempt sequential (same-lane) pairs from the overlap check.
 
     Returns:
-        List of error messages.  Empty list means no overlaps detected.
+        List of error messages.  Empty list means no disallowed overlaps.
     """
     errors: list[str] = []
 
@@ -113,9 +191,21 @@ def validate_no_overlap(manifests: dict[str, OwnershipManifest]) -> list[str]:
     for wp_id in sorted(skipped):
         logger.info("Skipping overlap check for %s (codebase-wide scope)", wp_id)
 
+    reach = _dependency_reachability(dependencies) if dependencies else {}
+
     wp_ids = list(narrow_manifests.keys())
 
     for wp_a, wp_b in combinations(wp_ids, 2):
+        # Same-lane sequential pair (a directed dependency path exists either
+        # way) → never concurrent → sharing owned_files is legitimate.
+        if reach and (wp_b in reach.get(wp_a, ()) or wp_a in reach.get(wp_b, ())):
+            logger.info(
+                "Skipping overlap check for sequential pair %s/%s (dependency-ordered)",
+                wp_a,
+                wp_b,
+            )
+            continue
+
         manifest_a = narrow_manifests[wp_a]
         manifest_b = narrow_manifests[wp_b]
 
@@ -208,19 +298,27 @@ def validate_execution_mode_consistency(manifest: OwnershipManifest) -> list[str
     return warnings
 
 
-def validate_all(manifests: dict[str, OwnershipManifest]) -> ValidationResult:
+def validate_all(
+    manifests: dict[str, OwnershipManifest],
+    dependencies: Mapping[str, list[str]] | None = None,
+) -> ValidationResult:
     """Run all ownership validations across every WP in a feature.
 
     Args:
         manifests: Mapping of WP ID to OwnershipManifest.
+        dependencies: Optional mapping of WP ID to the WP ids it depends on.
+            When supplied, same-lane sequential (dependency-ordered) WPs are
+            exempt from the owned_files overlap check — only concurrent
+            (parallel-lane) WPs must not share files.
 
     Returns:
         A ValidationResult with errors (hard) and warnings (soft).
     """
     result = ValidationResult()
 
-    # Cross-WP: overlap detection (hard error)
-    result.errors.extend(validate_no_overlap(manifests))
+    # Cross-WP: overlap detection (hard error) — concurrent pairs only when a
+    # dependency graph is supplied.
+    result.errors.extend(validate_no_overlap(manifests, dependencies))
 
     # Per-WP: authoritative_surface prefix (hard error)
     # Per-WP: execution_mode consistency (warning)
@@ -264,32 +362,89 @@ def build_wp_manifests(
 validate_ownership = validate_all
 
 
+def _nearest_match_suggestion(pattern: str, repo_root: Path) -> str | None:
+    """Return a nearest-match suggestion for a literal path that exists nowhere.
+
+    Collects all files under the pattern's parent directory (if the parent
+    exists) and uses :func:`difflib.get_close_matches` to find the closest
+    name.  Returns a formatted hint string or ``None`` when no candidates
+    are available.
+    """
+    path = Path(pattern)
+    parent = repo_root / path.parent
+    if not parent.is_dir():
+        return None
+    siblings = [str(p.relative_to(repo_root)) for p in parent.iterdir() if p.is_file()]
+    matches = difflib.get_close_matches(pattern, siblings, n=1, cutoff=0.5)
+    if matches:
+        return f"Did you mean '{matches[0]}'?"
+    return None
+
+
 def validate_glob_matches(
     manifests: dict[str, OwnershipManifest],
     repo_root: Path,
-) -> list[str]:
-    """Warn when owned_files globs match zero files in the repository.
+    create_intent: dict[str, list[str]] | None = None,
+) -> GlobValidationResult:
+    """Check owned_files entries against the repository for zero-match conditions.
 
-    This is a soft check — it returns warnings, not errors.  A zero-match
-    glob is not a hard failure because WPs may legitimately target files
-    that do not yet exist (new file creation), but it is suspicious enough
-    to warrant a warning so operators can verify the pattern is correct.
+    Classifies each entry as a literal path or a glob pattern, then applies
+    different severity rules:
+
+    - **Literal path + zero matches** → hard error (exit 1), with a
+      nearest-match suggestion when one can be found.  Suppressed (becomes an
+      info note) when the path appears in *create_intent* for that WP.
+    - **Glob pattern + zero matches** → soft warning (may be in-flight work).
 
     Args:
         manifests: Mapping of WP ID to OwnershipManifest.
         repo_root: Root directory of the repository for glob resolution.
+        create_intent: Optional mapping of WP ID → list of paths that are
+            planned-new-file entries.  A literal-path zero-match whose path
+            appears in this list is suppressed (no hard error).
 
     Returns:
-        List of warning messages.  Empty list means all globs matched at
-        least one file.
+        :class:`GlobValidationResult` with separate ``errors``, ``warnings``,
+        and ``info`` lists.  Call sites should emit ``errors`` to stderr and
+        exit 1 if ``result.passed`` is False.
     """
-    warnings: list[str] = []
+    _create_intent: dict[str, list[str]] = create_intent or {}
+    result = GlobValidationResult()
+
     for wp_id in sorted(manifests):
         manifest = manifests[wp_id]
+        wp_intent_paths = set(_create_intent.get(wp_id, []))
+
         for pattern in manifest.owned_files:
-            if not any(repo_root.glob(pattern)):
-                warnings.append(
+            matched = any(repo_root.glob(pattern))
+            if matched:
+                continue
+
+            if is_glob_pattern(pattern):
+                # Glob zero-match → soft warning only
+                result.warnings.append(
                     f"{wp_id}: owned_files glob '{pattern}' matches "
                     f"zero files in the repository"
                 )
-    return warnings
+            elif pattern in wp_intent_paths:
+                # Literal path suppressed by create_intent
+                result.info.append(
+                    f"{wp_id}: owned_files path '{pattern}' has no match "
+                    f"— suppressed by create_intent (planned-new-file)."
+                )
+            else:
+                # Literal path zero-match → hard error
+                suggestion = _nearest_match_suggestion(pattern, repo_root)
+                msg = (
+                    f"{wp_id}: owned_files path '{pattern}' is a literal "
+                    f"file path that matches zero files in the repository."
+                )
+                if suggestion:
+                    msg += f" {suggestion}"
+                msg += (
+                    " If this file will be created during implementation, "
+                    f"declare it in the WP frontmatter:\n  create_intent:\n    - {pattern}"
+                )
+                result.errors.append(msg)
+
+    return result

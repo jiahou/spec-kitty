@@ -89,10 +89,94 @@ Markers
 ``non_sandbox`` — the fixture spawns ``git worktree add`` and invokes
 ``spec-kitty`` as a subprocess, both of which are structurally incompatible
 with mutmut's forked sandbox.
+
+Composite-fragment dual-CWD extension (execution-context-unification-01KTPKST / IC-08 / FR-011)
+-----------------------------------------------------------------------------------------------
+The block at the bottom of this module extends the ratchet from *string-keyed
+status parity* (above) to **fragment-by-fragment parity of the resolved
+``MissionExecutionContext``** — the doc-09 fragment / op-composite described in
+``kitty-specs/execution-context-unification-01KTPKST/data-model.md``. It is
+authored **ATDD-first** (charter C-011): the fragment assertions are written
+RED now, *before* the fragments exist on ``mission_runtime.ExecutionContext``,
+and each converges to GREEN as its conversion WP lands.
+
+The harness resolves the context twice — once with ``repo_root`` derived (via
+``find_repo_root``) from the **primary-checkout CWD** and once from the
+**lane-worktree CWD** — and asserts the two resolved contexts are equal,
+fragment by fragment, for every lifecycle action that the resolver supports
+today (``tasks`` / ``tasks_finalize`` / ``accept``). The broader lifecycle
+(``specify``/``plan``/``analyze``/``status``) and the fragment objects
+themselves (Identity incl. ``mid8``; BranchRef incl. ``target_branch`` +
+``destination_ref``/``CommitTarget``; StatusSurface; Workspace incl.
+``primary_root``; ArtifactPlacement; PromptSource) do not exist on the context
+yet, so the assertions that depend on them are ``xfail(strict=True)``.
+
+xfail → convergence-WP map (IC-08 / T003)
+-----------------------------------------
+Each ``xfail(strict=True)`` test below converges (flips to XPASS, at which point
+the converging WP removes the marker) as its conversion lands. ``strict=True``
+means a stale marker left after a fragment lands fails the suite, forcing the
+converging WP to delete it — that is the ratchet.
+
+==================================  ====  ==========================================
+Test (xfail until converged)        WP    What flips it green
+==================================  ====  ==========================================
+test_status_surface_fragment_       WP02  CONVERGED. StatusSurfaceFragment carried
+  parity                            /03   on the context (``status_read_dir`` /
+                                          ``status_write_dir``); status facade
+                                          adoption (IC-01, WP02) + fragment
+                                          attachment (WP03). xfail removed.
+test_identity_fragment_parity       WP03  CONVERGED. IdentityFragment (``mission_id``
+                                          / ``mid8`` / ``mission_slug``) on the
+                                          context; ``mid8`` single-derivation.
+                                          xfail removed.
+test_branchref_fragment_parity      WP03  CONVERGED. BranchRefFragment
+                                          (``target_branch`` /
+                                          ``coordination_branch`` /
+                                          ``destination_ref``=CommitTarget).
+                                          xfail removed.
+test_read_path_fragment_parity      WP04  Read-path resolver folded into the
+                                          context (``feature_dir`` resolves via
+                                          the single read-path surface, IC-03).
+test_workspace_fragment_parity      WP05  WorkspaceFragment incl. ``primary_root``
+                                          (single worktree-pointer parser, IC-04).
+test_artifact_placement_fragment_   WP06  ArtifactPlacementFragment
+  parity                                  (``placement_ref``=CommitTarget) — one
+                                          artifact-placement ref (IC-05).
+test_runtime_lifecycle_action_      WP07  Runtime threads the context through the
+  parity                                  full lifecycle (specify/plan/analyze/
+                                          status become resolvable actions).
+test_flattened_topology_commit_     WP08  CommitTarget + flattened-topology
+  target / *_status_surface /             resolution: ``kind == flattened``,
+  *_no_coordination_branch                ``coordination_branch is None``,
+                                          ``status_read_dir == status_write_dir``
+                                          (also exercised by retrospect/merge,
+                                          IC-12).
+==================================  ====  ==========================================
+
+Live (non-xfail) parity coverage
+---------------------------------
+``test_dual_cwd_existing_field_parity`` asserts CWD-invariance of the fields
+that the resolver already populates today (``mission_slug`` / ``target_branch``
+/ ``feature_dir`` / ``detection_method``). It guards against a CWD-routing
+regression in the *current* surface and is the anchor the fragment tests grow on
+top of — it must stay GREEN throughout the conversion.
+
+Determinism (NFR-003)
+---------------------
+The composite-fragment block reuses the same hand-crafted, network-free,
+clock-free fixtures as the status-parity block. ``repo_root`` is derived via
+``find_repo_root`` from each CWD (no ``os.chdir``); no wall-clock, ULID-mint, or
+random value influences any asserted fragment. The resolver is called in-process
+with explicit ``repo_root``/``cwd`` arguments, so results are reproducible across
+both CWDs and across repeated runs. The synthetic flattened mission is torn down
+(``shutil.rmtree`` of the temp tree) by ``tmp_path`` so it never leaks a
+``test-feature-*`` mission or a ``kitty/mission-test-feature-*`` branch.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -1320,4 +1404,826 @@ def test_execution_context_parity_gate_registered_in_ci() -> None:
         + "\n".join(f"  - {p}" for p in sorted(missing))
         + "\n\nAdd them to the ``execution_context`` filter so PRs touching "
         "these surfaces trigger the parity ratchet."
+    )
+
+
+# ===========================================================================
+# COMPOSITE-FRAGMENT DUAL-CWD RATCHET
+# (execution-context-unification-01KTPKST / IC-08 / FR-011 / C-CTX-2 / SC-1)
+# ===========================================================================
+#
+# ATDD-FIRST (charter C-011): the fragment assertions below are authored RED,
+# *before* the fragments exist on ``mission_runtime.ExecutionContext``. They are
+# ``xfail(strict=True)`` and converge to XPASS as each conversion WP lands; the
+# converging WP then removes its now-stale marker (strict=True forces this).
+#
+# The convergence map lives in the module docstring (T003). Every fragment test
+# names its convergence WP in its ``xfail`` reason.
+#
+# The single live (non-xfail) test ``test_dual_cwd_existing_field_parity`` is
+# the anchor: it guards CWD-invariance of the fields the resolver populates
+# *today* and must remain GREEN throughout.
+# ---------------------------------------------------------------------------
+
+# Lifecycle actions the resolver supports today (``ACTION_NAMES``). The full
+# lifecycle in FR-011 (``specify → plan → tasks → analyze → implement → review →
+# status``) is only partly resolvable now; ``implement`` / ``review`` additionally
+# require a ``lanes.json`` (written by finalize-tasks) which the hermetic fixture
+# omits, so the dual-CWD field-parity anchor exercises the lane-free actions.
+# The remaining lifecycle steps are covered by the xfail
+# ``test_runtime_lifecycle_action_parity`` below (converges in WP07).
+_RESOLVABLE_LANE_FREE_ACTIONS: tuple[str, ...] = (
+    "tasks",
+    "tasks_finalize",
+    "accept",
+)
+
+# Fields that ``resolve_action_context`` populates today for the lane-free
+# actions. These are the live (non-xfail) parity surface.
+_EXISTING_PARITY_FIELDS: tuple[str, ...] = (
+    "mission_slug",
+    "target_branch",
+    "feature_dir",
+    "detection_method",
+)
+
+# Fragment attribute names from data-model.md that do NOT yet exist on the
+# context. Accessing any of these raises ``AttributeError`` today; that is the
+# RED state each fragment test asserts against until its conversion WP lands.
+_IDENTITY_FRAGMENT = "identity"
+_BRANCHREF_FRAGMENT = "branch_ref"
+_STATUS_SURFACE_FRAGMENT = "status_surface"
+_WORKSPACE_FRAGMENT = "workspace"
+_ARTIFACT_PLACEMENT_FRAGMENT = "artifact_placement"
+
+
+def _resolve_context_from_cwd(
+    cwd: Path,
+    *,
+    action: str,
+    mission_slug: str,
+    wp_id: str | None = None,
+) -> object:
+    """Resolve the canonical context with ``repo_root`` derived from ``cwd``.
+
+    This is the heart of the dual-CWD harness: the *only* difference between the
+    two parity arms is the working directory the ``repo_root`` is derived from.
+    ``find_repo_root`` follows the git worktree pointer back to the main
+    checkout, so a correct (CWD-invariant) resolver MUST return an identical
+    context whether ``cwd`` is the primary checkout or a lane worktree.
+
+    Uses ``find_repo_root(start=cwd)`` rather than ``os.chdir`` so no global
+    process state is mutated (NFR-003 determinism, mirrors the subprocess
+    ``cwd=`` discipline used by the status-parity block above).
+    """
+    # Import here (not at module top) so the heavy ``specify_cli`` import graph
+    # is only paid by the composite-fragment tests, and to preserve the
+    # status-import-first ordering that avoids the dependency_graph circular
+    # import when these helpers run in isolation.
+    import specify_cli.status  # noqa: F401  (warm import order; avoids circular import)
+    import mission_runtime as _mr
+    from specify_cli.task_utils.support import find_repo_root
+
+    repo_root = find_repo_root(start=cwd)
+    return _mr.resolve_action_context(
+        repo_root,
+        action=action,  # type: ignore[arg-type]  # validated by ACTION_NAMES
+        feature=mission_slug,
+        wp_id=wp_id,
+        cwd=cwd,
+    )
+
+
+def _fragment_value(context: object, fragment: str, field_name: str) -> object:
+    """Read ``context.<fragment>.<field_name>``.
+
+    Raises ``AttributeError`` while the fragment does not exist on the context
+    (the RED state). Once the fragment lands, this returns the resolved value
+    and the surrounding ``xfail`` test flips to XPASS.
+    """
+    frag = getattr(context, fragment)
+    return getattr(frag, field_name)
+
+
+# ---------------------------------------------------------------------------
+# T001 — Dual-CWD harness: LIVE anchor (existing fields, must stay GREEN)
+# ---------------------------------------------------------------------------
+
+
+def test_dual_cwd_existing_field_parity(parity_repo: tuple[Path, Path, str]) -> None:
+    """T001 (live anchor): resolved-context field parity across primary vs lane CWD.
+
+    For every lane-free lifecycle action, resolves the context twice — with
+    ``repo_root`` derived from the **primary-checkout CWD** and from the
+    **lane-worktree CWD** — and asserts that every field the resolver populates
+    *today* (``_EXISTING_PARITY_FIELDS``) is identical.
+
+    This is the non-xfail anchor of the composite-fragment ratchet: it proves
+    the *current* in-process resolution path is CWD-invariant and must remain
+    GREEN throughout the conversion. The fragment-level parity (Identity /
+    BranchRef / StatusSurface / Workspace / ArtifactPlacement / PromptSource)
+    is asserted by the ``xfail`` tests below until each lands.
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    for action in _RESOLVABLE_LANE_FREE_ACTIONS:
+        primary_ctx = _resolve_context_from_cwd(
+            repo_root, action=action, mission_slug=mission_slug
+        )
+        lane_ctx = _resolve_context_from_cwd(
+            worktree_path, action=action, mission_slug=mission_slug
+        )
+
+        for field_name in _EXISTING_PARITY_FIELDS:
+            primary_val = getattr(primary_ctx, field_name)
+            lane_val = getattr(lane_ctx, field_name)
+            assert primary_val == lane_val, (
+                f"CWD-parity violation for action {action!r}, field "
+                f"{field_name!r}:\n"
+                f"  from primary-checkout CWD: {primary_val!r}\n"
+                f"  from lane-worktree CWD:    {lane_val!r}\n"
+                "The resolved MissionExecutionContext must be identical "
+                "regardless of the CWD the repo root is derived from (C-CTX-2)."
+            )
+
+
+# ---------------------------------------------------------------------------
+# T001/T003 — Fragment-by-fragment parity (xfail until each conversion lands)
+# ---------------------------------------------------------------------------
+
+
+# CONVERGED (WP03): IdentityFragment now lands on the context — xfail removed.
+def test_identity_fragment_parity(parity_repo: tuple[Path, Path, str]) -> None:
+    """IdentityFragment parity (``mission_id`` / ``mid8`` / ``mission_slug``).
+
+    Asserts that the IdentityFragment resolves identically from both CWDs and
+    that the ``mid8 == mission_id[:8]`` invariant (single-derivation, FR-012 /
+    C-CTX-3) holds. RED today: the context carries no ``identity`` fragment.
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    primary_ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    lane_ctx = _resolve_context_from_cwd(
+        worktree_path, action="tasks", mission_slug=mission_slug
+    )
+
+    for field_name in ("mission_id", "mid8", "mission_slug"):
+        primary_val = _fragment_value(primary_ctx, _IDENTITY_FRAGMENT, field_name)
+        lane_val = _fragment_value(lane_ctx, _IDENTITY_FRAGMENT, field_name)
+        assert primary_val == lane_val, (
+            f"IdentityFragment.{field_name} diverges across CWDs: "
+            f"{primary_val!r} (primary) != {lane_val!r} (lane)."
+        )
+
+    # mid8 single-derivation invariant: mid8 == mission_id[:8].
+    mission_id = _fragment_value(primary_ctx, _IDENTITY_FRAGMENT, "mission_id")
+    mid8 = _fragment_value(primary_ctx, _IDENTITY_FRAGMENT, "mid8")
+    assert mid8 == str(mission_id)[:8], (
+        f"mid8 must be derived as mission_id[:8]; got mid8={mid8!r}, "
+        f"mission_id={mission_id!r} (C-CTX-3)."
+    )
+
+
+# CONVERGED (WP03): BranchRefFragment + destination_ref/CommitTarget now land on
+# the context — xfail removed.
+def test_branchref_fragment_parity(parity_repo: tuple[Path, Path, str]) -> None:
+    """BranchRefFragment parity (``target_branch`` / ``coordination_branch`` / ``destination_ref``).
+
+    Asserts CWD-invariance of the branch reference fragment, including that
+    planning artifacts and status events resolve to the **same**
+    ``destination_ref`` (CommitTarget) — the FR-004 invariant. RED today: the
+    context carries no ``branch_ref`` fragment.
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    primary_ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    lane_ctx = _resolve_context_from_cwd(
+        worktree_path, action="tasks", mission_slug=mission_slug
+    )
+
+    for field_name in ("target_branch", "coordination_branch", "destination_ref"):
+        primary_val = _fragment_value(primary_ctx, _BRANCHREF_FRAGMENT, field_name)
+        lane_val = _fragment_value(lane_ctx, _BRANCHREF_FRAGMENT, field_name)
+        assert primary_val == lane_val, (
+            f"BranchRefFragment.{field_name} diverges across CWDs: "
+            f"{primary_val!r} (primary) != {lane_val!r} (lane)."
+        )
+
+    # destination_ref is a ref-only CommitTarget value object (C-007 / FR-001b):
+    # it carries a ``ref`` and NO retired ``kind`` field.
+    destination_ref = _fragment_value(
+        primary_ctx, _BRANCHREF_FRAGMENT, "destination_ref"
+    )
+    assert getattr(destination_ref, "ref", None), (
+        "BranchRefFragment.destination_ref must be a CommitTarget carrying a "
+        f"``ref``; got {destination_ref!r} (ADR-2026-06-03-2 / C-007)."
+    )
+    assert not hasattr(destination_ref, "kind"), (
+        "CommitTarget is ref-only (FR-001b): the retired ``kind`` field must be "
+        f"gone; got {destination_ref!r}."
+    )
+
+
+# CONVERGED (WP02 facade + WP03 attachment): StatusSurfaceFragment is now carried
+# on the context (resolved via WP02's resolve_status_surface) — xfail removed.
+def test_status_surface_fragment_parity(parity_repo: tuple[Path, Path, str]) -> None:
+    """StatusSurfaceFragment parity (``status_read_dir`` / ``status_write_dir``).
+
+    Asserts that the status surface is resolved once and carried on the context
+    identically from both CWDs — consumers (esp.
+    ``status_transition._identity_for_request``) must NOT re-derive it
+    (FR-003/FR-008/#1737). RED today: the context carries no ``status_surface``
+    fragment.
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    primary_ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    lane_ctx = _resolve_context_from_cwd(
+        worktree_path, action="tasks", mission_slug=mission_slug
+    )
+
+    for field_name in ("status_read_dir", "status_write_dir"):
+        primary_val = _fragment_value(
+            primary_ctx, _STATUS_SURFACE_FRAGMENT, field_name
+        )
+        lane_val = _fragment_value(lane_ctx, _STATUS_SURFACE_FRAGMENT, field_name)
+        assert primary_val == lane_val, (
+            f"StatusSurfaceFragment.{field_name} diverges across CWDs: "
+            f"{primary_val!r} (primary) != {lane_val!r} (lane)."
+        )
+
+
+# CONVERGED (WP04): the read-path is folded into the single ``_read_path_resolver``
+# surface (IC-03). The consolidated read directory is the status read dir, carried
+# on ``StatusSurfaceFragment.status_read_dir`` (the one read surface, C-005); the
+# duplicate ``candidate_feature_dir_for_mission`` now re-exports the primitive, so
+# every caller resolves a ``--mission <mid8>`` handle to the same dir as the full
+# slug (F-001/F-003/F-004). xfail removed — this test asserts that consolidated
+# read path is CWD-invariant. (``WorkspaceFragment``/``primary_root`` is WP05's
+# surface, IC-04, and stays xfail until then.)
+def test_read_path_fragment_parity(parity_repo: tuple[Path, Path, str]) -> None:
+    """Read-path parity: the mission read dir resolves via the single read-path
+    surface and is CWD-invariant (IC-03 / C-CTX-2 / C-CTX-4).
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    primary_ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    lane_ctx = _resolve_context_from_cwd(
+        worktree_path, action="tasks", mission_slug=mission_slug
+    )
+
+    primary_val = _fragment_value(
+        primary_ctx, _STATUS_SURFACE_FRAGMENT, "status_read_dir"
+    )
+    lane_val = _fragment_value(lane_ctx, _STATUS_SURFACE_FRAGMENT, "status_read_dir")
+    assert primary_val == lane_val, (
+        "Read-path (status read) fragment diverges across CWDs: "
+        f"{primary_val!r} (primary) != {lane_val!r} (lane) — the single "
+        "read-path resolver must be CWD-invariant (IC-03 / C-CTX-4)."
+    )
+
+
+# CONVERGED (WP05 / T018): the context now carries a WorkspaceFragment whose
+# ``primary_root`` is resolved via the single worktree-pointer parser in
+# ``core/paths`` (IC-04); the duplicate parser in ``workspace/root_resolver`` was
+# collapsed (C-005). xfail removed — this test asserts ``primary_root`` is
+# CWD-invariant and is the main checkout (not the lane worktree).
+def test_workspace_fragment_parity(parity_repo: tuple[Path, Path, str]) -> None:
+    """WorkspaceFragment parity (``primary_root`` single worktree-pointer parser).
+
+    Asserts that ``WorkspaceFragment.primary_root`` resolves to the *same*
+    repo-root checkout from both CWDs — the single worktree-pointer parser
+    (IC-04) replacing the collapsed ``workspace/root_resolver`` parser.
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    primary_ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    lane_ctx = _resolve_context_from_cwd(
+        worktree_path, action="tasks", mission_slug=mission_slug
+    )
+
+    primary_val = _fragment_value(primary_ctx, _WORKSPACE_FRAGMENT, "primary_root")
+    lane_val = _fragment_value(lane_ctx, _WORKSPACE_FRAGMENT, "primary_root")
+    assert primary_val == lane_val, (
+        "WorkspaceFragment.primary_root diverges across CWDs: "
+        f"{primary_val!r} (primary) != {lane_val!r} (lane). Both must resolve "
+        "to the same main-checkout root via the single worktree-pointer parser "
+        "(IC-04)."
+    )
+    # The lane arm derived its root from inside the worktree; primary_root must
+    # still be the main checkout, not the worktree path.
+    assert Path(str(lane_val)).resolve() == repo_root.resolve(), (
+        "WorkspaceFragment.primary_root resolved from the lane-worktree CWD must "
+        f"be the main checkout {repo_root!r}; got {lane_val!r}."
+    )
+
+
+# CONVERGED (WP06 / T019): the context now carries an ArtifactPlacementFragment
+# whose ``placement_ref`` is the SAME CommitTarget status events resolve to
+# (C-PLACE-1 / IC-05). xfail removed.
+def test_artifact_placement_fragment_parity(
+    parity_repo: tuple[Path, Path, str],
+) -> None:
+    """ArtifactPlacementFragment parity (``placement_ref`` CommitTarget).
+
+    Asserts that the single artifact-placement ref is CWD-invariant and is the
+    *same* CommitTarget that status events resolve to (C-PLACE-1).
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    primary_ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    lane_ctx = _resolve_context_from_cwd(
+        worktree_path, action="tasks", mission_slug=mission_slug
+    )
+
+    primary_val = _fragment_value(
+        primary_ctx, _ARTIFACT_PLACEMENT_FRAGMENT, "placement_ref"
+    )
+    lane_val = _fragment_value(lane_ctx, _ARTIFACT_PLACEMENT_FRAGMENT, "placement_ref")
+    assert primary_val == lane_val, (
+        "ArtifactPlacementFragment.placement_ref diverges across CWDs: "
+        f"{primary_val!r} (primary) != {lane_val!r} (lane) (C-PLACE-1)."
+    )
+
+    # C-PLACE-1: the placement ref is literally the same CommitTarget the
+    # BranchRefFragment carries as ``destination_ref`` — planning artifacts and
+    # status events resolve to ONE ref, not two reconciled values.
+    primary_destination = _fragment_value(
+        primary_ctx, _BRANCHREF_FRAGMENT, "destination_ref"
+    )
+    assert primary_val == primary_destination, (
+        "ArtifactPlacementFragment.placement_ref must equal "
+        "BranchRefFragment.destination_ref (one placement ref, C-PLACE-1): "
+        f"{primary_val!r} != {primary_destination!r}."
+    )
+
+
+def test_runtime_lifecycle_action_parity(parity_repo: tuple[Path, Path, str]) -> None:
+    """Full-lifecycle dual-CWD parity for actions not yet resolvable.
+
+    FR-011 requires parity across ``specify → plan → tasks → analyze →
+    implement → review → status``. Today the resolver only knows ``tasks*`` /
+    ``implement`` / ``review`` / ``accept`` (``ACTION_NAMES``); ``specify`` /
+    ``plan`` / ``analyze`` / ``status`` are not resolvable actions. This test
+    asserts they resolve identically from both CWDs once WP07 threads the
+    context through the full lifecycle. RED today: ``resolve_action_context``
+    rejects these actions with ``INVALID_ACTION``.
+    """
+    repo_root, worktree_path, mission_slug = parity_repo
+
+    lifecycle_only_actions = ("specify", "plan", "analyze", "status")
+    for action in lifecycle_only_actions:
+        primary_ctx = _resolve_context_from_cwd(
+            repo_root, action=action, mission_slug=mission_slug
+        )
+        lane_ctx = _resolve_context_from_cwd(
+            worktree_path, action=action, mission_slug=mission_slug
+        )
+        for field_name in _EXISTING_PARITY_FIELDS:
+            primary_val = getattr(primary_ctx, field_name)
+            lane_val = getattr(lane_ctx, field_name)
+            assert primary_val == lane_val, (
+                f"Lifecycle action {action!r} field {field_name!r} diverges "
+                f"across CWDs: {primary_val!r} != {lane_val!r} (FR-011)."
+            )
+
+
+# ===========================================================================
+# T002 — FLATTENED-TOPOLOGY SYNTHETIC FIXTURE
+# (C-001 proof — single-branch / no separate coordination branch)
+# ===========================================================================
+#
+# A flattened mission has NO separate coordination branch: landing ==
+# coordination == target. C-001 declares this for THIS mission
+# (``fixups/code-engine-stabilization``). The fixture below builds a synthetic
+# flattened mission (a primary checkout with a mission directory and NO
+# ``.worktrees/<slug>-coord`` worktree) and the tests prove the flattened
+# invariants from data-model.md:
+#
+#   * routes_through_coordination(stored topology) is False (C-001, FR-001b)
+#   * coordination_branch is None
+#   * status_read_dir == status_write_dir
+#
+# The fragment/CommitTarget objects do not exist yet, so the assertions are
+# ``xfail(strict=True)`` and converge in WP08 (retrospect/merge + CommitTarget).
+#
+# Determinism / no leak (NFR-003 + E2E-leak memory): the fixture lives entirely
+# under ``tmp_path`` (torn down automatically) and uses the ``test-parity-*``
+# slug — NOT ``test-feature-*`` — and creates NO ``kitty/mission-*`` branch, so
+# it cannot leak the known E2E ``test-feature-*`` / ``kitty/mission-test-feature-*``
+# artifacts.
+# ---------------------------------------------------------------------------
+
+_FLATTENED_MISSION_SLUG = "test-parity-flattened"
+
+_FLATTENED_META_JSON = json.dumps(
+    {
+        "mission_id": "01TESTPARITYFLAT0000000001",
+        "mission_slug": _FLATTENED_MISSION_SLUG,
+        "mission_number": None,
+        "mission_type": "software-dev",
+        "friendly_name": "Test parity flattened mission",
+        # Flattened topology: NO coordination_branch key — landing == target.
+    },
+    indent=2,
+)
+
+
+def _build_flattened_repo(tmp_path: Path) -> tuple[Path, str]:
+    """Build a synthetic FLATTENED-topology mission (no coordination worktree).
+
+    Mirrors ``_build_repo`` but:
+
+    * checks out a non-mainline target branch (``fixups/code-engine-stabilization``)
+      that is simultaneously the landing, coordination, and target branch
+      (flattened topology, C-001);
+    * creates NO ``.worktrees/<slug>-coord`` coordination worktree — so the
+      status read and write directories are necessarily the same primary
+      checkout directory; and
+    * omits a ``coordination_branch`` from ``meta.json``.
+
+    Returns ``(repo_root, mission_slug)``. Fully deterministic and self-cleaning
+    via ``tmp_path``; creates no ``kitty/mission-*`` branch (no E2E leak).
+    """
+    repo_root = tmp_path / "flat"
+    repo_root.mkdir()
+
+    _git(["init", "--initial-branch=main"], repo_root)
+    _git(["config", "user.email", "parity@example.com"], repo_root)
+    _git(["config", "user.name", "Parity Test"], repo_root)
+    _git(["config", "commit.gpgsign", "false"], repo_root)
+
+    kittify_dir = repo_root / ".kittify"
+    kittify_dir.mkdir()
+    (kittify_dir / "config.yaml").write_text(
+        "agents:\n  available:\n    - claude\n", encoding="utf-8"
+    )
+
+    feature_dir = repo_root / "kitty-specs" / _FLATTENED_MISSION_SLUG
+    tasks_dir = feature_dir / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (feature_dir / "meta.json").write_text(_FLATTENED_META_JSON, encoding="utf-8")
+    (tasks_dir / "WP01.md").write_text(_WP01_MD, encoding="utf-8")
+    events = [
+        _make_status_event(
+            "WP01",
+            from_lane="planned",
+            to_lane="planned",
+            event_id="01TESTPARITYFLAT0000000P01",
+            at="2026-06-03T10:00:00+00:00",
+        ),
+    ]
+    (feature_dir / "status.events.jsonl").write_text(
+        "\n".join(events) + "\n", encoding="utf-8"
+    )
+    (feature_dir / "status.json").write_text(
+        json.dumps({"event_count": 0, "work_packages": {}}), encoding="utf-8"
+    )
+
+    _git(["add", "."], repo_root)
+    _git(["commit", "-m", "chore: flattened parity fixture initial commit"], repo_root)
+
+    # Flattened: landing == coordination == target, all on one branch.
+    _git(["checkout", "-b", "fixups/code-engine-stabilization"], repo_root)
+
+    # NB: deliberately NO ``git worktree add ...-coord`` here — that absence is
+    # exactly what "flattened topology" means at the filesystem level.
+    return repo_root, _FLATTENED_MISSION_SLUG
+
+
+@pytest.fixture
+def flattened_repo(tmp_path: Path) -> Generator[tuple[Path, str], None, None]:
+    """Synthetic flattened-topology mission (no coordination worktree/branch).
+
+    Function-scoped (cheap, single commit) and self-cleaning via ``tmp_path``.
+    Does not leak ``test-feature-*`` missions or ``kitty/mission-*`` branches.
+    """
+    repo_root, mission_slug = _build_flattened_repo(tmp_path)
+    yield repo_root, mission_slug
+
+
+# CONVERGED (WP08 / IC-12; reworked WP16 / FR-001b): a mission with no
+# coordination branch does NOT route through coordination (data-model.md / C-001 /
+# C-PLACE-1). The retired ``CommitTarget.kind == 'flattened'`` pin is replaced by
+# the canonical stored-topology routing predicate — the per-ref enum is gone.
+def test_flattened_topology_does_not_route_through_coordination(
+    flattened_repo: tuple[Path, str],
+) -> None:
+    """Flattened C-001 proof: the mission does NOT route through coordination.
+
+    A mission with no separate coordination branch resolves a coord-less stored
+    topology (SINGLE_BRANCH/LANES), so ``routes_through_coordination`` is ``False``
+    — the FR-001b replacement for the retired ``CommitTarget.kind == 'flattened'``
+    pin (data-model.md / C-PLACE-1). The destination ref is the ref-only target.
+    """
+    from mission_runtime import resolve_topology, routes_through_coordination
+
+    repo_root, mission_slug = flattened_repo
+    ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    destination_ref = _fragment_value(ctx, _BRANCHREF_FRAGMENT, "destination_ref")
+    # Ref-only carrier (C-007): no retired ``kind`` field.
+    assert not hasattr(destination_ref, "kind")
+    assert getattr(destination_ref, "ref", None), (
+        f"flattened destination_ref must carry a ref; got {destination_ref!r}"
+    )
+    assert routes_through_coordination(resolve_topology(repo_root, mission_slug)) is False, (
+        "Under flattened topology the mission must NOT route through coordination "
+        "(C-001 proof) — the stored topology is coord-less."
+    )
+
+
+# CONVERGED (WP03): BranchRefFragment.coordination_branch is None for the
+# flattened fixture (no coordination_branch in meta) — xfail removed.
+def test_flattened_topology_no_coordination_branch(
+    flattened_repo: tuple[Path, str],
+) -> None:
+    """Flattened C-001 proof: ``coordination_branch is None``.
+
+    A flattened mission has no separate coordination branch, so the
+    BranchRefFragment must report ``coordination_branch is None``. RED today:
+    the BranchRefFragment does not exist on the context.
+    """
+    repo_root, mission_slug = flattened_repo
+    ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    coordination_branch = _fragment_value(
+        ctx, _BRANCHREF_FRAGMENT, "coordination_branch"
+    )
+    assert coordination_branch is None, (
+        "Under flattened topology BranchRefFragment.coordination_branch must be "
+        f"None; got {coordination_branch!r} (C-001)."
+    )
+
+
+# CONVERGED (WP02 facade + WP03 attachment): status_read_dir == status_write_dir
+# for the flattened fixture (no coord worktree, surface collapses) — xfail removed.
+def test_flattened_topology_status_surface_collapses(
+    flattened_repo: tuple[Path, str],
+) -> None:
+    """Flattened C-001 proof: ``status_read_dir == status_write_dir``.
+
+    Under flattened topology there is no primary↔coord split, so the status read
+    and write directories collapse to the same directory (data-model.md). RED
+    today: the StatusSurfaceFragment does not exist on the context.
+    """
+    repo_root, mission_slug = flattened_repo
+    ctx = _resolve_context_from_cwd(
+        repo_root, action="tasks", mission_slug=mission_slug
+    )
+    read_dir = _fragment_value(ctx, _STATUS_SURFACE_FRAGMENT, "status_read_dir")
+    write_dir = _fragment_value(ctx, _STATUS_SURFACE_FRAGMENT, "status_write_dir")
+    assert read_dir == write_dir, (
+        "Under flattened topology status_read_dir must equal status_write_dir; "
+        f"got read={read_dir!r}, write={write_dir!r} (C-001 / C-PLACE-1)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T030 — Fragment-is-the-source ratchet (FR-005 / C-STAT-1 / #1821)
+# ---------------------------------------------------------------------------
+#
+# WP07 of tooling-stability-guard-coherence-01KTRC04 closed the latent SC-4
+# drift Debby flagged at the 01KTPKST closeout: ``MissionStatus.load`` and
+# ``status_transition._canonical_primary_feature_dir`` each composed the coord
+# candidate path by hand (a SECOND composition of the path the canonical
+# ``resolve_status_surface`` already owns). Both now consume the single
+# canonical surface — ``MissionStatus.load`` via ``resolve_status_surface`` (or
+# a carried ``StatusSurfaceFragment``) and ``status_transition`` via
+# ``resolve_status_surface_with_anchor``.
+#
+# This block EXTENDS the ratchet (C-005: extend, never fork) with two
+# assertions that the fragment / canonical surface IS the source:
+#
+# 1. ``test_no_local_coord_path_composition_in_status_surfaces`` — a static
+#    architectural grep: neither file may rebuild the coord feature dir locally
+#    (``CoordinationWorkspace.worktree_path`` composed with ``_compose_mission_dir``
+#    /``KITTY_SPECS_DIR``). If a future edit reintroduces a parallel composition,
+#    this fails (the C-STAT-1 "no local coord-path composition remains" gate).
+# 2. (retired by Mission B write-side-context-factory-adoption-01KV9W0X):
+#    ``test_mission_status_load_consumes_carried_fragment`` was a behavioral spy
+#    that verified the ``surface=`` parameter on ``MissionStatus.load``. The
+#    ``surface=`` keyword was removed (dead fragment retirement; zero callers
+#    remained after D-12 adoption); the test was retired with it.
+# ---------------------------------------------------------------------------
+
+# Source files whose coord-path composition was folded into the canonical
+# surface by WP07. These are read as text (not imported) for the static check.
+_FRAGMENT_SOURCE_THREADING_FILES: tuple[str, ...] = (
+    "src/specify_cli/status/aggregate.py",
+    "src/specify_cli/coordination/status_transition.py",
+)
+
+
+def _repo_root_for_sources() -> Path:
+    """Resolve the spec-kitty repo root from this test file's location."""
+    # tests/architectural/test_execution_context_parity.py → repo root is 2 up.
+    return Path(__file__).resolve().parents[2]
+
+
+def test_no_local_coord_path_composition_in_status_surfaces() -> None:
+    """C-STAT-1 / FR-005: no second hand-rolled coord-path composition remains.
+
+    ``MissionStatus.load`` and ``status_transition`` must resolve the status
+    surface through the single canonical authority (``resolve_status_surface`` /
+    ``resolve_status_surface_with_anchor``), never by re-composing the
+    coordination feature dir locally. The drift seam Debby flagged was exactly
+    such a second composition: ``CoordinationWorkspace.worktree_path(...)``
+    joined with ``KITTY_SPECS_DIR`` and ``_compose_mission_dir(...)``.
+
+    This static gate fails if either file reintroduces that composition,
+    preventing the parallel-mechanism regression (NFR-003 / C-005).
+    """
+    repo_root = _repo_root_for_sources()
+    offenders: dict[str, list[str]] = {}
+    for rel_path in _FRAGMENT_SOURCE_THREADING_FILES:
+        source = (repo_root / rel_path).read_text(encoding="utf-8")
+        hits: list[str] = []
+        # A local coord-path composition needs BOTH the worktree-root primitive
+        # AND a mission-dir name join. Either alone is benign (the canonical
+        # resolver is allowed to be referenced); together they reconstruct the
+        # surface the canonical authority already owns.
+        composes_worktree_root = "CoordinationWorkspace.worktree_path" in source
+        composes_mission_dir = "_compose_mission_dir" in source
+        if composes_worktree_root and composes_mission_dir:
+            hits.append(
+                "rebuilds the coord feature dir locally "
+                "(CoordinationWorkspace.worktree_path + _compose_mission_dir) — "
+                "consume resolve_status_surface[_with_anchor] instead"
+            )
+        if hits:
+            offenders[rel_path] = hits
+
+    assert not offenders, (
+        "Second hand-rolled coord-path composition detected — the status surface "
+        "must be resolved through the single canonical authority, not re-composed "
+        f"locally (FR-005 / C-STAT-1 / #1821):\n{json.dumps(offenders, indent=2)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC10 — Canonical status-read ratchet (FR-008e / FR-009 / #1735, WP05 of
+# coordination-merge-stabilization-01KTXRVR)
+# ---------------------------------------------------------------------------
+#
+# WP05 routed the last two Class A read stragglers — the retrospective
+# completion gate (``retrospective/gate.py``) and the retrospect command
+# surface (``cli/commands/agent_retrospect.py``) — through the canonical
+# ``resolve_status_surface``. Under coordination topology the authoritative
+# ``status.events.jsonl`` lives in the coordination worktree; a
+# ``feature_dir``-anchored direct read in these modules is exactly the #1735
+# split-brain bug class.
+#
+# This ratchet EXTENDS the static-gate convention above (C-005: extend, never
+# fork) with an AST scan scoped to the two known read families in the two
+# fixed modules (research/risks: a tree-wide ``feature_dir`` scan has dozens
+# of legitimate hits on already-resolved surfaces, so the scope is the two
+# modules whose reads were routed):
+#
+# 1. ``read_events(<…feature_dir…>)`` — a feature_dir-anchored event read.
+# 2. ``<…feature_dir…> / "status.events.jsonl"`` — a direct event-log path
+#    composition.
+#
+# The only exempt locations are the routed seam helpers themselves
+# (``_resolve_events_path`` / ``_canonical_events_dir``), whose legacy-mission
+# fallback composes the path AFTER first consulting the canonical resolver.
+# The ratchet additionally asserts each seam exists and calls
+# ``resolve_status_surface``, so deleting a seam (e.g. by reverting WP05's
+# T024/T025 routing) turns this test RED — the anti-vacuity property.
+# ---------------------------------------------------------------------------
+
+# module path → routed seam function names exempt from the read-family scan.
+_CANONICAL_STATUS_READ_FILES: dict[str, frozenset[str]] = {
+    "src/specify_cli/retrospective/gate.py": frozenset({"_resolve_events_path"}),
+    "src/specify_cli/cli/commands/agent_retrospect.py": frozenset({"_canonical_events_dir"}),
+}
+
+_STATUS_EVENTS_LITERAL = "status.events.jsonl"
+
+
+def _subtree_anchors_feature_dir(node: ast.AST) -> bool:
+    """True when *node*'s subtree references a ``feature_dir`` name/attribute."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and sub.id == "feature_dir":
+            return True
+        if isinstance(sub, ast.Attribute) and sub.attr == "feature_dir":
+            return True
+    return False
+
+
+def _callee_name(node: ast.Call) -> str | None:
+    """Best-effort simple name of a call's callee (``f(...)`` / ``m.f(...)``)."""
+    callee = node.func
+    if isinstance(callee, ast.Name):
+        return callee.id
+    if isinstance(callee, ast.Attribute):
+        return callee.attr
+    return None
+
+
+def _feature_dir_read_family_hits(
+    func: ast.AST, exempt_seams: frozenset[str]
+) -> list[str]:
+    """Return AC10 read-family violations inside *func* (line-tagged).
+
+    An argument that is itself a call to a routed seam helper (e.g.
+    ``read_events(_canonical_events_dir(repo_root, slug, feature_dir))``) is
+    NOT a violation: there ``feature_dir`` is only the legacy fallback handed
+    to the seam, which consults ``resolve_status_surface`` first.
+    """
+    hits: list[str] = []
+    for node in ast.walk(func):
+        # Family 1: read_events(<…feature_dir…>)
+        if (
+            isinstance(node, ast.Call)
+            and _callee_name(node) == "read_events"
+            and any(
+                _subtree_anchors_feature_dir(arg)
+                and not (
+                    isinstance(arg, ast.Call) and _callee_name(arg) in exempt_seams
+                )
+                for arg in node.args
+            )
+        ):
+            hits.append(
+                f"line {node.lineno}: feature_dir-anchored read_events() call"
+            )
+        # Family 2: <…feature_dir…> / "status.events.jsonl"
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            right = node.right
+            if (
+                isinstance(right, ast.Constant)
+                and right.value == _STATUS_EVENTS_LITERAL
+                and _subtree_anchors_feature_dir(node.left)
+            ):
+                hits.append(
+                    f"line {node.lineno}: feature_dir-anchored "
+                    f'"{_STATUS_EVENTS_LITERAL}" path composition'
+                )
+    return hits
+
+
+def test_no_feature_dir_anchored_status_event_reads() -> None:
+    """AC10 / FR-009 / #1735: retrospective reads route through the canonical surface.
+
+    Forbids ``feature_dir``-anchored ``read_events()`` calls and direct
+    ``status.events.jsonl`` path compositions in ``retrospective/gate.py`` and
+    ``cli/commands/agent_retrospect.py`` outside their routed seam helpers,
+    and asserts each seam consults ``resolve_status_surface``. Reverting the
+    WP05 T024/T025 routing reintroduces a forbidden read (or deletes a seam)
+    and turns this RED.
+    """
+    repo_root = _repo_root_for_sources()
+    offenders: dict[str, list[str]] = {}
+
+    for rel_path, exempt_seams in _CANONICAL_STATUS_READ_FILES.items():
+        source_path = repo_root / rel_path
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        hits: list[str] = []
+        seen_seams: set[str] = set()
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name in exempt_seams:
+                seen_seams.add(node.name)
+                # The seam is only a legitimate exemption if it consults the
+                # canonical resolver before any fallback composition.
+                seam_source = ast.unparse(node)
+                if "resolve_status_surface" not in seam_source:
+                    hits.append(
+                        f"line {node.lineno}: routed seam {node.name!r} no longer "
+                        "calls resolve_status_surface — the exemption does not apply"
+                    )
+                continue
+            hits.extend(_feature_dir_read_family_hits(node, exempt_seams))
+
+        missing_seams = exempt_seams - seen_seams
+        if missing_seams:
+            hits.append(
+                f"routed seam(s) {sorted(missing_seams)!r} missing — the canonical "
+                "read routing (WP05 T024/T025) appears to have been reverted"
+            )
+        if hits:
+            offenders[rel_path] = hits
+
+    assert not offenders, (
+        "feature_dir-anchored status-event read detected — retrospective reads "
+        "must route through resolve_status_surface, never read "
+        "status.events.jsonl via the (identity-only) feature dir "
+        f"(AC10 / FR-009 / #1735):\n{json.dumps(offenders, indent=2)}"
     )

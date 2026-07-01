@@ -13,9 +13,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.unit]
-
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 # ---------------------------------------------------------------------------
 # T016 / T017: resolve_mission_read_path path selection
 # ---------------------------------------------------------------------------
@@ -25,7 +23,9 @@ class TestResolveMissionReadPath:
 
     def test_coord_candidate_preferred_when_exists(self, tmp_path: Path) -> None:
         """When coord worktree dir exists, resolve returns coord path (T016)."""
-        from specify_cli.mission_read_path import resolve_mission_read_path
+        from specify_cli.missions._read_path_resolver import (
+            _resolve_mission_read_path as resolve_mission_read_path,
+        )
 
         slug = "my-feature"
         mid8 = "01KT3YBD"
@@ -41,7 +41,9 @@ class TestResolveMissionReadPath:
 
     def test_primary_checkout_fallback_when_coord_absent(self, tmp_path: Path) -> None:
         """When coord worktree absent, resolve falls back to primary checkout (T017)."""
-        from specify_cli.mission_read_path import resolve_mission_read_path
+        from specify_cli.missions._read_path_resolver import (
+            _resolve_mission_read_path as resolve_mission_read_path,
+        )
 
         slug = "my-feature"
         mid8 = "01KT3YBD"
@@ -57,7 +59,9 @@ class TestResolveMissionReadPath:
         self, tmp_path: Path
     ) -> None:
         """Before coord worktree materialization, bootstrap status lives in primary."""
-        from specify_cli.mission_read_path import resolve_mission_read_path
+        from specify_cli.missions._read_path_resolver import (
+            _resolve_mission_read_path as resolve_mission_read_path,
+        )
 
         slug = "my-feature"
         mid8 = "01KT3YBD"
@@ -75,9 +79,9 @@ class TestResolveMissionReadPath:
         self, tmp_path: Path
     ) -> None:
         """Modern coord missions must not read primary once coord root exists."""
-        from specify_cli.mission_read_path import (
+        from specify_cli.missions._read_path_resolver import (
             StatusReadPathNotFound,
-            resolve_mission_read_path,
+            _resolve_mission_read_path as resolve_mission_read_path,
         )
 
         slug = "my-feature"
@@ -96,7 +100,9 @@ class TestResolveMissionReadPath:
 
     def test_primary_returned_when_both_absent(self, tmp_path: Path) -> None:
         """When neither exists, returns primary candidate path (no error by default)."""
-        from specify_cli.mission_read_path import resolve_mission_read_path
+        from specify_cli.missions._read_path_resolver import (
+            _resolve_mission_read_path as resolve_mission_read_path,
+        )
 
         slug = "my-feature"
         mid8 = "01KT3YBD"
@@ -107,9 +113,9 @@ class TestResolveMissionReadPath:
 
     def test_require_exists_raises_when_neither_exists(self, tmp_path: Path) -> None:
         """require_exists=True raises StatusReadPathNotFound when both paths absent."""
-        from specify_cli.mission_read_path import (
+        from specify_cli.missions._read_path_resolver import (
             StatusReadPathNotFound,
-            resolve_mission_read_path,
+            _resolve_mission_read_path as resolve_mission_read_path,
         )
 
         with pytest.raises(StatusReadPathNotFound):
@@ -117,7 +123,9 @@ class TestResolveMissionReadPath:
 
     def test_empty_mid8_skips_coord_check(self, tmp_path: Path) -> None:
         """Legacy callers with empty mid8 skip coord worktree, go to primary."""
-        from specify_cli.mission_read_path import resolve_mission_read_path
+        from specify_cli.missions._read_path_resolver import (
+            _resolve_mission_read_path as resolve_mission_read_path,
+        )
 
         slug = "legacy-feature"
         # Create primary

@@ -108,16 +108,28 @@ requirements, quality gates, etc.
 
 The current synthesis scope is: `directive`, `tactic`, `styleguide`.
 
-Read shipped examples to understand the expected YAML shape:
+Read shipped examples to understand the expected YAML shape.
+There is no `doctrine list` or `doctrine show` CLI command — use the programmatic
+`DoctrineService` API (documented in the *Programmatic Doctrine Access* section below)
+or read the YAML files directly from `src/doctrine/<kind>/shipped/`:
+
+```python
+from doctrine.service import DoctrineService
+service = DoctrineService(shipped_root, project_root)
+
+# Read a directive
+directive = service.directives.get("<a-directive-id>")
+
+# Read a tactic
+tactic = service.tactics.get("<a-tactic-id>")
+
+# Read a styleguide
+styleguide = service.styleguides.get("<a-styleguide-id>")
+```
+
+To validate your project-layer doctrine artifacts run:
 ```bash
-spec-kitty doctrine list --kind directive
-spec-kitty doctrine show <a-directive-id>
-
-spec-kitty doctrine list --kind tactic
-spec-kitty doctrine show <a-tactic-id>
-
-spec-kitty doctrine list --kind styleguide
-spec-kitty doctrine show <a-styleguide-id>
+spec-kitty doctrine validate .kittify/
 ```
 
 ### Step 3 — Read the interview mapping to know what to generate
@@ -329,9 +341,8 @@ timestamp.
 ### Doctrine Artifact Kinds
 
 Doctrine organizes knowledge into 8 artifact kinds. Each kind has a
-dedicated repository in `DoctrineService`, follows two-source loading
-(shipped defaults + project overrides), and is accessible programmatically
-or via CLI.
+dedicated repository in `DoctrineService`, follows built-in -> org -> project
+loading, and is accessible programmatically or via CLI.
 
 **Directives** — Numbered project rules that constrain agent behavior.
 Each directive has a severity (`error`, `warn`, `info`), an `applies_to`
@@ -343,10 +354,7 @@ directive = service.directives.get("DIRECTIVE_034")
 # directive.title → "Test-First Development"
 # directive.severity → "warn"
 # directive.applies_to → ["implement", "review"]
-```
-
-```bash
-spec-kitty doctrine list --kind directive
+# All directives: service.directives.list_all() or read src/doctrine/directives/shipped/
 ```
 
 **Tactics** — Reusable implementation approaches that describe *how* to do
@@ -400,8 +408,9 @@ procedure = service.procedures.get("refactoring")
 
 **Agent Profiles** — Role definitions with 6 sections: context_sources,
 purpose, specialization, collaboration, mode_defaults, and
-initialization_declaration. Profiles form a hierarchy (`specializes_from`)
-and support weighted matching against task context (DDR-011 algorithm).
+initialization_declaration. Relationship fields such as `specializes_from` are
+not profile fields; lineage belongs in the doctrine DRG. Profiles support
+weighted matching against task context (DDR-011 algorithm).
 
 ```python
 profile = service.agent_profiles.get("implementer")
@@ -434,16 +443,33 @@ for step in contract.steps:
 
 ### Discovering Available Artifacts
 
+There is no `doctrine list` or `doctrine show` CLI command. Use the programmatic
+`DoctrineService` API or read artifact YAML files directly:
+
+```python
+from doctrine.service import DoctrineService
+service = DoctrineService(shipped_root, project_root)
+
+# List or inspect artifacts by kind
+directive = service.directives.get("DIRECTIVE_034")
+tactic = service.tactics.get("tdd-red-green-refactor")
+paradigm = service.paradigms.get("<paradigm-id>")
+# Shipped artifacts: src/doctrine/<kind>/shipped/
+# Project-local overrides: .kittify/<kind>/
+```
+
+To validate project-layer artifacts:
 ```bash
-# List all artifacts of a kind
-spec-kitty doctrine list --kind directive
-spec-kitty doctrine list --kind tactic
-spec-kitty doctrine list --kind paradigm
+spec-kitty doctrine validate .kittify/
+```
 
-# Show detail for one artifact
-spec-kitty doctrine show DIRECTIVE_034
+To list registered mission types:
+```bash
+spec-kitty doctrine mission-type list
+```
 
-# List agent profiles
+To list agent profiles:
+```bash
 spec-kitty agent profile list
 ```
 
@@ -570,7 +596,7 @@ See `references/charter-command-map.md` for all flags.
 spec-kitty charter generate --from-interview --json
 ```
 
-Key flags: `--mission`, `--template-set`, `--force`, `--from-interview`, `--json`.
+Key flags: `--mission-type`, `--template-set`, `--force`, `--from-interview`, `--json`.
 
 Generation triggers an automatic sync, so governance.yaml and directives.yaml
 are written immediately.
@@ -666,10 +692,10 @@ needs to assign an agent to a task, it resolves the best profile:
 from doctrine.agent_profiles.profile import TaskContext
 
 context = TaskContext(
-    languages=["python"],
-    frameworks=["<project-test-runner>", "typer"],
-    file_patterns=["src/**/*.py"],
-    domain_keywords=["cli", "testing"],
+    language="python",
+    framework="typer",
+    file_paths=["src/specify_cli/cli.py"],
+    keywords=["cli", "testing"],
 )
 
 profile = service.agent_profiles.find_best_match(context)
@@ -678,9 +704,9 @@ profile = service.agent_profiles.find_best_match(context)
 # profile.initialization_declaration → startup context text
 ```
 
-Profiles support hierarchy (`specializes_from` field). Language-specific
-profiles can specialize from `implementer`, inheriting base capabilities and
-adding stack-specific ones.
+Profile lineage is represented by DRG edges, not a `specializes_from` field on
+profile YAML. Language-specific profiles can still be related to base roles in
+the DRG and resolved through profile matching.
 
 ### Action-Scoped Doctrine via Action Indices
 

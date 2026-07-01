@@ -33,6 +33,7 @@ from specify_cli.coordination.transaction import (
     BookkeepingTransaction,
 )
 from specify_cli.coordination.workspace import CoordinationWorkspace
+from specify_cli.core.commit_guard import GuardCapability
 from specify_cli.git.commit_helpers import SafeCommitRecoveryFailed
 from specify_cli.status.emit import build_status_event
 from specify_cli.status import store as _store
@@ -214,7 +215,7 @@ def test_legacy_transaction_appends_to_primary_checkout(
         mid8=MID8,
         destination_ref=COORD_BRANCH,
         operation="legacy_emit",
-        allow_protected_branch_in_test_mode=True,
+        capability=GuardCapability.TEST_MODE,
     ) as txn:
         assert txn.worktree_root == repo
         assert txn.destination_ref == "main"
@@ -306,7 +307,7 @@ def test_destination_ref_refs_heads_prefix_refused(repo: Path) -> None:
 
 def test_mission_slug_path_traversal_is_rejected(repo: Path) -> None:
     """User-controlled mission selectors must not escape kitty-specs/."""
-    with pytest.raises(BookkeepingError, match="single safe path segment"):
+    with pytest.raises(BookkeepingError, match="safe path segment"):
         BookkeepingTransaction.acquire(
             repo_root=repo,
             mission_id=MISSION_ID,
@@ -331,7 +332,7 @@ def test_whitespace_bearing_selectors_are_rejected(
 ) -> None:
     with pytest.raises(
         BookkeepingError,
-        match=rf"{field_name} must not contain leading or trailing whitespace",
+        match=rf"{field_name} is not a safe path segment",
     ):
         BookkeepingTransaction.acquire(
             repo_root=repo,
@@ -344,7 +345,7 @@ def test_whitespace_bearing_selectors_are_rejected(
 
 
 def test_legacy_warning_marker_confines_mission_id(repo: Path) -> None:
-    with pytest.raises(BookkeepingError, match="mission_id must be a single safe path segment"):
+    with pytest.raises(BookkeepingError, match="mission_id is not a safe path segment"):
         transaction_module._legacy_warning_marker_path(repo, "../escape")
 
 

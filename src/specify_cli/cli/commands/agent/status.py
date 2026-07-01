@@ -7,7 +7,6 @@ Provides CLI access to the status emit/materialize pipeline:
 
 from __future__ import annotations
 
-from specify_cli.missions.feature_dir_resolver import candidate_feature_dir_for_mission
 import json
 import logging
 from pathlib import Path
@@ -17,10 +16,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from specify_cli.cli.selector_resolution import resolve_mission_handle, resolve_selector
-from specify_cli.core.constants import KITTY_SPECS_DIR
+from specify_cli.cli.selector_resolution import resolve_mission_handle
 from specify_cli.core.paths import locate_project_root, get_main_repo_root
-from specify_cli.lanes.branch_naming import mid8_from_slug
+from specify_cli.missions._read_path_resolver import (
+    candidate_feature_dir_for_mission,
+    resolve_bare_modern_mission_dir_name,
+)
 from specify_cli.status import feature_status_lock
 from specify_cli.status import EVENTS_FILENAME, EventPersistenceError, StoreError
 
@@ -36,28 +37,8 @@ console = Console()
 PROJECT_ROOT_NOT_FOUND = "Could not locate project root"
 
 
-def _resolve_bare_modern_mission_slug(repo_root: Path, raw_handle: str) -> str | None:
-    """Resolve ``human-slug`` to ``human-slug-<mid8>`` when exactly one dir exists."""
-    if mid8_from_slug(raw_handle):
-        return None
-
-    specs_dir = repo_root / KITTY_SPECS_DIR
-    if not specs_dir.is_dir():
-        return None
-
-    matches = [
-        meta_path.parent.name
-        for meta_path in sorted(specs_dir.glob(f"{raw_handle}-*/meta.json"))
-        if mid8_from_slug(meta_path.parent.name)
-    ]
-    if len(matches) != 1:
-        return None
-    return matches[0]
-
-
 def _find_mission_slug(
     explicit_mission: str | None = None,
-    explicit_feature: str | None = None,
     *,
     json_output: bool = False,
     repo_root: Path | None = None,
@@ -70,7 +51,6 @@ def _find_mission_slug(
 
     Args:
         explicit_mission: Mission slug provided explicitly.
-        explicit_feature: Mission slug provided via hidden --feature alias.
         json_output: Propagate to resolver error rendering.
         repo_root: Repository root; if provided, enables canonical resolver.
 
@@ -80,35 +60,35 @@ def _find_mission_slug(
     Raises:
         typer.Exit: If the mission slug is not provided.
     """
-    try:
-        selector = resolve_selector(
-            canonical_value=explicit_mission,
-            canonical_flag="--mission",
-            alias_value=explicit_feature,
-            alias_flag="--feature",
-            suppress_env_var="SPEC_KITTY_SUPPRESS_FEATURE_DEPRECATION",
-            command_hint="--mission <slug>",
-        )
-    except typer.BadParameter as e:
+    if not explicit_mission or not explicit_mission.strip():
+        err = "--mission <slug> is required"
         if json_output:
-            print(json.dumps({"error": str(e)}))
+            print(json.dumps({"error": err}))
         else:
-            console.print(f"[red]Error:[/red] {e}")
+            console.print(f"[red]Error:[/red] {err}")
         raise typer.Exit(1)
 
-    raw_handle = selector.canonical_value
+    raw_handle = explicit_mission.strip()
     if repo_root is not None:
         legacy_dir = candidate_feature_dir_for_mission(get_main_repo_root(repo_root), raw_handle)
         if legacy_dir.exists():
-            return raw_handle
-        if resolved_bare := _resolve_bare_modern_mission_slug(get_main_repo_root(repo_root), raw_handle):
+            # F-001: the candidate resolver canonicalizes mid8/ULID/numeric
+            # handles, so the resolved directory's NAME — not the raw operator
+            # handle — is the canonical mission slug downstream consumers need.
+            return legacy_dir.name
+        # C6 (WP05): the bare-modern-slug resolution is the ONE shared seam in
+        # ``missions._read_path_resolver`` — the CLI consumes it rather than keeping
+        # a byte-for-byte glob clone (NFR-004 single-definition).
+        if resolved_bare := resolve_bare_modern_mission_dir_name(
+            get_main_repo_root(repo_root), raw_handle
+        ):
             return resolved_bare
         try:
             resolved = resolve_mission_handle(raw_handle, repo_root, json_mode=json_output)
             return resolved.mission_slug
         except (SystemExit, typer.Exit):
             if legacy_dir.exists():
-                return raw_handle
+                return legacy_dir.name
             raise
 
     return raw_handle
@@ -132,7 +112,6 @@ def _output_error(json_mode: bool, error_message: str, diagnostic: dict | None =
 
 def _resolve_status_surface(
     explicit_mission: str | None = None,
-    explicit_feature: str | None = None,
     *,
     json_output: bool = False,
 ) -> tuple[Path, str, Path]:
@@ -140,7 +119,7 @@ def _resolve_status_surface(
 
     This is the ``MissionStatus`` authority resolver (slug validation +
     fail-closed coord authority), **not** the dir-only feature-dir resolver
-    in :mod:`specify_cli.missions.feature_dir_resolver`. It uses
+    in :mod:`specify_cli.missions._read_path_resolver`. It uses
     ``MissionStatus.load()`` to resolve the coord-aware read path so that
     coordination-topology missions read from the coord worktree rather than
     the (potentially stale) primary checkout.
@@ -151,6 +130,7 @@ def _resolve_status_surface(
     Raises:
         typer.Exit: If resolution fails
     """
+    from specify_cli.coordination.surface_resolver import CoordinationBranchDeleted
     from specify_cli.status import CoordAuthorityUnavailable, MissionMetadataUnavailable, MissionStatus
 
     cwd = Path.cwd().resolve()
@@ -162,7 +142,6 @@ def _resolve_status_surface(
 
     mission_slug = _find_mission_slug(
         explicit_mission=explicit_mission,
-        explicit_feature=explicit_feature,
         json_output=json_output,
         repo_root=repo_root,
     )
@@ -171,7 +150,11 @@ def _resolve_status_surface(
     try:
         ms = MissionStatus.load(repo_root=main_repo_root, mission_slug=mission_slug)
         feature_dir = ms.read_dir
-    except (CoordAuthorityUnavailable, MissionMetadataUnavailable) as exc:
+    # ``CoordinationBranchDeleted`` (WP05 / T025) surfaces the converged coord-
+    # deleted hard-fail (#1848 data-loss) identically to the other fail-closed
+    # boundary types; it is listed explicitly because the aggregate now propagates
+    # it VERBATIM rather than re-wrapping to ``CoordAuthorityUnavailable``.
+    except (CoordinationBranchDeleted, CoordAuthorityUnavailable, MissionMetadataUnavailable) as exc:
         _output_error(json_output, str(exc))
         raise typer.Exit(1)
 
@@ -197,6 +180,7 @@ def _resolve_mission_status_for_repo(
         typer.Exit: If the slug is invalid or the coord authority is
             unavailable / metadata cannot be trusted (fail closed).
     """
+    from specify_cli.coordination.surface_resolver import CoordinationBranchDeleted
     from specify_cli.status import (
         CoordAuthorityUnavailable,
         InvalidMissionSlug,
@@ -206,7 +190,10 @@ def _resolve_mission_status_for_repo(
 
     try:
         return MissionStatus.load(repo_root=main_repo_root, mission_slug=mission_slug)
-    except (CoordAuthorityUnavailable, MissionMetadataUnavailable, InvalidMissionSlug) as exc:
+    # ``CoordinationBranchDeleted`` (WP05 / T025): the aggregate now propagates the
+    # converged coord-deleted hard-fail VERBATIM, so the CLI surfaces it as a clean
+    # fail-closed error (#1848) rather than letting it escape uncaught.
+    except (CoordinationBranchDeleted, CoordAuthorityUnavailable, MissionMetadataUnavailable, InvalidMissionSlug) as exc:
         _output_error(json_output, str(exc))
         raise typer.Exit(1)
 
@@ -246,7 +233,7 @@ def emit(
         str | None,
         typer.Option("--mission", help="Mission slug (required in multi-mission repos)"),
     ] = None,
-    feature: Annotated[str | None, typer.Option("--feature", hidden=True, help="(deprecated) Use --mission")] = None,
+
     force: Annotated[bool, typer.Option("--force", help="Force transition bypassing guards")] = False,
     reason: Annotated[str | None, typer.Option("--reason", help="Reason for forced transition")] = None,
     evidence_json: Annotated[str | None, typer.Option("--evidence-json", help="JSON string with done evidence")] = None,
@@ -297,7 +284,7 @@ def emit(
         main_repo_root = get_main_repo_root(repo_root)
 
         # Resolve feature slug
-        mission_slug = _find_mission_slug(explicit_mission=mission, explicit_feature=feature, json_output=json_output, repo_root=repo_root)
+        mission_slug = _find_mission_slug(explicit_mission=mission, json_output=json_output, repo_root=repo_root)
 
         # Resolve coord-aware mission aggregate via MissionStatus.load(). The
         # aggregate is retained (not just its read_dir) so the write below can
@@ -398,7 +385,7 @@ def emit(
 @app.command()
 def materialize(
     mission: Annotated[str | None, typer.Option("--mission", help="Mission slug (required in multi-mission repos)")] = None,
-    feature: Annotated[str | None, typer.Option("--feature", hidden=True, help="(deprecated) Use --mission")] = None,
+
     json_output: Annotated[bool, typer.Option("--json", help="Machine-readable JSON output")] = False,
 ) -> None:
     """Rebuild status.json from the canonical event log.
@@ -423,7 +410,7 @@ def materialize(
         main_repo_root = get_main_repo_root(repo_root)
 
         # Resolve feature slug
-        mission_slug = _find_mission_slug(explicit_mission=mission, explicit_feature=feature, json_output=json_output, repo_root=repo_root)
+        mission_slug = _find_mission_slug(explicit_mission=mission, json_output=json_output, repo_root=repo_root)
 
         # Resolve coord-aware mission directory via MissionStatus aggregate
         feature_dir, _, _ = _resolve_status_surface_for_repo(main_repo_root, mission_slug, json_output)
@@ -486,10 +473,7 @@ def doctor(
         str | None,
         typer.Option("--mission", help="Mission slug"),
     ] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
-    ] = None,
+
     stale_claimed: Annotated[
         int,
         typer.Option(
@@ -523,7 +507,7 @@ def doctor(
     from specify_cli.runtime.doctor import run_global_checks
     from specify_cli.status import run_doctor
 
-    feature_dir, mission_slug, repo_root = _resolve_status_surface(mission, feature, json_output=json_output)
+    feature_dir, mission_slug, repo_root = _resolve_status_surface(mission, json_output=json_output)
 
     # Run global runtime checks BEFORE project-specific checks
     global_checks = run_global_checks(project_dir=repo_root)
@@ -627,10 +611,7 @@ def lifecycle(
         str | None,
         typer.Option("--mission", help="Mission slug"),
     ] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
-    ] = None,
+
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Machine-readable JSON output"),
@@ -644,7 +625,7 @@ def lifecycle(
     """
     from specify_cli.status import derive_mission_lifecycle
 
-    feature_dir, mission_slug, _repo_root = _resolve_status_surface(mission, feature, json_output=json_output)
+    feature_dir, mission_slug, _repo_root = _resolve_status_surface(mission, json_output=json_output)
     try:
         result = derive_mission_lifecycle(feature_dir)
     except StoreError as exc:
@@ -677,6 +658,16 @@ def lifecycle(
     console.print()
     console.print(f"[bold]Mission Lifecycle: {mission_slug}[/bold]")
     console.print(table)
+
+    # WP02 / T009: render post-mission lifecycle history (re-opens + follow-ups).
+    from specify_cli.status import format_post_mission_events
+
+    history_lines = format_post_mission_events(result.post_mission_events)
+    if history_lines:
+        console.print()
+        console.print("[bold]Post-mission History[/bold]")
+        for line in history_lines:
+            console.print(f"  • {line}")
     raise typer.Exit(0)
 
 
@@ -762,10 +753,7 @@ def migrate(
         str | None,
         typer.Option("--mission", "-f", help="Single mission slug to migrate"),
     ] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
-    ] = None,
+
     _all_features: Annotated[
         bool,
         typer.Option("--all", help="Migrate all features in kitty-specs/"),
@@ -792,8 +780,8 @@ def migrate(
     Examples:
         spec-kitty upgrade  # applies all pending migrations
     """
-    if mission is not None or feature is not None:
-        _find_mission_slug(explicit_mission=mission, explicit_feature=feature, json_output=json_output)
+    if mission is not None:
+        _find_mission_slug(explicit_mission=mission, json_output=json_output)
 
     msg = (
         "The migrate command has been removed. "
@@ -849,10 +837,7 @@ def validate(
         str | None,
         typer.Option("--mission", help="Mission slug (required in multi-mission repos)"),
     ] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
-    ] = None,
+
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Machine-readable JSON output"),
@@ -882,7 +867,7 @@ def validate(
             console.print(f"[red]Error:[/red] {PROJECT_ROOT_NOT_FOUND}")
         raise typer.Exit(1)
 
-    mission_slug = _find_mission_slug(explicit_mission=mission, explicit_feature=feature, json_output=json_output, repo_root=repo_root)
+    mission_slug = _find_mission_slug(explicit_mission=mission, json_output=json_output, repo_root=repo_root)
 
     main_repo_root = get_main_repo_root(repo_root)
     feature_dir, _, _ = _resolve_status_surface_for_repo(main_repo_root, mission_slug, json_output)
@@ -970,10 +955,7 @@ def reconcile(
         str | None,
         typer.Option("--mission", "-f", help="Mission slug (required in multi-mission repos)"),
     ] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
-    ] = None,
+
     _dry_run: Annotated[
         bool,
         typer.Option("--dry-run/--apply", help="Preview vs persist reconciliation events"),
@@ -997,8 +979,8 @@ def reconcile(
     Examples:
         spec-kitty agent status validate --mission 034-feature-name
     """
-    if mission is not None or feature is not None:
-        _find_mission_slug(explicit_mission=mission, explicit_feature=feature, json_output=json_output)
+    if mission is not None:
+        _find_mission_slug(explicit_mission=mission, json_output=json_output)
 
     msg = (
         "The reconcile command has been removed. "

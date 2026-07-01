@@ -8,15 +8,32 @@ import subprocess
 import sys
 import textwrap
 import threading
-from http.server import HTTPServer
 from pathlib import Path
 from typing import Optional, Tuple
 
+from specify_cli.core.errors import StructuredError
+from specify_cli.core.loopback_http import create_loopback_server, serve_loopback_server
+
 from .handlers.router import DashboardRouter
 
-__all__ = ["find_free_port", "start_dashboard", "run_dashboard_server"]
+__all__ = [
+    "PortUnavailableError",
+    "find_free_port",
+    "start_dashboard",
+    "run_dashboard_server",
+]
 
 logger = logging.getLogger(__name__)
+
+
+class PortUnavailableError(StructuredError):
+    """Raised when no free port can be found in the scanned range.
+
+    Carries a stable ``error_code`` (NFR-007, #1893) so callers branch on the
+    typed value rather than substring-matching the human-readable message.
+    """
+
+    error_code: str = "DASHBOARD_PORT_UNAVAILABLE"
 
 
 def find_free_port(start_port: int = 9237, max_attempts: int = 100) -> int:
@@ -44,7 +61,7 @@ def find_free_port(start_port: int = 9237, max_attempts: int = 100) -> int:
         except OSError:
             continue
 
-    raise RuntimeError(f"Could not find free port in range {start_port}-{start_port + max_attempts}")
+    raise PortUnavailableError(f"Could not find free port in range {start_port}-{start_port + max_attempts}")
 
 
 def _build_handler_class(project_dir: Path, project_token: str | None) -> type[DashboardRouter]:
@@ -71,8 +88,7 @@ def run_dashboard_server(project_dir: Path, port: int, project_token: str | None
         logger.warning("Global sync daemon check failed: %s", exc)
 
     handler_class = _build_handler_class(project_dir, project_token)
-    server = HTTPServer(('127.0.0.1', port), handler_class)  # NOSONAR -- dashboard control plane binds to localhost only
-    server.serve_forever()
+    serve_loopback_server(port, handler_class)
 
 
 def _background_script(project_dir: Path, port: int, project_token: str | None) -> str:
@@ -129,7 +145,7 @@ def start_dashboard(
         return port, proc.pid
 
     handler_class = _build_handler_class(project_dir_abs, project_token)
-    server = HTTPServer(('127.0.0.1', port), handler_class)
+    server = create_loopback_server(port, handler_class)
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

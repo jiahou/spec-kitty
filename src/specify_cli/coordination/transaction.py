@@ -18,12 +18,12 @@ C-013, NFR-001, NFR-008, NFR-010.
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
+from specify_cli.core.constants import KITTY_SPECS_DIR, WORKTREES_DIR
+from specify_cli.core.paths import assert_safe_path_segment
 import errno
 import json as _json
 import logging
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -47,12 +47,21 @@ from specify_cli.coordination.status_service import (
 from specify_cli.coordination.types import (
     Allowed,
     CommitReceipt,
+    DESTINATION_REF_NOT_FOUND,
     GitChangeSet,
     PendingEventHandle,
+    PROTECTED_BRANCH_REFUSED,
     Refused,
 )
 from specify_cli.coordination.workspace import CoordinationWorkspace
-from specify_cli.git.commit_helpers import SafeCommitRecoveryFailed, safe_commit
+from specify_cli.lanes.branch_naming import coord_mission_dir_name as _seam_coord_mission_dir_name
+from mission_runtime import CommitTarget
+from specify_cli.core.commit_guard import GuardCapability
+from specify_cli.git.commit_helpers import (
+    SafeCommitPathPolicyError,
+    SafeCommitRecoveryFailed,
+    safe_commit,
+)
 from specify_cli.status import reducer as _reducer
 from specify_cli.status.locking import (
     FeatureStatusLockTimeoutError,
@@ -138,35 +147,34 @@ class BookkeepingLegacyResolutionFailed(BookkeepingError):
 
 _EVENTS_FILENAME = "status.events.jsonl"
 _SNAPSHOT_FILENAME = "status.json"
-_SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _mission_specs_dir_name(mission_slug: str, mid8: str) -> str:
     """Return the kitty-specs sub-directory name for this mission.
 
-    Mirrors the heuristic in
-    :func:`specify_cli.coordination.workspace._compose_mission_dir`:
-    post-WP03 slugs already contain ``-<mid8>``; pre-WP03 slugs do not.
+    Delegates to the seam's VERBATIM coordination primitive
+    (``lanes.branch_naming.coord_mission_dir_name``, FR-010) so there is exactly
+    ONE algorithm for the coordination ``<slug>-<mid8>`` grammar, reconstructed
+    byte-identical to the prior hand-rolled body. This transaction path consumes
+    ``meta.json.mission_slug`` VERBATIM (including any legacy ``NNN-`` prefix); the
+    seam primitive does NOT strip it, so the kitty-specs dir matches the on-disk
+    coord target (#1589). The canonical, NNN-stripping ``mission_dir_name`` is NOT
+    used here.
     """
-    if mission_slug.endswith(f"-{mid8}"):
-        return mission_slug
-    return f"{mission_slug}-{mid8}"
+    return _seam_coord_mission_dir_name(mission_slug, mid8=mid8)
 
 
 def _validate_safe_segment(name: str, value: str) -> str:
-    """Return a single safe path segment or raise a bookkeeping error."""
-    if not value:
-        raise BookkeepingError(f"{name} cannot be empty")
-    if value != value.strip():
-        raise BookkeepingError(f"{name} must not contain leading or trailing whitespace")
-    candidate = value
-    if candidate in {".", ".."} or "/" in candidate or "\\" in candidate:
-        raise BookkeepingError(f"{name} must be a single safe path segment")
-    if _SAFE_PATH_SEGMENT_RE.fullmatch(candidate) is None:
-        raise BookkeepingError(
-            f"{name} contains unsupported characters: {candidate!r}"
-        )
-    return candidate
+    """Return a single safe path segment or raise a bookkeeping error.
+
+    Delegates to the canonical ``assert_safe_path_segment`` (FR-001 / WP01) and
+    re-raises any ``ValueError`` as a ``BookkeepingError`` to preserve the call-site
+    contract (C-001: migrate, don't wrap — no parallel mechanism).
+    """
+    try:
+        return assert_safe_path_segment(value)
+    except ValueError as exc:
+        raise BookkeepingError(f"{name} is not a safe path segment: {exc}") from exc
 
 
 def _generate_ulid() -> str:
@@ -516,6 +524,17 @@ def _unlink_confined_artifact_path(worktree_root: Path, path: Path) -> None:
 # callers that imported it through this module.
 from specify_cli.status.emit import build_status_event  # noqa: E402,F401
 
+__all__ = [
+    "BookkeepingCommitFailed",
+    "BookkeepingDoubleEventId",
+    "BookkeepingError",
+    "BookkeepingLockTimeout",
+    "BookkeepingPolicyRefused",
+    "BookkeepingTransaction",
+    "BookkeepingWorktreeMissing",
+    "build_status_event",
+]
+
 
 # ---------------------------------------------------------------------------
 # Transaction
@@ -589,7 +608,7 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
         self._commit_recovery_failed_after_commit = False
         self._explicit_commit_message: str | None = None
         self._explicit_commit_receipt: CommitReceipt | None = None
-        self._allow_protected_branch_in_test_mode = False
+        self._capability: GuardCapability = GuardCapability.STANDARD
         self._legacy_mode = False
 
     # ---- acquire ----
@@ -605,7 +624,7 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
         destination_ref: str,
         operation: str,
         timeout: float = 30.0,
-        allow_protected_branch_in_test_mode: bool = False,
+        capability: GuardCapability = GuardCapability.STANDARD,
     ) -> BookkeepingTransaction:
         """Construct, lock, and run the pre-flight policy gate.
 
@@ -647,7 +666,7 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
                 normalised_ref=normalised_ref,
                 operation=operation,
                 lock_cm=lock_cm,
-                allow_protected_branch_in_test_mode=allow_protected_branch_in_test_mode,
+                capability=capability,
             )
         except Exception:
             lock_cm.__exit__(None, None, None)
@@ -665,7 +684,7 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
         normalised_ref: str,
         operation: str,
         lock_cm: AbstractContextManager[Path],
-        allow_protected_branch_in_test_mode: bool = False,
+        capability: GuardCapability = GuardCapability.STANDARD,
     ) -> BookkeepingTransaction:
         safe_mission_slug = _validate_safe_segment("mission_slug", mission_slug)
         safe_mid8 = _validate_safe_segment("mid8", mid8)
@@ -718,7 +737,7 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
                 paths=(),
                 message=f"<pending: {operation}>",
                 operation=operation,
-                allow_protected_branch_in_test_mode=allow_protected_branch_in_test_mode,
+                capability=capability,
             )
             caller_verdict = WorkflowMutationPolicy.assert_allowed(caller_change_set)
             if isinstance(caller_verdict, Refused):
@@ -726,11 +745,11 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
                     repo_root, safe_mission_slug, safe_mid8,
                 )
                 can_recover_to_coord_branch = (
-                    caller_verdict.error_code == "PROTECTED_BRANCH_REFUSED"
+                    caller_verdict.error_code == PROTECTED_BRANCH_REFUSED
                     and explicit_coord_branch == coord_branch
                 )
                 allow_coord_resolution_to_report_missing_branch = (
-                    caller_verdict.error_code == "DESTINATION_REF_NOT_FOUND"
+                    caller_verdict.error_code == DESTINATION_REF_NOT_FOUND
                     and effective_destination_ref == coord_branch
                 )
                 if not (
@@ -776,7 +795,7 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
             paths=(events_path, snapshot_path),
             message=f"<pending: {operation}>",
             operation=operation,
-            allow_protected_branch_in_test_mode=allow_protected_branch_in_test_mode,
+            capability=capability,
         )
         verdict = WorkflowMutationPolicy.assert_allowed(change_set)
         if isinstance(verdict, Refused):
@@ -808,7 +827,7 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
             pre_emit_events_existed=pre_emit_events_existed,
             lock_cm=lock_cm,
         )
-        txn._allow_protected_branch_in_test_mode = allow_protected_branch_in_test_mode
+        txn._capability = capability
         txn._legacy_mode = legacy_mode
         return txn
 
@@ -928,6 +947,24 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
         previously exist). C-009: no ``git checkout --`` in the
         rollback path.
         """
+        # FR-005 / Issue #1887: guard against callers that accidentally
+        # resolve a path relative to the primary repo root (which would make
+        # the output path land under .worktrees/) rather than relative to the
+        # coordination worktree. This is the write-side backstop — if the
+        # output path resolves under .worktrees/ from the primary repo's
+        # perspective, reject it immediately before touching the filesystem.
+        resolved_candidate = (path if path.is_absolute() else self.worktree_root / path).resolve(
+            strict=False
+        )
+        try:
+            rel_from_worktree = resolved_candidate.relative_to(self.worktree_root.resolve())
+        except ValueError:
+            rel_from_worktree = None
+        if rel_from_worktree is not None and rel_from_worktree.parts and rel_from_worktree.parts[0] == WORKTREES_DIR:
+            raise SafeCommitPathPolicyError(
+                offending_path=rel_from_worktree.as_posix(),
+                worktree_root=self.worktree_root,
+            )
         try:
             resolved_path = _resolve_confined_artifact_path(self.worktree_root, path)
         except ValueError as exc:
@@ -1002,10 +1039,10 @@ class BookkeepingTransaction(AbstractContextManager["BookkeepingTransaction"]):
             result = safe_commit(
                 repo_root=self.repo_root,
                 worktree_root=self.worktree_root,
-                destination_ref=self.destination_ref,
+                target=CommitTarget(ref=self.destination_ref),
                 message=message,
                 paths=tuple(self._staged_paths),
-                allow_protected_branch_in_test_mode=self._allow_protected_branch_in_test_mode,
+                capability=self._capability,
             )
         except SafeCommitRecoveryFailed as exc:
             if exc.commit_sha is None:

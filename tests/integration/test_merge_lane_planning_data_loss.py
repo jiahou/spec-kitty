@@ -134,27 +134,32 @@ class TestMergeIncludesPlanningLane:
             return (0, "", "")
 
         patches = [
-            patch("specify_cli.cli.commands.merge.require_lanes_json", return_value=manifest),
-            patch("specify_cli.cli.commands.merge.load_state", return_value=None),
-            patch("specify_cli.cli.commands.merge.save_state", side_effect=fake_save_state),
-            patch("specify_cli.cli.commands.merge.get_main_repo_root", return_value=tmp_path),
-            patch("specify_cli.cli.commands.merge.require_no_sparse_checkout"),
+            patch("specify_cli.merge.executor.require_lanes_json", return_value=manifest),
+            patch("specify_cli.merge.resolve.load_state", return_value=None),
+            patch("specify_cli.merge.done_bookkeeping.save_state", side_effect=fake_save_state),
+            patch("specify_cli.merge.executor.get_main_repo_root", return_value=tmp_path),
+            patch("specify_cli.merge.executor.require_no_sparse_checkout"),
             patch("specify_cli.lanes.merge.merge_lane_to_mission", return_value=lane_result),
             patch("specify_cli.lanes.merge.merge_mission_to_target", return_value=mission_result),
-            patch("specify_cli.cli.commands.merge._mark_wp_merged_done", side_effect=fake_mark_wp_merged_done),
-            patch("specify_cli.cli.commands.merge.safe_commit"),
-            patch("specify_cli.cli.commands.merge._assert_merged_wps_reached_done"),
+            patch("specify_cli.merge.done_bookkeeping._mark_wp_merged_done", side_effect=fake_mark_wp_merged_done),
+            patch("specify_cli.merge.executor.commit_merge_bookkeeping"),
+            patch("specify_cli.merge.done_bookkeeping._assert_merged_wps_reached_done"),
             patch("specify_cli.post_merge.stale_assertions.run_check"),
             patch("specify_cli.policy.merge_gates.evaluate_merge_gates"),
             patch("specify_cli.policy.config.load_policy_config"),
-            patch("specify_cli.cli.commands.merge.run_command", side_effect=fake_run_command),
-            patch("specify_cli.cli.commands.merge.has_remote", return_value=False),
-            patch("specify_cli.cli.commands.merge.cleanup_merge_workspace"),
-            patch("specify_cli.cli.commands.merge.clear_state"),
-            patch("specify_cli.cli.commands.merge._bake_mission_number_into_mission_branch"),
-            patch("specify_cli.cli.commands.merge.trigger_feature_dossier_sync_if_enabled"),
-            patch("specify_cli.cli.commands.merge.emit_mission_closed"),
-            patch("specify_cli.cli.commands.merge._emit_merge_diff_summary"),
+            patch("specify_cli.merge.executor.run_command", side_effect=fake_run_command),
+            patch("specify_cli.merge.executor.has_remote", return_value=False),
+            patch("specify_cli.merge.executor.cleanup_merge_workspace"),
+            patch("specify_cli.merge.executor.clear_state"),
+            patch("specify_cli.merge.executor._bake_mission_number_into_mission_branch"),
+            patch("specify_cli.merge.executor.trigger_feature_dossier_sync_if_enabled"),
+            patch("specify_cli.merge.executor.emit_mission_closed"),
+            patch("specify_cli.merge.executor._emit_merge_diff_summary"),
+            # WP10 (#2057): branch preflight + target asserts moved to seams;
+            # appended last to keep positional mock indices stable.
+            patch("specify_cli.merge.executor._check_mission_branch", return_value=(True, None)),
+            patch("specify_cli.merge.executor._assert_merged_wps_done_on_target"),
+            patch("specify_cli.merge.executor._assert_baseline_merge_commit_on_target"),
         ]
         with contextlib.ExitStack() as stack:
             mocks = [stack.enter_context(p) for p in patches]
@@ -328,29 +333,29 @@ def _real_merge_external_mocks(repo_root: Path):
     """
     patches = [
         # External side effects (status emit, dossier, SaaS, stale-assertion check)
-        patch("specify_cli.cli.commands.merge._mark_wp_merged_done"),
-        patch("specify_cli.cli.commands.merge._assert_merged_wps_reached_done"),
-        patch("specify_cli.cli.commands.merge.safe_commit"),
-        patch("specify_cli.cli.commands.merge.trigger_feature_dossier_sync_if_enabled"),
-        patch("specify_cli.cli.commands.merge.emit_mission_closed"),
-        patch("specify_cli.cli.commands.merge._emit_merge_diff_summary"),
+        patch("specify_cli.merge.done_bookkeeping._mark_wp_merged_done"),
+        patch("specify_cli.merge.done_bookkeeping._assert_merged_wps_reached_done"),
+        patch("specify_cli.merge.executor.commit_merge_bookkeeping"),
+        patch("specify_cli.merge.executor.trigger_feature_dossier_sync_if_enabled"),
+        patch("specify_cli.merge.executor.emit_mission_closed"),
+        patch("specify_cli.merge.executor._emit_merge_diff_summary"),
         patch("specify_cli.post_merge.stale_assertions.run_check"),
-        patch("specify_cli.cli.commands.merge.run_check"),
+        patch("specify_cli.merge.executor.run_check"),
         # Preflight / gates / policy / sparse-checkout — out of scope for
         # this data-loss regression
-        patch("specify_cli.cli.commands.merge.require_no_sparse_checkout"),
+        patch("specify_cli.merge.executor.require_no_sparse_checkout"),
         patch("specify_cli.cli.commands.merge._enforce_git_preflight"),
         patch("specify_cli.policy.merge_gates.evaluate_merge_gates"),
         patch("specify_cli.policy.config.load_policy_config"),
         # mission_number assignment scans kitty-specs/ and rewrites meta.json on
         # the mission branch via a temp worktree — not the focus of the
         # data-loss regression.  Keep it out of the way.
-        patch("specify_cli.cli.commands.merge._bake_mission_number_into_mission_branch", return_value=None),
+        patch("specify_cli.merge.executor._bake_mission_number_into_mission_branch", return_value=None),
         # Post-merge invariant fires on `git status --porcelain` output that
         # includes the test-only files — short-circuit it for this test.
         # The merge has already run through real git by the time this would
         # raise.
-        patch("specify_cli.cli.commands.merge._classify_porcelain_lines", return_value=([], 0)),
+        patch("specify_cli.merge.executor._classify_porcelain_lines", return_value=([], 0)),
     ]
     with contextlib.ExitStack() as stack:
         ms = [stack.enter_context(p) for p in patches]
@@ -399,20 +404,20 @@ def _real_invariant_external_mocks(repo_root: Path):
     so the first dirty line — whatever sorts first — is classified correctly.
     """
     patches = [
-        patch("specify_cli.cli.commands.merge._mark_wp_merged_done"),
-        patch("specify_cli.cli.commands.merge._assert_merged_wps_reached_done"),
-        patch("specify_cli.cli.commands.merge.safe_commit"),
-        patch("specify_cli.cli.commands.merge.trigger_feature_dossier_sync_if_enabled"),
-        patch("specify_cli.cli.commands.merge.emit_mission_closed"),
-        patch("specify_cli.cli.commands.merge._emit_merge_diff_summary"),
+        patch("specify_cli.merge.done_bookkeeping._mark_wp_merged_done"),
+        patch("specify_cli.merge.done_bookkeeping._assert_merged_wps_reached_done"),
+        patch("specify_cli.merge.executor.commit_merge_bookkeeping"),
+        patch("specify_cli.merge.executor.trigger_feature_dossier_sync_if_enabled"),
+        patch("specify_cli.merge.executor.emit_mission_closed"),
+        patch("specify_cli.merge.executor._emit_merge_diff_summary"),
         patch("specify_cli.post_merge.stale_assertions.run_check"),
-        patch("specify_cli.cli.commands.merge.run_check"),
-        patch("specify_cli.cli.commands.merge.require_no_sparse_checkout"),
+        patch("specify_cli.merge.executor.run_check"),
+        patch("specify_cli.merge.executor.require_no_sparse_checkout"),
         patch("specify_cli.cli.commands.merge._enforce_git_preflight"),
         patch("specify_cli.policy.merge_gates.evaluate_merge_gates"),
         patch("specify_cli.policy.config.load_policy_config"),
-        patch("specify_cli.cli.commands.merge._bake_mission_number_into_mission_branch", return_value=None),
-        patch("specify_cli.cli.commands.merge._refresh_primary_checkout_after_merge"),
+        patch("specify_cli.merge.executor._bake_mission_number_into_mission_branch", return_value=None),
+        patch("specify_cli.merge.executor._refresh_primary_checkout_after_merge"),
         # NOTE: _classify_porcelain_lines is intentionally NOT mocked here —
         # the real post-merge working-tree invariant must run so the F2 fix
         # (meta.json in expected_paths) is exercised.
@@ -547,17 +552,25 @@ class TestLegacyPlanningOnlyMetaInvariant:
         )
 
     def test_meta_json_membership_is_load_bearing(self, tmp_path: Path) -> None:
-        """Prove the F2 fix is load-bearing: if ``meta.json`` were NOT in
-        ``expected_paths``, the real invariant (reading RAW porcelain) flags the
-        dirtied ``meta.json`` first line and fails the merge with ``typer.Exit``.
+        """Prove meta.json tolerance in the merge invariant is load-bearing.
 
-        We simulate the pre-fix state by patching ``_classify_porcelain_lines``
-        to receive an ``expected_paths`` set with the mission_number meta.json
-        path stripped out — i.e. exactly the membership the F2 fix adds. The
-        real raw-porcelain read still runs, so this proves that meta.json's
-        intact ``" M ..."`` line genuinely reaches classification.
+        Post-WP01 (#2251) the merge dirty-tree classifier ``_classify_porcelain_lines``
+        converged onto the single ``mission_runtime.is_self_bookkeeping_path`` authority,
+        which independently recognizes ``meta.json``. meta.json is therefore now tolerated
+        by TWO mechanisms: the F2 ``expected_paths`` membership AND that unified
+        self-bookkeeping check (the F2 membership is now redundant belt-and-suspenders).
+
+        To prove the invariant genuinely exercises meta.json — and would flag it absent
+        ALL tolerance — this strips BOTH: it drops the F2 membership from
+        ``expected_paths`` AND neutralizes the self-bookkeeping recognition for this
+        meta.json only. With both stripped, the real invariant (reading RAW porcelain)
+        flags the dirtied ``meta.json`` first line and fails the merge with ``typer.Exit``,
+        confirming its intact ``" M ..."`` line reaches classification and is caught.
         """
-        import specify_cli.cli.commands.merge as merge_mod
+        # WP10 (#2057): the post-merge porcelain invariant runs in the executor
+        # seam, reading _classify_porcelain_lines from its own module binding.
+        import mission_runtime
+        import specify_cli.merge.executor as merge_mod
 
         slug = "legacy-planning-only-meta-loadbearing"
         _init_git_repo(tmp_path)
@@ -565,12 +578,26 @@ class TestLegacyPlanningOnlyMetaInvariant:
         meta_rel = f"kitty-specs/{slug}/meta.json"
 
         real_classify = merge_mod._classify_porcelain_lines
+        real_is_self_bookkeeping = mission_runtime.is_self_bookkeeping_path
+        classified_lines: list[str] = []
 
         def classify_without_meta_membership(
-            lines: list[str], expected_paths: set[str]
+            lines: list[str], expected_paths: set[str], **kwargs: object
         ) -> tuple[list[str], int]:
             # Drop the F2 membership to recreate the pre-fix expected_paths.
-            return real_classify(lines, expected_paths - {meta_rel})
+            # Forward any keyword-only args (e.g. ``residue_predicate``) intact so
+            # this spy stays signature-agnostic to the production classifier.
+            classified_lines.extend(lines)
+            return real_classify(lines, expected_paths - {meta_rel}, **kwargs)
+
+        def is_self_bookkeeping_without_meta(path: object) -> bool:
+            # WP01 (#2251) folded is_self_bookkeeping_path into the classifier;
+            # neutralize it for THIS meta.json only so the tolerance is fully
+            # stripped and the invariant must fall back to catching the dirtied
+            # meta.json (the load-bearing behavior this test proves).
+            if str(path).endswith("meta.json"):
+                return False
+            return real_is_self_bookkeeping(path)
 
         with (
             _real_invariant_external_mocks(tmp_path),
@@ -578,6 +605,11 @@ class TestLegacyPlanningOnlyMetaInvariant:
                 merge_mod,
                 "_classify_porcelain_lines",
                 side_effect=classify_without_meta_membership,
+            ),
+            patch.object(
+                mission_runtime,
+                "is_self_bookkeeping_path",
+                side_effect=is_self_bookkeeping_without_meta,
             ),
             pytest.raises(typer.Exit),
         ):
@@ -592,9 +624,12 @@ class TestLegacyPlanningOnlyMetaInvariant:
             )
 
         # The dirtied meta.json was genuinely the file that tripped the
-        # invariant (its intact " M " line reached classification).
+        # invariant (its intact " M " line reached classification). The final
+        # bookkeeping rollback restores the uncommitted mission_number after
+        # this artificial failure, so the persisted meta returns to null.
+        assert f" M {meta_rel}" in classified_lines
         post_meta = json.loads((feature_dir / "meta.json").read_text(encoding="utf-8"))
-        assert isinstance(post_meta.get("mission_number"), int)
+        assert post_meta.get("mission_number") is None
 
 
 class TestPostMergePorcelainHole:
@@ -733,18 +768,18 @@ def _real_persistence_external_mocks(repo_root: Path):
     ``TestLegacyPlanningOnlyMetaInvariant`` (F2).
     """
     patches = [
-        patch("specify_cli.cli.commands.merge.safe_commit"),
-        patch("specify_cli.cli.commands.merge.trigger_feature_dossier_sync_if_enabled"),
-        patch("specify_cli.cli.commands.merge.emit_mission_closed"),
-        patch("specify_cli.cli.commands.merge._emit_merge_diff_summary"),
+        patch("specify_cli.merge.executor.commit_merge_bookkeeping"),
+        patch("specify_cli.merge.executor.trigger_feature_dossier_sync_if_enabled"),
+        patch("specify_cli.merge.executor.emit_mission_closed"),
+        patch("specify_cli.merge.executor._emit_merge_diff_summary"),
         patch("specify_cli.post_merge.stale_assertions.run_check"),
-        patch("specify_cli.cli.commands.merge.run_check"),
-        patch("specify_cli.cli.commands.merge.require_no_sparse_checkout"),
+        patch("specify_cli.merge.executor.run_check"),
+        patch("specify_cli.merge.executor.require_no_sparse_checkout"),
         patch("specify_cli.cli.commands.merge._enforce_git_preflight"),
         patch("specify_cli.policy.merge_gates.evaluate_merge_gates"),
         patch("specify_cli.policy.config.load_policy_config"),
-        patch("specify_cli.cli.commands.merge._bake_mission_number_into_mission_branch", return_value=None),
-        patch("specify_cli.cli.commands.merge._classify_porcelain_lines", return_value=([], 0)),
+        patch("specify_cli.merge.executor._bake_mission_number_into_mission_branch", return_value=None),
+        patch("specify_cli.merge.executor._classify_porcelain_lines", return_value=([], 0)),
         # NOTE: _mark_wp_merged_done and _assert_merged_wps_reached_done are
         # intentionally NOT mocked — the real done-marking persistence runs.
     ]

@@ -393,7 +393,7 @@ class TestUnknownVerdictWarning:
 class TestVerdictGuardInMoveTask:
     """move_task blocks force-approve/force-done when verdict == rejected."""
 
-    @patch("specify_cli.cli.commands.agent.tasks.safe_commit")
+    @patch("specify_cli.cli.commands.agent.tasks.commit_for_mission")
     @patch("specify_cli.cli.commands.agent.tasks.emit_status_transition_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.read_events_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.feature_status_lock")
@@ -466,7 +466,7 @@ class TestVerdictGuardInMoveTask:
         assert "--skip-review-artifact-check --note <reason>" in result.output
         assert "arbiter override" in result.output
 
-    @patch("specify_cli.cli.commands.agent.tasks.safe_commit")
+    @patch("specify_cli.cli.commands.agent.tasks.commit_for_mission")
     @patch("specify_cli.cli.commands.agent.tasks.emit_status_transition_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.read_events_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.feature_status_lock")
@@ -537,7 +537,7 @@ class TestVerdictGuardInMoveTask:
         assert "no parseable review verdict" in result.output
         mock_emit.assert_not_called()
 
-    @patch("specify_cli.cli.commands.agent.tasks.safe_commit")
+    @patch("specify_cli.cli.commands.agent.tasks.commit_for_mission")
     @patch("specify_cli.cli.commands.agent.tasks.emit_status_transition_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.read_events_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.feature_status_lock")
@@ -610,7 +610,7 @@ class TestVerdictGuardInMoveTask:
 class TestSkipReviewArtifactCheck:
     """--skip-review-artifact-check records a durable override."""
 
-    @patch("specify_cli.cli.commands.agent.tasks.safe_commit")
+    @patch("specify_cli.cli.commands.agent.tasks.commit_for_mission")
     @patch("specify_cli.cli.commands.agent.tasks.emit_status_transition_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.read_events_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.feature_status_lock")
@@ -699,7 +699,7 @@ class TestSkipReviewArtifactCheck:
         assert "review_artifact_override_actor:" in artifact_text
         assert "review_artifact_override_reason:" in artifact_text
 
-    @patch("specify_cli.cli.commands.agent.tasks.safe_commit")
+    @patch("specify_cli.cli.commands.agent.tasks.commit_for_mission")
     @patch("specify_cli.cli.commands.agent.tasks.emit_status_transition_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.read_events_transactional")
     @patch("specify_cli.cli.commands.agent.tasks.feature_status_lock")
@@ -861,6 +861,9 @@ class TestLaneGuardErrorMessage:
 
         fake_worktree = tmp_path / "worktree"
         fake_worktree.mkdir(exist_ok=True)
+        # #1833 husk guard: a resolved workspace must carry a .git entry; all
+        # git calls below are mocked, so a marker file is sufficient.
+        (fake_worktree / ".git").write_text("gitdir: mocked\n", encoding="utf-8")
 
         def _mock_subprocess(cmd: object, *args: object, **kwargs: object) -> MagicMock:
             result_mock = MagicMock()
@@ -868,7 +871,10 @@ class TestLaneGuardErrorMessage:
             result_mock.stdout = ""
             cmd_list = cmd if isinstance(cmd, list) else []
             cmd_str = " ".join(str(c) for c in cmd_list)
-            if "status" in cmd_str and "--porcelain" in cmd_str:
+            if "rev-parse" in cmd_str and "--show-toplevel" in cmd_str:
+                # #1833 toplevel assertion: the workspace is its own toplevel.
+                result_mock.stdout = f"{fake_worktree}\n"
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
                 # No uncommitted changes in main or worktree
                 result_mock.stdout = ""
             elif "rev-list" in cmd_str and "HEAD.." in cmd_str:
@@ -958,3 +964,91 @@ class TestLaneGuardErrorMessage:
         assert "planning branch unknown" in guidance_text, (
             f"Expected fallback message; got:\n{guidance_text}"
         )
+
+    def test_missing_workspace_context_checks_coord_branch_not_pr_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy workspace fixtures still use the coord branch as review base."""
+        from mission_runtime import CommitTarget, MissionTopology
+        from specify_cli.cli.commands.agent.tasks import _validate_ready_for_review
+
+        mission_slug = "test-review-base-003"
+        feature_dir = tmp_path / "kitty-specs" / mission_slug
+        feature_dir.mkdir(parents=True)
+        (feature_dir / "meta.json").write_text(
+            json.dumps({"mission_type": "software-dev", "target_branch": "fix/pr-branch"}),
+            encoding="utf-8",
+        )
+        fake_worktree = tmp_path / "worktree"
+        fake_worktree.mkdir()
+        (fake_worktree / ".git").write_text("gitdir: mocked\n", encoding="utf-8")
+        seen_rev_lists: list[str] = []
+
+        def _mock_subprocess(cmd: object, *args: object, **kwargs: object) -> MagicMock:
+            result_mock = MagicMock()
+            result_mock.returncode = 0
+            result_mock.stdout = ""
+            cmd_list = cmd if isinstance(cmd, list) else []
+            cmd_str = " ".join(str(c) for c in cmd_list)
+            if "rev-parse" in cmd_str and "--show-toplevel" in cmd_str:
+                result_mock.stdout = f"{fake_worktree}\n"
+            elif "rev-parse" in cmd_str and any(
+                ref in cmd_str for ref in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD")
+            ):
+                result_mock.returncode = 1
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result_mock.stdout = ""
+            elif "rev-list" in cmd_str:
+                rev_range = str(cmd_list[-1])
+                seen_rev_lists.append(rev_range)
+                result_mock.stdout = "1\n" if rev_range.endswith("..HEAD") else "0\n"
+            return result_mock
+
+        coord_branch = f"kitty/mission-{mission_slug}"
+        with (
+            patch("specify_cli.cli.commands.agent.tasks.get_main_repo_root", return_value=tmp_path),
+            patch(
+                "specify_cli.cli.commands.agent.tasks._list_wp_branch_kitty_specs_changes",
+                return_value=[],
+            ),
+            patch("specify_cli.cli.commands.agent.tasks.resolve_workspace_for_wp") as mock_ws,
+            patch(
+                "specify_cli.cli.commands.agent.tasks.resolve_placement_only",
+                return_value=CommitTarget(
+                    ref=coord_branch,
+                ),
+            ),
+            patch(
+                "specify_cli.cli.commands.agent.tasks.resolve_topology",
+                return_value=MissionTopology.COORD,
+            ),
+            patch(
+                "specify_cli.cli.commands.agent.tasks.get_feature_target_branch",
+                return_value="fix/pr-branch",
+            ),
+            patch("specify_cli.cli.commands.agent.tasks.get_mission_type", return_value="software-dev"),
+            patch(
+                "specify_cli.core.git_ops.get_current_branch",
+                return_value=f"{coord_branch}-lane-a",
+            ),
+            patch("subprocess.run", side_effect=_mock_subprocess),
+        ):
+            mock_workspace = MagicMock()
+            mock_workspace.resolution_kind = "lane_workspace"
+            mock_workspace.worktree_path = fake_worktree
+            mock_workspace.context = None
+            mock_ws.return_value = mock_workspace
+
+            is_valid, guidance = _validate_ready_for_review(
+                repo_root=tmp_path,
+                mission_slug=mission_slug,
+                wp_id="WP01",
+                force=False,
+                target_lane="for_review",
+            )
+
+        assert is_valid, guidance
+        assert f"HEAD..{coord_branch}" in seen_rev_lists
+        assert f"{coord_branch}..HEAD" in seen_rev_lists
+        assert "HEAD..fix/pr-branch" not in seen_rev_lists
+        assert "fix/pr-branch..HEAD" not in seen_rev_lists

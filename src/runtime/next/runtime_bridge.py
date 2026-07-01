@@ -46,6 +46,7 @@ from runtime.next._internal_runtime import (
 from runtime.next._internal_runtime.schema import ActorIdentity, MissionRuntimeError, load_mission_template_file
 
 from specify_cli.core.atomic import atomic_write
+from specify_cli.core.constants import MISSION_TYPE_SOFTWARE_DEV
 from specify_cli.mission import get_mission_type
 from specify_cli.status import CanonicalStatusNotFoundError
 from specify_cli.status import Lane
@@ -61,6 +62,7 @@ from runtime.next.decision import (
     _state_to_action,
 )
 from specify_cli.sync.runtime_event_emitter import SyncRuntimeEventEmitter
+from mission_runtime import routes_through_coordination
 
 logger = logging.getLogger(__name__)
 
@@ -69,74 +71,121 @@ META_JSON = "meta.json"
 MISSION_RUNTIME_YAML = "mission-runtime.yaml"
 MISSION_YAML = "mission.yaml"
 
-
 class DecisionGitLogUnavailable(RuntimeError):
     """Decision audit logging cannot be made durable for a modern mission."""
 
 
 def _primary_runtime_feature_dir(repo_root: Path, mission_slug: str) -> Path:
-    """Return the topology-aware mission feature dir for meta.json reads.
+    """Return the PRIMARY-checkout mission feature dir for identity/meta reads.
 
-    Routes through the canonical coord-aware resolver
-    (:func:`candidate_feature_dir_for_mission`) rather than re-deriving a
-    raw mission-spec dir from the repo root and the bare slug by hand (the
-    residual slug-derived path-builder that ignored coord topology and the
-    ``-<mid8>`` suffix). One resolver, one path — FR-007/FR-009/FR-036.
+    Mission identity (``mission_id``, ``coordination_branch``, stored topology)
+    is persisted ONLY on the primary checkout's ``meta.json``. Under coordination
+    topology the topology-aware resolver (``candidate_feature_dir_for_mission``)
+    returns the coordination worktree once it is materialized — whose mission dir
+    has NO ``meta.json`` — so reading identity there found nothing and fell back
+    to the bare slug, yielding an empty ``mid8`` and a malformed
+    ``kitty/mission-<slug>-`` coord branch (#2091). Anchor on the topology-BLIND
+    :func:`primary_feature_dir_for_mission`, mirroring
+    :func:`_mission_routes_through_coordination` above and the canonical
+    precedent in ``core/paths.py`` (the same bug-class fixed for the merge
+    target): the coord-aware resolver fail-closes for a materialized-but-empty
+    coord worktree, so it must not gate primary-anchored identity reads.
     """
-    from specify_cli.missions.feature_dir_resolver import (
-        candidate_feature_dir_for_mission,
+    from specify_cli.missions._read_path_resolver import (
+        _canonicalize_primary_read_handle,
+        primary_feature_dir_for_mission,
     )
 
-    return candidate_feature_dir_for_mission(repo_root, mission_slug)
+    # WP05/FR-005: route through _canonicalize_primary_read_handle.
+    return primary_feature_dir_for_mission(
+        repo_root,
+        _canonicalize_primary_read_handle(repo_root, mission_slug),
+    )
 
 
 def _resolve_coordination_branch(mission_slug: str, repo_root: Path) -> str:
     """Return the coordination branch for a mission from meta.json.
 
-    Falls back to ``kitty/mission-<slug>`` when meta.json is absent or
-    does not carry the ``coordination_branch`` key.
+    When meta.json declares ``coordination_branch`` explicitly, that value is
+    authoritative. Otherwise the branch is composed via the fail-closed WP01
+    seam (:func:`coord_branch_name`/:func:`mission_branch_name_required`) using
+    the declared ``mission_id``, instead of a bare ``kitty/mission-<slug>``
+    f-string that drops the ``-<mid8>`` disambiguator (#1978). When the mission
+    is legacy/unresolvable the seam still composes the legacy branch; a modern
+    slug with no recoverable identity raises :class:`BranchIdentityUnresolved`,
+    surfacing the lost identity rather than silently mis-composing.
     """
+    meta: dict[str, Any] = {}
     meta_path = _primary_runtime_feature_dir(repo_root, mission_slug) / META_JSON
     if meta_path.exists():
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            meta = {}
-        branch = meta.get("coordination_branch") if isinstance(meta, dict) else None
+            loaded = {}
+        if isinstance(loaded, dict):
+            meta = loaded
+        branch = meta.get("coordination_branch")
         if isinstance(branch, str) and branch.strip():
             return branch.strip()
-    return f"kitty/mission-{mission_slug}"
+
+    from specify_cli.lanes.branch_naming import mission_branch_name_required
+
+    mission_id = meta.get("mission_id")
+    resolved_id = mission_id.strip() if isinstance(mission_id, str) and mission_id.strip() else None
+    return mission_branch_name_required(mission_slug, resolved_id)
 
 
-def _resolve_mission_ulid(mission_slug: str, repo_root: Path) -> str:
-    """Read the canonical ULID mission_id from meta.json.
+def _resolve_mission_ulid(mission_slug: str, repo_root: Path) -> str | None:
+    """Read the canonical ULID mission_id from meta.json via the identity SSOT.
 
-    Returns the ULID string when present, or the slug as a fallback so that
-    callers always receive a non-empty identifier.
+    WP04/FR-004: Routes through ``mission_metadata.resolve_mission_identity``
+    (the single source of truth) instead of hand-rolling a json.loads read.
+    Returns the ULID string when present, or ``None`` when absent — fail-closed:
+    callers must NOT substitute the slug for the absent ULID.
     """
-    meta_path = _primary_runtime_feature_dir(repo_root, mission_slug) / META_JSON
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            meta = {}
-        mission_id = meta.get("mission_id") if isinstance(meta, dict) else None
-        if isinstance(mission_id, str) and mission_id.strip():
-            return mission_id.strip()
-    return mission_slug
+    from specify_cli.mission_metadata import resolve_mission_identity  # noqa: PLC0415
+
+    feature_dir = _primary_runtime_feature_dir(repo_root, mission_slug)
+    return resolve_mission_identity(feature_dir).mission_id
 
 
-def _mission_declares_coordination_branch(mission_slug: str, repo_root: Path) -> bool:
-    """Return True when meta.json explicitly declares coord-branch topology."""
-    meta_path = _primary_runtime_feature_dir(repo_root, mission_slug) / META_JSON
-    if not meta_path.exists():
-        return False
+def _mission_routes_through_coordination(mission_slug: str, repo_root: Path) -> bool:
+    """Return True when the mission's STORED topology routes through coordination.
+
+    Reads the WP02 stored :class:`MissionTopology` (FR-004) from ``meta.json`` via
+    the **pure** :func:`read_topology` reader and disposes the coord-vs-flattened
+    SHAPE from it — replacing the retired ``meta.coordination_branch is not None``
+    derivation (the second #2069 inference, which keyed the decision on a value
+    presence rather than the stored shape, SC-001). The read is PURE: an
+    un-backfilled mission is classified once and NOT persisted, so this read path
+    never writes ``meta.json`` (the read-only contract, #1814). The coord-routing
+    membership is disposed by the ONE canonical predicate
+    (:func:`routes_through_coordination`) over the ONE canonical set — no second
+    ``{COORD, LANES_WITH_COORD}`` set is restated here (FR-005). A coord-routing
+    topology (``COORD`` / ``LANES_WITH_COORD``) returns ``True``; the coord-less
+    cells return ``False``. Missing/malformed meta degrades to non-coord (matching
+    the historical "no declared coord topology" arm).
+    """
+    from specify_cli.migration.backfill_topology import read_topology
+    from specify_cli.missions._read_path_resolver import (
+        _canonicalize_primary_read_handle,
+        primary_feature_dir_for_mission,
+    )
+
+    # Anchor the stored-topology read on the topology-BLIND primary dir (where
+    # meta.json lives), mirroring ``resolution._resolve_coordination_branch`` — the
+    # coord-aware resolver fail-closes for a materialized-but-empty coord worktree,
+    # so it must not gate this read.
+    # WP05/FR-005: route through _canonicalize_primary_read_handle.
+    feature_dir = primary_feature_dir_for_mission(
+        repo_root,
+        _canonicalize_primary_read_handle(repo_root, mission_slug),
+    )
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        topology = read_topology(feature_dir)
+    except (FileNotFoundError, ValueError, OSError):
         return False
-    branch = meta.get("coordination_branch") if isinstance(meta, dict) else None
-    return isinstance(branch, str) and bool(branch.strip())
+    return routes_through_coordination(topology)
 
 
 def _wrap_with_decision_git_log(
@@ -150,33 +199,70 @@ def _wrap_with_decision_git_log(
     the original emitter is returned unchanged so mission execution is not
     blocked.
     """
-    declared_coord_topology = _mission_declares_coordination_branch(
+    coord_routing_topology = _mission_routes_through_coordination(
         mission_slug, repo_root,
     )
     try:
+        from mission_runtime import CommitTarget
         from specify_cli.coordination.workspace import CoordinationWorkspace
         from specify_cli.events.decision_log import DecisionGitLog
 
         coordination_branch = _resolve_coordination_branch(mission_slug, repo_root)
-        mission_id = _resolve_mission_ulid(mission_slug, repo_root)
+        mission_id = _resolve_mission_ulid(mission_slug, repo_root)  # str | None
 
         # Resolve coord worktree path (pure static method, no side effects).
-        # Extract mid8 from slug (post-083 slugs end in "-<8-char-ULID-prefix>").
-        # Fall back to repo_root only for legacy missions or pre-init runs that
-        # do not yet declare coord-branch topology.  Modern missions with a
-        # missing coord worktree fail closed to avoid dirtying the primary
-        # checkout with coord-branch decision events.
-        from specify_cli.lanes.branch_naming import mid8_from_slug as _mid8_from_slug
-        _mid8 = _mid8_from_slug(mission_slug)
-        _coord_path = CoordinationWorkspace.worktree_path(repo_root, mission_slug, _mid8)
-        if _coord_path.exists():
-            worktree_root = _coord_path
-        elif declared_coord_topology:
-            worktree_root = CoordinationWorkspace.resolve(
-                repo_root, mission_slug, _mid8,
+        # Derive the mid8 authoritatively from the declared mission_id via the
+        # WP01 seam (FR-004): the heuristic mid8_from_slug trusts a coincidental
+        # 8-char tail with no identity to confirm against, so it must not sit on
+        # this correctness path (#1918). resolve_mid8 returns mission_id[:8] when
+        # a ULID is declared, and declines (``""``) on a bare slug or None.
+        # WP04: slug-as-sentinel removed — mission_id is now str | None from SSOT.
+        from specify_cli.lanes.branch_naming import resolve_mid8 as _resolve_mid8
+        _mid8 = _resolve_mid8(mission_slug, mission_id=mission_id)
+
+        # Fail loud, never compose a malformed ``kitty/mission-<slug>-`` branch
+        # (#2091): an empty mid8 on a coord-routing mission means identity was
+        # unresolvable, so refuse here with a clear message rather than letting
+        # ``git worktree add`` fail with an opaque exit-128 on a non-existent
+        # branch. With the primary-anchored identity read above this is
+        # belt-and-suspenders, but it closes the dormant mask if any future read
+        # path loses the ULID again.
+        if coord_routing_topology and not _mid8:
+            raise DecisionGitLogUnavailable(
+                f"Cannot resolve mid8 for coordination-topology mission "
+                f"{mission_slug!r} (mission_id unresolvable); refusing to compose "
+                "a malformed coordination branch without durable decision evidence."
             )
+
+        # The decision-target topology SHAPE is READ from the WP02 stored topology
+        # (FR-004 / SC-001) — never from ``_coord_path.exists()`` (the retired
+        # disk-``stat`` ladder, C-004). The on-disk worktree-materialization check
+        # (``_coord_path.exists()``) survives ONLY to choose the worktree_root for a
+        # coord-routing mission (C-006 transient discrimination: materialized →
+        # use it; not-yet-materialized → compose via ``CoordinationWorkspace.resolve``)
+        # — it is NOT the topology classifier.
+        if coord_routing_topology:
+            _coord_path = CoordinationWorkspace.worktree_path(
+                repo_root, mission_slug, _mid8
+            )
+            # C-011 risk site: the worktree_root selection is preserved EXACTLY —
+            # keyed off the stored-topology coord-routing decision and the C-006
+            # transient on-disk materialization check, never ``.kind``.
+            worktree_root = (
+                _coord_path
+                if _coord_path.exists()
+                else CoordinationWorkspace.resolve(repo_root, mission_slug, _mid8)
+            )
+            # The vestigial topology ``.kind`` carrier is dropped (WP04 drain):
+            # DecisionGitLog → safe_commit reads only ``target.ref``. The VO field
+            # defaults transitionally until WP16 removes it.
+            decision_target = CommitTarget(ref=coordination_branch)
         else:
+            # Coord-less topology: decisions land on the primary checkout's
+            # current branch (a lane/mission branch); landing == coordination ==
+            # target. worktree_root is the repo_root (preserved exactly).
             worktree_root = repo_root
+            decision_target = CommitTarget(ref=coordination_branch)
 
         return DecisionGitLog(
             repo_root=repo_root,
@@ -185,9 +271,10 @@ def _wrap_with_decision_git_log(
             mission_slug=mission_slug,
             inner=emitter,
             mission_id=mission_id,
+            target=decision_target,
         )
     except Exception as exc:
-        if declared_coord_topology:
+        if coord_routing_topology:
             raise DecisionGitLogUnavailable(
                 "DecisionGitLog construction failed for declared coordination "
                 f"topology mission {mission_slug!r}; refusing to continue "
@@ -202,8 +289,50 @@ def _wrap_with_decision_git_log(
         return emitter
 
 
+# FR-001 / C-IC02: the typed read-path codes whose fidelity MUST be preserved
+# across the next-family catch-sites. These are *read-path topology* failures
+# (the mission exists but its status read surface is broken / ambiguous), as
+# opposed to a genuinely-missing mission (``FEATURE_CONTEXT_UNRESOLVED`` and the
+# like), which legitimately stays ``MISSION_NOT_FOUND``. Collapsing a code in
+# this set into ``MISSION_NOT_FOUND`` mis-routes the operator (the disease #15).
+_READ_PATH_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "STATUS_READ_PATH_NOT_FOUND",
+        "COORDINATION_BRANCH_DELETED",
+        "MISSION_AMBIGUOUS_SELECTOR",
+    }
+)
+
+
+def _is_read_path_error(exc: object) -> bool:
+    """Return True when *exc* carries a typed read-path topology code (C-IC02)."""
+    return getattr(exc, "code", None) in _READ_PATH_ERROR_CODES
+
+
 class QueryModeValidationError(ValueError):
     """Raised when query mode cannot produce a truthful read-only preview."""
+
+
+class MissionNotFoundError(Exception):
+    """Raised when a mission handle cannot be resolved to an existing mission.
+
+    Carries the attempted handle so callers can include it in structured
+    error output (FR-004 / WP03 — fail-closed next query mode), plus an
+    actionable ``next_step`` remediation so operators are told concretely how
+    to recover (list available missions / verify the handle). The ``next_step``
+    affordance restores the operator guidance the superseded
+    ``QueryModeValidationError`` used to carry (#1911).
+    """
+
+    error_code: str = "MISSION_NOT_FOUND"
+
+    def __init__(self, handle: str, next_step: str | None = None) -> None:
+        self.handle = handle
+        self.next_step = next_step or (
+            "Run 'spec-kitty mission list' to see available missions, then "
+            f"re-run with a valid handle (attempted: '{handle}')."
+        )
+        super().__init__(f"Mission not found: '{handle}'")
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +960,8 @@ def _is_wp_iteration_step(step_id: str) -> bool:
 def _finalized_task_board_override_step(
     feature_dir: Path,
     progress: dict[str, int | float] | None,
+    *,
+    status_dir: Path | None = None,
 ) -> str | None:
     """Return the next step implied by finalized WP state, if available.
 
@@ -846,15 +977,15 @@ def _finalized_task_board_override_step(
     if not (feature_dir / "tasks.md").is_file() or not (feature_dir / "tasks").is_dir():
         return None
 
-    if _find_first_wp_by_lane(feature_dir, "planned") is not None:
+    if _find_first_wp_by_lane(feature_dir, "planned", status_dir=status_dir) is not None:
         return "implement"
-    if _find_first_wp_by_lane(feature_dir, "claimed") is not None:
+    if _find_first_wp_by_lane(feature_dir, "claimed", status_dir=status_dir) is not None:
         return "implement"
-    if _find_first_wp_by_lane(feature_dir, "in_progress") is not None:
+    if _find_first_wp_by_lane(feature_dir, "in_progress", status_dir=status_dir) is not None:
         return "implement"
-    if _find_first_wp_by_lane(feature_dir, "for_review") is not None:
+    if _find_first_wp_by_lane(feature_dir, "for_review", status_dir=status_dir) is not None:
         return "review"
-    if _find_first_wp_by_lane(feature_dir, "in_review") is not None:
+    if _find_first_wp_by_lane(feature_dir, "in_review", status_dir=status_dir) is not None:
         return "blocked:review_in_progress"
 
     done = int(progress.get("done_wps", 0) or 0)
@@ -1793,7 +1924,7 @@ def _advance_run_state_after_composition(
     #     just completed (avoid duplicate emit on re-poll).
     issued_step_id = snapshot.issued_step_id
     pending_decisions = dict(snapshot.pending_decisions)
-    if decision.kind == "step" and decision.step_id:
+    if decision.kind == DecisionKind.step and decision.step_id:
         issued_step_id = decision.step_id
         si_actor = RuntimeActorIdentity(actor_id=agent, actor_type="llm")
         si_payload = NextStepIssuedPayload(
@@ -1804,7 +1935,7 @@ def _advance_run_state_after_composition(
         )
         _append_event(run_dir, NEXT_STEP_ISSUED, si_payload.model_dump(mode="json"))
         sync_emitter.emit_next_step_issued(si_payload)
-    elif decision.kind == "decision_required" and decision.decision_id:
+    elif decision.kind == DecisionKind.decision_required and decision.decision_id:
         # Persist input-keyed decisions in pending_decisions so they're
         # answerable; only emit + persist on first occurrence to avoid
         # duplicates on re-poll. Mirrors engine.next_step's branch verbatim
@@ -1834,7 +1965,7 @@ def _advance_run_state_after_composition(
                 run_dir, DECISION_INPUT_REQUESTED, dr_payload.model_dump(mode="json")
             )
             sync_emitter.emit_decision_input_requested(dr_payload)
-    elif decision.kind == "terminal" and did_complete_step:
+    elif decision.kind == DecisionKind.terminal and did_complete_step:
         policy, _source_map, policy_error = _resolve_retrospective_policy_for_runtime(repo_root)
         retrospective_enabled = bool(getattr(policy, "enabled", False))
         block_on_retrospective = _retrospective_blocks_completion(policy)
@@ -2026,7 +2157,7 @@ def _runtime_template_key(mission_type: str, repo_root: Path) -> str:
     builtin_tier = list(context.builtin_roots)
     tiers = (
         project_tiers + [builtin_tier, global_tier]
-        if mission_type == "software-dev"
+        if mission_type == MISSION_TYPE_SOFTWARE_DEV
         else project_tiers + [global_tier, builtin_tier]
     )
 
@@ -2353,13 +2484,31 @@ def _build_operational_context_for_decision(
 
 
 def _resolve_runtime_feature_dir(repo_root: Path, mission_slug: str) -> Path:
-    """Resolve a mission dir for runtime reads without importing CLI context."""
-    from specify_cli.lanes.branch_naming import mid8_from_slug as _mid8_from_slug
-    from specify_cli.mission_read_path import (
-        resolve_mission_read_path as _resolve_read_path,
+    """Resolve a mission dir for runtime reads without importing CLI context.
+
+    Routes through the single guarded read-side seam
+    (:func:`resolve_handle_to_read_path`, WP01/IC-01): it reads the PRIMARY
+    ``meta.json``, runs the ONE sanctioned mid8 cascade (``resolve_declared_mid8``)
+    and returns the existence-gated topology-aware dir — folding away the bespoke
+    ``_resolve_mission_ulid`` → ``resolve_mid8`` cascade here (FR-002, C-007).
+
+    Boundary-safe fold-in (C-007): ``runtime_bridge`` already imports
+    ``specify_cli.missions._read_path_resolver`` (see ``_primary_runtime_feature_dir``
+    at module top), so consuming ``resolve_handle_to_read_path`` from the same
+    module adds NO new package-boundary edge.
+
+    Subsumption note (T013): the retired body derived ``mid8`` as
+    ``resolve_mid8(slug, mission_id=<declared ULID or None>)`` — exactly tier 2 of
+    the seam's ``resolve_declared_mid8``. The seam additionally honours an explicit
+    declared ``meta.mid8`` (tier 1) before that and the ``mid8_from_slug`` heuristic
+    (tier 3) after, so it resolves the SAME dir for any meta the old body handled
+    while also covering the explicit-mid8 case the old body silently skipped.
+    """
+    from specify_cli.missions._read_path_resolver import (
+        resolve_handle_to_read_path as _resolve_handle,
     )
 
-    return _resolve_read_path(repo_root, mission_slug, _mid8_from_slug(mission_slug))
+    return _resolve_handle(repo_root, mission_slug)
 
 
 def decide_next_via_runtime(  # noqa: C901
@@ -2815,7 +2964,7 @@ def decide_next_via_runtime(  # noqa: C901
             origin=origin,
         )
 
-    if block_on_retrospective and runtime_decision.kind == "terminal":
+    if block_on_retrospective and runtime_decision.kind == DecisionKind.terminal:
         mission_id = _resolve_mission_id_for_terminus(feature_dir)
         try:
             if policy_error is not None:
@@ -2874,7 +3023,7 @@ def decide_next_via_runtime(  # noqa: C901
     if (
         retrospective_enabled
         and not block_on_retrospective
-        and runtime_decision.kind == "terminal"
+        and runtime_decision.kind == DecisionKind.terminal
     ):
         mission_id = _resolve_mission_id_for_terminus(feature_dir)
         _run_retrospective_learning_capture(
@@ -2905,7 +3054,7 @@ def _build_finalized_override_query_decision(
     now: str,
     progress: dict | None,
     emitted_run_id: str | None,
-    feature_dir: Path,
+    repo_root: Path,
     finalized_override: str,
 ) -> Decision:
     override_wp_id: str | None = None
@@ -2922,9 +3071,14 @@ def _build_finalized_override_query_decision(
         preview_step = finalized_override
         reason = None
         if finalized_override == "implement":
+            from mission_runtime import MissionArtifactKind, mission_context_for
             from runtime.next.discovery import preview_claimable_wp
 
-            preview = preview_claimable_wp(feature_dir)
+            mission_context = mission_context_for(repo_root, mission_slug)
+            preview = preview_claimable_wp(
+                mission_context.artifact(MissionArtifactKind.WORK_PACKAGE_TASK).read_dir,
+                status_dir=mission_context.artifact(MissionArtifactKind.STATUS_STATE).read_dir,
+            )
             override_wp_id = preview.wp_id
             if preview.wp_id is None and preview.selection_reason is not None:
                 reason = preview.selection_reason
@@ -3012,9 +3166,9 @@ def _build_runtime_query_decision(
 ) -> Decision:
     mission_state = runtime_decision.step_id or "unknown"
     blocked_reason: str | None = None
-    if runtime_decision.kind == "terminal":
+    if runtime_decision.kind == DecisionKind.terminal:
         mission_state = "done"
-    elif runtime_decision.kind == "blocked":
+    elif runtime_decision.kind == DecisionKind.blocked:
         mission_state = snapshot.issued_step_id or runtime_decision.step_id or "blocked"
         blocked_reason = snapshot.blocked_reason or getattr(runtime_decision, "reason", None)
     return Decision(
@@ -3032,7 +3186,7 @@ def _build_runtime_query_decision(
     )
 
 
-def query_current_state(  # noqa: C901
+def query_current_state(
     agent: str | None,
     mission_slug: str,
     repo_root: Path,
@@ -3047,43 +3201,43 @@ def query_current_state(  # noqa: C901
         mission_slug: Mission slug (e.g. '069-planning-pipeline-integrity').
         repo_root: Repository root path.
     """
-    from mission_runtime import ActionContextError, resolve_action_context
+    from mission_runtime import ActionContextError, MissionArtifactKind, mission_context_for
 
     now = datetime.now(UTC).isoformat()
     try:
-        _ctx = resolve_action_context(
-            repo_root,
-            action="tasks",
-            feature=mission_slug,
-        )
-        feature_dir = Path(_ctx.feature_dir)
-    except ActionContextError:
-        # Mission directory not found — return not-found Decision immediately.
-        return Decision(
-            kind=DecisionKind.query,
-            agent=agent,
-            mission_slug=mission_slug,
-            mission="unknown",
-            mission_state="unknown",
-            timestamp=now,
-            is_query=True,
-            reason=None,
-        )
+        mission_context = mission_context_for(repo_root, mission_slug)
+        mission_slug = mission_context.mission_slug
+    except ActionContextError as exc:
+        # FR-001 / C-IC02: pass a typed *read-path* error through VERBATIM. The
+        # resolver already produced the precise code (e.g.
+        # COORDINATION_BRANCH_DELETED / STATUS_READ_PATH_NOT_FOUND) plus the real
+        # read-path remediation; collapsing it into a generic MISSION_NOT_FOUND
+        # ("run mission list") points the operator the wrong way (the mission is
+        # not missing — its read path is broken; the disease #15). The command
+        # layer surfaces ``exc.code`` + checked paths from the typed error.
+        # (Earlier this raised ``MissionNotFoundError`` for ALL ActionContextError
+        # and mis-attributed the collapse to FR-004 / WP03; that attribution was
+        # stale — the next-family collapse is owned by THIS WP.)
+        if _is_read_path_error(exc):
+            raise
+        # A genuinely-missing mission (e.g. FEATURE_CONTEXT_UNRESOLVED — no mission
+        # directory at all) is legitimately MISSION_NOT_FOUND (FR-004 / WP03).
+        raise MissionNotFoundError(mission_slug) from exc
 
-    if not feature_dir.is_dir():
-        return Decision(
-            kind=DecisionKind.query,
-            agent=agent,
-            mission_slug=mission_slug,
-            mission="unknown",
-            mission_state="unknown",
-            timestamp=now,
-            is_query=True,
-            reason=None,
-        )
+    task_board = mission_context.artifact(MissionArtifactKind.WORK_PACKAGE_TASK)
+    status_state = mission_context.artifact(MissionArtifactKind.STATUS_STATE)
 
-    mission_type = get_mission_type(feature_dir)
-    progress = _compute_wp_progress(feature_dir)
+    if not task_board.read_dir.is_dir():
+        # Conscious decision (C-IC02): reaching here means the resolver RESOLVED
+        # a directory and verified it ``exists()`` (see resolution.py), yet it is
+        # not a directory on disk — i.e. the canonical mission dir name resolved
+        # to a regular file. That is a genuinely malformed / missing mission, not
+        # a read-path topology miss, so ``MISSION_NOT_FOUND`` is the correct,
+        # deliberately-kept classification here (NOT a read-path collapse).
+        raise MissionNotFoundError(mission_slug)
+
+    mission_type = mission_context.mission_type
+    progress = _compute_wp_progress(task_board.read_dir, status_dir=status_state.read_dir)
 
     run_ref = _existing_run_ref(mission_slug, repo_root, mission_type)
     ephemeral_run_store: Path | None = None
@@ -3131,7 +3285,11 @@ def query_current_state(  # noqa: C901
         if ephemeral_run_store is None:
             emitted_run_id = getattr(run_ref, "run_id", None)
 
-        finalized_override = _finalized_task_board_override_step(feature_dir, progress)
+        finalized_override = _finalized_task_board_override_step(
+            task_board.read_dir,
+            progress,
+            status_dir=status_state.read_dir,
+        )
         if finalized_override is not None:
             return _build_finalized_override_query_decision(
                 agent=agent,
@@ -3140,12 +3298,12 @@ def query_current_state(  # noqa: C901
                 now=now,
                 progress=progress,
                 emitted_run_id=emitted_run_id,
-                feature_dir=feature_dir,
+                repo_root=repo_root,
                 finalized_override=finalized_override,
             )
 
         if not snapshot.completed_steps and not snapshot.pending_decisions and not snapshot.decisions:
-            if runtime_decision.kind in {"step", "decision_required"} and runtime_decision.step_id:
+            if runtime_decision.kind in {DecisionKind.step, DecisionKind.decision_required} and runtime_decision.step_id:
                 return _build_initial_query_decision(
                     runtime_decision=runtime_decision,
                     agent=agent,
@@ -3212,15 +3370,21 @@ def answer_decision_via_runtime(
         )
         feature_dir = Path(_ctx.feature_dir)
     except ActionContextError as exc:
+        # FR-001 / C-IC02: preserve the typed read-path error IDENTICALLY on the
+        # decision-answer path (the same fidelity obligation as the query path).
+        # Collapsing it into a generic "not found" MissionRuntimeError would drop
+        # ``exc.code`` (e.g. COORDINATION_BRANCH_DELETED) and the read-path
+        # remediation, mis-routing the operator. Log the context, then re-raise
+        # the typed ActionContextError so the command layer surfaces its code.
         logger.warning(
-            "answer_decision_via_runtime: mission %r not found in repo %s — cannot answer decision %r",
+            "answer_decision_via_runtime: read-path error (%s) for mission %r in "
+            "repo %s — cannot answer decision %r",
+            exc.code,
             mission_slug,
             repo_root,
             decision_id,
         )
-        raise MissionRuntimeError(
-            f"Mission {mission_slug!r} not found; cannot answer decision {decision_id!r}"
-        ) from exc
+        raise
     if not feature_dir.is_dir():
         logger.warning(
             "answer_decision_via_runtime: mission %r resolved to missing dir %s — cannot answer decision %r",
@@ -3404,7 +3568,7 @@ def _map_runtime_decision(
     step_id = decision.step_id
     run_id = decision.run_id
 
-    if decision.kind == "terminal":
+    if decision.kind == DecisionKind.terminal:
         return Decision(
             kind=DecisionKind.terminal,
             agent=agent,
@@ -3419,7 +3583,7 @@ def _map_runtime_decision(
             step_id=step_id,
         )
 
-    if decision.kind == "blocked":
+    if decision.kind == DecisionKind.blocked:
         return Decision(
             kind=DecisionKind.blocked,
             agent=agent,
@@ -3434,7 +3598,7 @@ def _map_runtime_decision(
             step_id=step_id,
         )
 
-    if decision.kind == "decision_required":
+    if decision.kind == DecisionKind.decision_required:
         prompt_file = None
         if decision.question:
             from runtime.next.prompt_builder import build_decision_prompt

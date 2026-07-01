@@ -86,6 +86,7 @@ import pytest
 
 pytestmark = [pytest.mark.unit, pytest.mark.git_repo]
 
+
 def _repo_root() -> pathlib.Path:
     """Locate the worktree root by walking up from this test file."""
     return pathlib.Path(__file__).resolve().parents[2]
@@ -201,14 +202,8 @@ async def test_websocket_client_connect_failure_routes_diagnostics_to_stderr(
             with pytest.raises(type(exc_to_raise)):
                 await ws_client.connect()
             captured = capsys.readouterr()
-            assert captured.out == "", (
-                f"[{label}] stdout must remain empty during sync failures; "
-                f"got: {captured.out!r}"
-            )
-            assert expected_substring in captured.err, (
-                f"[{label}] expected diagnostic on stderr; "
-                f"stderr={captured.err!r}"
-            )
+            assert captured.out == "", f"[{label}] stdout must remain empty during sync failures; got: {captured.out!r}"
+            assert expected_substring in captured.err, f"[{label}] expected diagnostic on stderr; stderr={captured.err!r}"
             assert ws_client.connected is False
             assert ws_client.status == client_module.ConnectionStatus.OFFLINE
 
@@ -227,14 +222,8 @@ async def test_websocket_client_connect_failure_routes_diagnostics_to_stderr(
         with pytest.raises(RuntimeError):
             await ws_client.connect()
         captured = capsys.readouterr()
-        assert captured.out == "", (
-            "[ws-connect-failure] stdout must remain empty; "
-            f"got: {captured.out!r}"
-        )
-        assert "Sync WebSocket connection failed" in captured.err, (
-            f"[ws-connect-failure] expected stderr diagnostic; "
-            f"stderr={captured.err!r}"
-        )
+        assert captured.out == "", f"[ws-connect-failure] stdout must remain empty; got: {captured.out!r}"
+        assert "Sync WebSocket connection failed" in captured.err, f"[ws-connect-failure] expected stderr diagnostic; stderr={captured.err!r}"
     finally:
         logger.handlers.clear()
         for handler in prior_handlers:
@@ -248,13 +237,20 @@ async def test_websocket_client_connect_failure_routes_diagnostics_to_stderr(
 # ---------------------------------------------------------------------------
 
 
-def _seed_shared_only_session(fake_home: pathlib.Path) -> None:
-    """Write a real encrypted ``StoredSession`` (shared team only) under ``fake_home``.
+def _seed_shared_only_session(auth_dir: pathlib.Path) -> None:
+    """Write a real encrypted ``StoredSession`` (shared team only) into ``auth_dir``.
 
-    The session lands at ``fake_home/.spec-kitty/auth/session.json``,
-    which is exactly where the production ``FileFallbackStorage``
-    resolves via ``Path.home() / ".spec-kitty" / "auth"`` when
-    ``HOME=fake_home`` is set in the subprocess.
+    ``auth_dir`` MUST be the directory the production auth store reads in
+    the subprocess, i.e. the value returned by
+    ``specify_cli.auth.secure_storage.file_fallback.default_store_dir``
+    (``get_runtime_root().base / "auth"``) evaluated with the subprocess's
+    ``SPEC_KITTY_HOME``. Since #2182 (commit ``a75174917``) the auth store
+    is resolved via ``SPEC_KITTY_HOME`` -- ``$SPEC_KITTY_HOME/auth`` -- and
+    is no longer derived from ``Path.home() / ".spec-kitty" / "auth"``.
+    The caller (:func:`_build_isolated_home`) derives ``auth_dir`` from the
+    production resolver so a future change there surfaces as a RED
+    seed-vs-read mismatch rather than silently re-breaking this test (the
+    #2254 drift class).
 
     The session deliberately has only a non-Private team so the
     ingress-resolver path inside the CLI:
@@ -275,7 +271,6 @@ def _seed_shared_only_session(fake_home: pathlib.Path) -> None:
     from specify_cli.auth.secure_storage.file_fallback import FileFallbackStorage
     from specify_cli.auth.session import StoredSession, Team
 
-    auth_dir = fake_home / ".spec-kitty" / "auth"
     auth_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(UTC)
@@ -312,11 +307,14 @@ def _build_isolated_home(tmp_path: pathlib.Path) -> dict[str, str]:
     """Construct env overrides that wall the subprocess off from real auth state.
 
     Sets ``HOME``, ``XDG_CONFIG_HOME``, and ``SPEC_KITTY_HOME`` to fresh
-    tmp directories so the CLI's auth lookups (``~/.spec-kitty/auth``)
-    and runtime cache (``~/.kittify/``) cannot touch the developer's
-    real files. Enables the sync gate so the sync layer attempts its
-    work. Pins ``SPEC_KITTY_SAAS_URL`` to an unreachable host so the
-    rehydrate path fails fast and emits the structured diagnostic
+    tmp directories so the CLI's auth lookups and runtime cache cannot
+    touch the developer's real files. Since #2182 the auth store is
+    resolved via ``SPEC_KITTY_HOME`` (``$SPEC_KITTY_HOME/auth``), so the
+    encrypted session is seeded into the directory the production resolver
+    returns under that ``SPEC_KITTY_HOME`` -- not the legacy
+    ``HOME/.spec-kitty/auth`` path. Enables the sync gate so the sync layer
+    attempts its work. Pins ``SPEC_KITTY_SAAS_URL`` to an unreachable host
+    so the rehydrate path fails fast and emits the structured diagnostic
     rather than hanging on a real network call.
     """
     fake_home = tmp_path / "fake-home"
@@ -326,7 +324,19 @@ def _build_isolated_home(tmp_path: pathlib.Path) -> dict[str, str]:
     fake_kittify = fake_home / ".kittify"
     fake_kittify.mkdir(parents=True, exist_ok=True)
 
-    _seed_shared_only_session(fake_home)
+    # Seed the encrypted session where production will actually read it.
+    # Anchor to the production resolver (default_store_dir ->
+    # get_runtime_root().base / "auth") evaluated under the subprocess's
+    # SPEC_KITTY_HOME, rather than reconstructing the path by hand -- so any
+    # future change to the resolver surfaces here as a RED seed-vs-read
+    # mismatch instead of silently re-introducing the #2254 drift.
+    from unittest.mock import patch
+
+    from specify_cli.auth.secure_storage.file_fallback import default_store_dir
+
+    with patch.dict(os.environ, {"SPEC_KITTY_HOME": str(fake_kittify)}):
+        auth_dir = default_store_dir()
+    _seed_shared_only_session(auth_dir)
 
     return {
         "HOME": str(fake_home),
@@ -352,9 +362,7 @@ def _augment_pythonpath(env: dict[str, str]) -> dict[str, str]:
     """
     src_dir = str(_worktree_src())
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        src_dir + os.pathsep + existing if existing else src_dir
-    )
+    env["PYTHONPATH"] = src_dir + os.pathsep + existing if existing else src_dir
     return env
 
 
@@ -382,6 +390,29 @@ def _run_cli_isolated(
         cwd=str(cwd),
         timeout=60,
     )
+
+
+def _stop_isolated_sync_daemon(env_overrides: Mapping[str, str]) -> None:
+    """Stop any sync daemon started inside the isolated subprocess home."""
+    env = os.environ.copy()
+    env.update(env_overrides)
+    env = _augment_pythonpath(env)
+    script = (
+        "from specify_cli.sync.daemon import stop_sync_daemon\n"
+        "ok, message = stop_sync_daemon(timeout=5.0)\n"
+        "print(message)\n"
+        "raise SystemExit(0 if ok or message == 'No sync daemon metadata found.' else 1)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(pathlib.Path(env_overrides["HOME"])),
+        timeout=15,
+    )
+    assert result.returncode == 0, f"isolated sync daemon cleanup failed.\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
 
 
 def _resolve_in_tree_specify_cli(env_overrides: Mapping[str, str]) -> pathlib.Path:
@@ -459,9 +490,7 @@ def test_agent_tasks_status_json_strict_with_sync_enabled_isolated(
     resolved_path = _resolve_in_tree_specify_cli(env_overrides)
     worktree_src = _worktree_src().resolve()
     assert resolved_path.is_relative_to(worktree_src), (
-        f"subprocess resolved specify_cli at {resolved_path}, "
-        f"expected a path under {worktree_src}. "
-        f"PYTHONPATH override is not taking effect."
+        f"subprocess resolved specify_cli at {resolved_path}, expected a path under {worktree_src}. PYTHONPATH override is not taking effect."
     )
 
     # `agent tasks status` refuses early on detached HEAD; GitHub's
@@ -472,12 +501,15 @@ def test_agent_tasks_status_json_strict_with_sync_enabled_isolated(
     # duration of the subprocess invocation and restore the original
     # ref afterwards. The git tree itself is unchanged — only the
     # symbolic ref moves.
-    prior_head = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "HEAD"],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-    ).stdout.strip() or None
+    prior_head = (
+        subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        or None
+    )
     if prior_head is None:
         prior_head_sha = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -496,18 +528,21 @@ def test_agent_tasks_status_json_strict_with_sync_enabled_isolated(
         prior_head_sha = None
 
     try:
-        result = _run_cli_isolated(
-            [
-                "agent",
-                "tasks",
-                "status",
-                "--mission",
-                "private-teamspace-ingress-safeguards-01KQH03Y",
-                "--json",
-            ],
-            env_overrides=env_overrides,
-            cwd=repo,
-        )
+        try:
+            result = _run_cli_isolated(
+                [
+                    "agent",
+                    "tasks",
+                    "status",
+                    "--mission",
+                    "private-teamspace-ingress-safeguards-01KQH03Y",
+                    "--json",
+                ],
+                env_overrides=env_overrides,
+                cwd=repo,
+            )
+        finally:
+            _stop_isolated_sync_daemon(env_overrides)
     finally:
         if prior_head_sha is not None:
             # Restore detached HEAD pointing at the original commit so the
@@ -534,9 +569,7 @@ def test_agent_tasks_status_json_strict_with_sync_enabled_isolated(
     # NFR-003: stdout must round-trip through json.loads as a single
     # JSON document. Any leaked diagnostic text would break this.
     parsed = json.loads(result.stdout)
-    assert isinstance(parsed, dict), (
-        f"expected top-level JSON object, got {type(parsed).__name__}"
-    )
+    assert isinstance(parsed, dict), f"expected top-level JSON object, got {type(parsed).__name__}"
 
     # FR-009: no sync-diagnostic emoji or prose on stdout.
     assert "Connection failed" not in result.stdout
@@ -548,9 +581,7 @@ def test_agent_tasks_status_json_strict_with_sync_enabled_isolated(
     # the subprocess must not have touched the real user's home.
     real_home = pathlib.Path(os.path.expanduser("~"))
     fake_home = pathlib.Path(env_overrides["HOME"]).resolve()
-    assert real_home.resolve() != fake_home, (
-        "fake home must differ from real home - fixture invariant"
-    )
+    assert real_home.resolve() != fake_home, "fake home must differ from real home - fixture invariant"
 
 
 @pytest.mark.slow
@@ -595,10 +626,7 @@ def test_sync_diagnostic_emits_to_stderr_with_strict_json_command(
     # Pre-flight: prove in-tree package will win.
     resolved_path = _resolve_in_tree_specify_cli(env_overrides)
     worktree_src = _worktree_src().resolve()
-    assert resolved_path.is_relative_to(worktree_src), (
-        f"subprocess resolved specify_cli at {resolved_path}, "
-        f"expected under {worktree_src}"
-    )
+    assert resolved_path.is_relative_to(worktree_src), f"subprocess resolved specify_cli at {resolved_path}, expected under {worktree_src}"
 
     # The Python script that exercises the resolver and emits strict
     # JSON afterwards. We attach a stderr handler to the sync._team
@@ -635,10 +663,7 @@ def test_sync_diagnostic_emits_to_stderr_with_strict_json_command(
         timeout=60,
     )
 
-    assert proc.returncode == 0, (
-        "diagnostic-path probe must exit 0 (FR-010 local-success).\n"
-        f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
-    )
+    assert proc.returncode == 0, f"diagnostic-path probe must exit 0 (FR-010 local-success).\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
 
     # NFR-003: stdout is strict JSON.
     parsed = json.loads(proc.stdout)
@@ -646,9 +671,7 @@ def test_sync_diagnostic_emits_to_stderr_with_strict_json_command(
     assert parsed.get("result") == "success"
     # The resolver must return None for a shared-only session after a
     # failed rehydrate -- the whole point of FR-002.
-    assert parsed.get("team_id") is None, (
-        f"expected team_id=None for shared-only session, got {parsed!r}"
-    )
+    assert parsed.get("team_id") is None, f"expected team_id=None for shared-only session, got {parsed!r}"
 
     # FR-009: no diagnostic prose on stdout.
     assert "direct ingress skipped" not in proc.stdout
@@ -658,10 +681,7 @@ def test_sync_diagnostic_emits_to_stderr_with_strict_json_command(
     # Cycle-2 fix: prove the diagnostic path actually fired. Without
     # this assertion the test could silently fall through the
     # ``get_current_session() is None`` branch and look passing.
-    diagnostic_present = (
-        "direct ingress skipped" in proc.stderr
-        or "direct_ingress_missing_private_team" in proc.stderr
-    )
+    diagnostic_present = "direct ingress skipped" in proc.stderr or "direct_ingress_missing_private_team" in proc.stderr
     assert diagnostic_present, (
         "expected 'direct ingress skipped' / "
         "'direct_ingress_missing_private_team' on stderr after seeding "
@@ -686,9 +706,7 @@ def _scaffold_minimal_kittify_repo(repo_root: pathlib.Path) -> None:
     ``agents.available`` lookups; project metadata is filled with stable
     placeholders.
     """
-    subprocess.run(
-        ["git", "init", "-q"], cwd=repo_root, check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "-q"], cwd=repo_root, check=True, capture_output=True)
     subprocess.run(
         [
             "git",
@@ -710,14 +728,7 @@ def _scaffold_minimal_kittify_repo(repo_root: pathlib.Path) -> None:
     kittify.mkdir(parents=True, exist_ok=True)
     (repo_root / "kitty-specs").mkdir(parents=True, exist_ok=True)
     (kittify / "config.yaml").write_text(
-        "vcs:\n"
-        "  type: git\n"
-        "agents:\n"
-        "  available:\n"
-        "  - claude\n"
-        "project:\n"
-        "  uuid: 00000000-0000-0000-0000-000000000000\n"
-        "  slug: ac006-test\n",
+        "vcs:\n  type: git\nagents:\n  available:\n  - claude\nproject:\n  uuid: 00000000-0000-0000-0000-000000000000\n  slug: ac006-test\n",
         encoding="utf-8",
     )
 
@@ -776,22 +787,22 @@ def test_mission_create_json_strict_when_sync_skips_ingress(
     # install -- same guard as the cycle-2 tasks-status test.
     resolved_path = _resolve_in_tree_specify_cli(env_overrides)
     worktree_src = _worktree_src().resolve()
-    assert resolved_path.is_relative_to(worktree_src), (
-        f"subprocess resolved specify_cli at {resolved_path}, "
-        f"expected under {worktree_src}"
-    )
+    assert resolved_path.is_relative_to(worktree_src), f"subprocess resolved specify_cli at {resolved_path}, expected under {worktree_src}"
 
-    result = _run_cli_isolated(
-        [
-            "agent",
-            "mission",
-            "create",
-            "ac-006-smoke",
-            "--json",
-        ],
-        env_overrides=env_overrides,
-        cwd=repo_root,
-    )
+    try:
+        result = _run_cli_isolated(
+            [
+                "agent",
+                "mission",
+                "create",
+                "ac-006-smoke",
+                "--json",
+            ],
+            env_overrides=env_overrides,
+            cwd=repo_root,
+        )
+    finally:
+        _stop_isolated_sync_daemon(env_overrides)
 
     assert result.returncode == 0, (
         "agent mission create --json must succeed even when sync ingress "
@@ -802,29 +813,17 @@ def test_mission_create_json_strict_when_sync_skips_ingress(
 
     # NFR-003 / AC-006: stdout is a single JSON document.
     parsed = json.loads(result.stdout)
-    assert isinstance(parsed, dict), (
-        f"expected top-level JSON object, got {type(parsed).__name__}"
-    )
-    assert parsed.get("result") == "success", (
-        f"expected result=success in payload, got: {parsed!r}"
-    )
-    assert "mission_slug" in parsed, (
-        f"expected mission_slug field in payload, got keys: "
-        f"{sorted(parsed.keys())!r}"
-    )
+    assert isinstance(parsed, dict), f"expected top-level JSON object, got {type(parsed).__name__}"
+    assert parsed.get("result") == "success", f"expected result=success in payload, got: {parsed!r}"
+    assert "mission_slug" in parsed, f"expected mission_slug field in payload, got keys: {sorted(parsed.keys())!r}"
 
     # FR-009: no sync diagnostic prose on stdout.
-    assert "Connection failed" not in result.stdout, (
-        f"sync diagnostic leaked onto stdout: {result.stdout!r}"
-    )
+    assert "Connection failed" not in result.stdout, f"sync diagnostic leaked onto stdout: {result.stdout!r}"
     assert "direct ingress skipped" not in result.stdout
     assert "direct_ingress_missing_private_team" not in result.stdout
 
     # Prove the diagnostic path actually fired: same guard as cycle-2.
-    diagnostic_present = (
-        "direct ingress skipped" in result.stderr
-        or "direct_ingress_missing_private_team" in result.stderr
-    )
+    diagnostic_present = "direct ingress skipped" in result.stderr or "direct_ingress_missing_private_team" in result.stderr
     assert diagnostic_present, (
         "expected 'direct ingress skipped' or "
         "'direct_ingress_missing_private_team' on stderr; without this "
@@ -832,6 +831,23 @@ def test_mission_create_json_strict_when_sync_skips_ingress(
         "from a no-op early-exit.\n"
         f"stderr={result.stderr!r}"
     )
+
+    # Non-vacuous proof the seeded session actually LOADED (the #2254 drift
+    # class): the genuine ingress-skip path above fires only when an
+    # authenticated session is present. If the session were invisible again
+    # (seed dir drifting from the production read path), sync would instead
+    # fall through to the unauthenticated final_sync gate, whose diagnostic
+    # carries 'Not authenticated: no valid access token'. Assert that gate
+    # did NOT fire, so this test fails loudly on a recurrence rather than
+    # passing for the wrong reason.
+    assert "no valid access token" not in result.stderr, (
+        "sync fell through to the unauthenticated final_sync gate -- the "
+        "seeded session did not load (the #2254 drift class). The "
+        "ingress-skip diagnostic above is not proof of a working contract "
+        "if auth silently failed.\n"
+        f"stderr={result.stderr!r}"
+    )
+    assert "Not authenticated" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -865,8 +881,6 @@ def test_no_print_calls_in_sync_client() -> None:
         if pattern.search(line):
             offenders.append((lineno, stripped))
 
-    assert not offenders, (
-        "print() calls detected in src/specify_cli/sync/client.py - "
-        "route through logging instead.\n"
-        + "\n".join(f"  client.py:{ln}  {src}" for ln, src in offenders)
+    assert not offenders, "print() calls detected in src/specify_cli/sync/client.py - route through logging instead.\n" + "\n".join(
+        f"  client.py:{ln}  {src}" for ln, src in offenders
     )

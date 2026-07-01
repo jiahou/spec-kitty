@@ -38,6 +38,11 @@ import ulid
 from rich.console import Console
 
 from specify_cli.core.contract_gate import validate_outbound_payload
+from specify_cli.event_journal import (
+    CaptureGateState,
+    capture_teamspace_bound,
+    get_journal,
+)
 from specify_cli.mission_metadata import mission_number_from_slug
 from specify_cli.proof.events import (
     PROOF_EVENT_REQUIRED_FIELDS,
@@ -83,7 +88,8 @@ def _get_project_identity() -> ProjectIdentity:
     Uses lazy import to prevent circular dependency issues.
     Returns empty ProjectIdentity in non-project contexts.
     """
-    from .project_identity import ensure_identity, ProjectIdentity
+    from .project_identity import ProjectIdentity
+    from specify_cli.identity.project import resolve_identity
     from specify_cli.task_utils import find_repo_root, TaskCliError
 
     try:
@@ -92,13 +98,14 @@ def _get_project_identity() -> ProjectIdentity:
         # Non-project context; return empty identity to trigger queue-only
         return ProjectIdentity()
 
-    return ensure_identity(repo_root)
+    # Read/emit path: resolve identity WITHOUT persisting (#2263, FR-002/FR-003).
+    return resolve_identity(repo_root)
 
 
 def _create_git_resolver() -> GitMetadataResolver:
     """Lazily create GitMetadataResolver with repo root and config override."""
     from .git_metadata import GitMetadataResolver
-    from .project_identity import ensure_identity
+    from specify_cli.identity.project import resolve_identity
     from specify_cli.task_utils import find_repo_root, TaskCliError
 
     try:
@@ -107,7 +114,8 @@ def _create_git_resolver() -> GitMetadataResolver:
         # Non-project context; return resolver that will produce None values
         return GitMetadataResolver(repo_root=Path.cwd())
 
-    identity = ensure_identity(repo_root)
+    # Read/emit path: resolve identity WITHOUT persisting (#2263, FR-002/FR-003).
+    identity = resolve_identity(repo_root)
     return GitMetadataResolver(
         repo_root=repo_root,
         repo_slug_override=identity.repo_slug,
@@ -259,119 +267,118 @@ def _is_proof_subject(value: Any) -> bool:
     return subject_type in {"review", "pull_request"}
 
 
+_PROOF_ARTIFACT_REF_KINDS: frozenset[str] = frozenset(
+    {
+        "file",
+        "log",
+        "junit",
+        "coverage",
+        "report",
+        "url",
+        "commit",
+        "pull_request",
+        "benchmark",
+        "security_scan",
+        "other",
+    }
+)
+
+
+def _is_proof_artifact_ref(ref: Any) -> bool:
+    """Validate a single artifact-ref mapping."""
+    if not isinstance(ref, dict):
+        return False
+    if not isinstance(ref.get("uri"), str) or not ref.get("uri"):
+        return False
+    if ref.get("kind") not in _PROOF_ARTIFACT_REF_KINDS:
+        return False
+    sha256 = ref.get("sha256")
+    if sha256 is not None and not _is_sha256_hex(sha256):
+        return False
+    size_bytes = ref.get("size_bytes")
+    return not (size_bytes is not None and (not isinstance(size_bytes, int) or size_bytes < 0))
+
+
 def _is_proof_artifact_refs(value: Any) -> bool:
     if not isinstance(value, list) or len(value) > 20:
         return False
-    for ref in value:
-        if not isinstance(ref, dict):
-            return False
-        if not isinstance(ref.get("uri"), str) or not ref.get("uri"):
-            return False
-        if ref.get("kind") not in {
-            "file",
-            "log",
-            "junit",
-            "coverage",
-            "report",
-            "url",
-            "commit",
-            "pull_request",
-            "benchmark",
-            "security_scan",
-            "other",
-        }:
-            return False
-        sha256 = ref.get("sha256")
-        if sha256 is not None and not _is_sha256_hex(sha256):
-            return False
-        size_bytes = ref.get("size_bytes")
-        if size_bytes is not None and (not isinstance(size_bytes, int) or size_bytes < 0):
-            return False
-    return True
+    return all(_is_proof_artifact_ref(ref) for ref in value)
 
 
 def _is_hex_digest(value: Any) -> bool:
     return isinstance(value, str) and bool(_SHA256_HEX_RE.match(value))
 
 
+#: Validators shared by every proof event type.
+_BASE_PROOF_VALIDATORS: dict[str, Any] = {
+    "proof_schema_version": lambda v: v == PROOF_SCHEMA_VERSION,
+    "subject": _is_proof_subject,
+    "source": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
+    "actor": _is_proof_actor,
+    "confidence": _is_probability,
+    "occurred_at": _is_datetime_string,
+    "observed_at": _is_datetime_string,
+    "artifact_refs": _is_proof_artifact_refs,
+    "summary": lambda v: isinstance(v, dict),
+    "idempotency_key": _is_hex_digest,
+}
+
+#: Per-event-type extra validators merged on top of :data:`_BASE_PROOF_VALIDATORS`.
+_PROOF_EVENT_VALIDATORS: dict[str, dict[str, Any]] = {
+    "ProofItemRecorded": {
+        "proof_kind": lambda v: v in {"artifact", "claim", "observation", "note", "other"},
+    },
+    "ReviewProofRecorded": {
+        "review_kind": lambda v: v in {"code_review", "qa", "mission_review", "security_review", "other"},
+        "verdict": lambda v: v in {"approved", "changes_requested", "commented", "rejected", "unknown"},
+        "review_ref": _is_nullable_string,
+    },
+    "TestEvidenceCaptured": {
+        "test_command": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
+        "exit_code": lambda v: isinstance(v, int) and v >= 0,
+        "status": lambda v: v in {"passed", "failed", "error", "skipped"},
+        "runner": _is_nullable_string,
+        "cwd": _is_nullable_string,
+        "duration_ms": lambda v: isinstance(v, int) and v >= 0,
+        "total_tests": lambda v: isinstance(v, int) and v >= 0,
+        "passed_tests": lambda v: isinstance(v, int) and v >= 0,
+        "failed_tests": lambda v: isinstance(v, int) and v >= 0,
+        "skipped_tests": lambda v: isinstance(v, int) and v >= 0,
+        "failure_summary": _is_nullable_string,
+        "branch": _is_nullable_string,
+        "commit": _is_nullable_string,
+        "build_id": _is_nullable_string,
+    },
+    "BenchmarkEvidenceAttached": {
+        "benchmark_name": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
+        "benchmark_suite": _is_nullable_string,
+        "baseline_ref": _is_nullable_string,
+        "comparison_ref": _is_nullable_string,
+    },
+    "SecurityScanCompleted": {
+        "scanner": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
+        "status": lambda v: v in {"passed", "failed", "completed", "error"},
+        "findings_summary": lambda v: isinstance(v, dict),
+    },
+    "PullRequestLineageRecorded": {
+        "provider": lambda v: v in {"github", "gitlab", "bitbucket", "other"},
+        "repository": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
+        "pull_request_url": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
+        "pull_request_number": lambda v: isinstance(v, int) and v >= 1,
+        "base_ref": _is_nullable_string,
+        "head_ref": _is_nullable_string,
+    },
+    "HumanApprovalRecorded": {
+        "approver": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
+        "approval_status": lambda v: v in {"approved", "rejected", "requested_changes", "acknowledged"},
+        "approval_ref": _is_nullable_string,
+    },
+}
+
+
 def _proof_validators_for(event_type: str) -> dict[str, Any]:
-    validators: dict[str, Any] = {
-        "proof_schema_version": lambda v: v == PROOF_SCHEMA_VERSION,
-        "subject": _is_proof_subject,
-        "source": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
-        "actor": _is_proof_actor,
-        "confidence": _is_probability,
-        "occurred_at": _is_datetime_string,
-        "observed_at": _is_datetime_string,
-        "artifact_refs": _is_proof_artifact_refs,
-        "summary": lambda v: isinstance(v, dict),
-        "idempotency_key": _is_hex_digest,
-    }
-    if event_type == "ProofItemRecorded":
-        validators["proof_kind"] = lambda v: v in {"artifact", "claim", "observation", "note", "other"}
-    elif event_type == "ReviewProofRecorded":
-        validators.update(
-            {
-                "review_kind": lambda v: v in {"code_review", "qa", "mission_review", "security_review", "other"},
-                "verdict": lambda v: v in {"approved", "changes_requested", "commented", "rejected", "unknown"},
-                "review_ref": _is_nullable_string,
-            }
-        )
-    elif event_type == "TestEvidenceCaptured":
-        validators.update(
-            {
-                "test_command": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
-                "exit_code": lambda v: isinstance(v, int) and v >= 0,
-                "status": lambda v: v in {"passed", "failed", "error", "skipped"},
-                "runner": _is_nullable_string,
-                "cwd": _is_nullable_string,
-                "duration_ms": lambda v: isinstance(v, int) and v >= 0,
-                "total_tests": lambda v: isinstance(v, int) and v >= 0,
-                "passed_tests": lambda v: isinstance(v, int) and v >= 0,
-                "failed_tests": lambda v: isinstance(v, int) and v >= 0,
-                "skipped_tests": lambda v: isinstance(v, int) and v >= 0,
-                "failure_summary": _is_nullable_string,
-                "branch": _is_nullable_string,
-                "commit": _is_nullable_string,
-                "build_id": _is_nullable_string,
-            }
-        )
-    elif event_type == "BenchmarkEvidenceAttached":
-        validators.update(
-            {
-                "benchmark_name": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
-                "benchmark_suite": _is_nullable_string,
-                "baseline_ref": _is_nullable_string,
-                "comparison_ref": _is_nullable_string,
-            }
-        )
-    elif event_type == "SecurityScanCompleted":
-        validators.update(
-            {
-                "scanner": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
-                "status": lambda v: v in {"passed", "failed", "completed", "error"},
-                "findings_summary": lambda v: isinstance(v, dict),
-            }
-        )
-    elif event_type == "PullRequestLineageRecorded":
-        validators.update(
-            {
-                "provider": lambda v: v in {"github", "gitlab", "bitbucket", "other"},
-                "repository": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
-                "pull_request_url": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
-                "pull_request_number": lambda v: isinstance(v, int) and v >= 1,
-                "base_ref": _is_nullable_string,
-                "head_ref": _is_nullable_string,
-            }
-        )
-    elif event_type == "HumanApprovalRecorded":
-        validators.update(
-            {
-                "approver": lambda v: isinstance(v, str) and len(v.strip()) >= 1,
-                "approval_status": lambda v: v in {"approved", "rejected", "requested_changes", "acknowledged"},
-                "approval_ref": _is_nullable_string,
-            }
-        )
+    validators: dict[str, Any] = dict(_BASE_PROOF_VALIDATORS)
+    validators.update(_PROOF_EVENT_VALIDATORS.get(event_type, {}))
     return validators
 
 
@@ -852,7 +859,7 @@ class EventEmitter:
                 get_token_manager(),
                 endpoint="/api/v1/events/batch/",
             )
-        except Exception as exc:  # noqa: BLE001 — explicit "log and skip" boundary
+        except Exception as exc:
             import logging
 
             logging.getLogger(__name__).warning("emitter._get_team_slug: ingress resolver raised: %s", exc)
@@ -1634,7 +1641,7 @@ class EventEmitter:
                 event_type,
                 self._enrich_proof_subject(payload),
             )
-        except Exception as exc:  # noqa: BLE001 - producer contract preserves None-on-invalid
+        except Exception as exc:
             _console.print(f"[yellow]Warning: {event_type} payload validation failed: {exc}[/yellow]")
             return None
 
@@ -1879,6 +1886,69 @@ class EventEmitter:
 
         return None
 
+    def _capture_gate_state(self, team_slug: str | None) -> CaptureGateState:
+        """Snapshot the drain gates for the journal's blocked-reason audit (T017).
+
+        Defensive: any gate-read failure is treated as "blocked" so capture
+        still records a durable, audit-tagged row — it never raises and never
+        drops the fact (contract §2 bullet 3).
+        """
+        try:
+            saas_enabled = is_saas_sync_enabled()
+        except Exception:
+            saas_enabled = False
+        try:
+            checkout_enabled = is_sync_enabled_for_checkout()
+        except Exception:
+            checkout_enabled = False
+        try:
+            authenticated = self._is_authenticated()
+        except Exception:
+            authenticated = False
+        return CaptureGateState(
+            saas_enabled=saas_enabled,
+            checkout_enabled=checkout_enabled,
+            authenticated=authenticated,
+            team_slug=team_slug,
+        )
+
+    def _capture_to_journal(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        event: dict[str, Any],
+        occurred_at: str,
+        team_slug: str | None,
+    ) -> None:
+        """Capture-first durable write to the producer-scoped event journal.
+
+        Runs before every delivery gate so a Teamspace-bound fact survives even
+        when all gates block (FR-017, contract §2; SC-009). Producer-scoped,
+        never server-scoped (FR-003). A journal I/O error is warned but never
+        propagated — capture-first must not make emission fail.
+
+        The journal payload BLOB stores the **full wire envelope** (``event``),
+        not just the inner ``payload`` field. The dispatcher decodes this BLOB
+        verbatim and the receiver POSTs it as a per-event object, so every
+        contract-required envelope field (``event_id``, ``event_type``,
+        ``aggregate_id``, ``payload``, ``timestamp``, ``node_id``,
+        ``lamport_clock``, ``schema_version``) survives the capture→drain path.
+        The ``event_id``/``event_type`` journal columns still index the envelope.
+        """
+        try:
+            payload_bytes = json.dumps(event, sort_keys=True, default=str).encode("utf-8")
+            capture_teamspace_bound(
+                journal=get_journal(team_slug=team_slug),
+                event_id=event_id,
+                event_type=event_type,
+                payload=payload_bytes,
+                occurred_at=occurred_at,
+                gate=self._capture_gate_state(team_slug),
+            )
+        except Exception as exc:
+            _console.print(f"[yellow]Warning: event journal capture failed: {exc}[/yellow]")
+
     def _emit(
         self,
         event_type: str,
@@ -1957,6 +2027,20 @@ class EventEmitter:
             }
             if envelope_fields:
                 event.update(envelope_fields)
+
+            # Capture-first (FR-017, contract §2; SC-009): durably record the
+            # Teamspace-bound fact in the producer-scoped event journal BEFORE
+            # any delivery gate (validation, contract gate, project routing,
+            # WebSocket, drain) can decide whether to ship it. The journal write
+            # is unconditional; the gates only set the recorded
+            # drain_blocked_reason, never whether the durable write happens.
+            self._capture_to_journal(
+                event_id=event_id,
+                event_type=event_type,
+                event=event,
+                occurred_at=str(event["timestamp"]),
+                team_slug=team_slug,
+            )
 
             # Validate event structure and payload. Validation tolerates
             # team_slug=None for pending-routing events (issue #1072).

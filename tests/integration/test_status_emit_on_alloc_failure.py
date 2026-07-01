@@ -27,9 +27,15 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture(autouse=True)
 def _disable_status_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the test hermetic; the fixture targets protected ``main``.
+
+    The documented operator escape hatch is the ONE sanctioned waiver for
+    status commits on a protected branch (``SPEC_KITTY_TEST_MODE`` no longer
+    waives the pre-check — PR #1850 guard-bypass fix).
+    """
     import specify_cli.status.emit as status_emit
 
-    monkeypatch.setenv("SPEC_KITTY_TEST_MODE", "1")
+    monkeypatch.setenv("SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS", "1")
     monkeypatch.setattr(status_emit, "_saas_fan_out", lambda *args, **kwargs: None)
     monkeypatch.setattr(status_emit, "fire_dossier_sync", lambda *args, **kwargs: None)
 
@@ -164,7 +170,7 @@ def test_implement_blocks_without_claiming_when_alloc_fails(
         mock_ensure_vcs.return_value = MagicMock(value="git")
 
         with pytest.raises(typer.Exit):
-            implement("WP01", feature=feature_slug, recover=False)
+            implement("WP01", mission=feature_slug, recover=False)
 
         # Confirm the allocator was actually invoked.
         assert mock_alloc.called

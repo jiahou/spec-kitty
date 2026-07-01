@@ -63,6 +63,13 @@ class Relation(StrEnum):
       to declare a full replacement.
     - ``REPLACES`` is retained for backward compatibility with existing
       hand-authored fragments (R-2).
+    - ``REFINES`` (refinement, #2079): an artifact narrows or sharpens the
+      applicability or meaning of the target (a parent or built-in) without
+      replacing it. It is distinct from ``APPLIES`` (an action applies a
+      directive/tactic) and from ``SPECIALIZES_FROM`` (static profile/artifact
+      lineage): a refinement is a first-class, traversable relation, never a
+      synonym for ``APPLIES``. Previously the org→DRG bridge silently downgraded
+      ``refines`` to ``APPLIES`` (a dead sink); it is now preserved end-to-end.
     """
 
     REQUIRES = "requires"
@@ -76,6 +83,7 @@ class Relation(StrEnum):
     SPECIALIZES_FROM = "specializes_from"
     ENHANCES = "enhances"
     OVERRIDES = "overrides"
+    REFINES = "refines"
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +97,13 @@ class DRGNode(BaseModel):
     urn: str
     kind: NodeKind
     label: str | None = None
+    # Merge-time provenance marker ("built-in" | "org:<pack>" | "project").
+    # Declared optional field (FR-013, D2-revised) replacing the former
+    # ``object.__setattr__`` sidecar. ``None`` for nodes that never pass
+    # through the three-layer merge (e.g. the extractor-built shipped graph),
+    # so the field is excluded from ``graph.yaml`` serialisation by the
+    # extractor's explicit field-by-field writer — graph output stays stable.
+    provenance: str | None = None
 
     @model_validator(mode="after")
     def _validate_urn(self) -> Self:
@@ -113,6 +128,10 @@ class DRGEdge(BaseModel):
     relation: Relation
     when: str | None = None
     reason: str | None = None
+    # Merge-time provenance marker; see ``DRGNode.provenance``. Named
+    # ``provenance`` (NOT ``source``) to avoid colliding with the source
+    # endpoint URN above.
+    provenance: str | None = None
 
     @model_validator(mode="after")
     def _validate_urns(self) -> Self:

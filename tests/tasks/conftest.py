@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from ulid import ULID
 
-from specify_cli.lanes.branch_naming import mid8, strip_numeric_prefix
+from specify_cli.lanes.branch_naming import _mid8, strip_numeric_prefix
 from tests.conftest import reset_spec_kitty_queue_state
 
 
@@ -55,14 +55,16 @@ def create_mission_fast(project: Path, slug: str, number: int = 1) -> Path:
     """
     mission_id = str(ULID())
     human_slug = strip_numeric_prefix(slug)
-    mission_slug = f"{human_slug}-{mid8(mission_id)}"
+    mission_slug = f"{human_slug}-{_mid8(mission_id)}"
     feature_dir = project / "kitty-specs" / mission_slug
 
     # Directory structure
     feature_dir.mkdir(parents=True, exist_ok=True)
     (feature_dir / "checklists").mkdir(exist_ok=True)
     (feature_dir / "research").mkdir(exist_ok=True)
-    for dirname in ("src", "tests", "contracts", "docs"):
+    # contracts/ is a mission artifact → under the feature dir, not repo root (#2115)
+    (feature_dir / "contracts").mkdir(exist_ok=True)
+    for dirname in ("src", "tests", "docs"):
         (project / dirname).mkdir(exist_ok=True)
     tasks_dir = feature_dir / "tasks"
     tasks_dir.mkdir(exist_ok=True)

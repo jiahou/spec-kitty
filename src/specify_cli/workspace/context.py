@@ -18,18 +18,99 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from specify_cli.core.atomic import atomic_write
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_slug
+from specify_cli.lanes.branch_naming import worktree_dir_name, worktree_path as _seam_worktree_path
+from mission_runtime import MissionArtifactKind
+from specify_cli.missions._read_path_resolver import (
+    resolve_feature_dir_for_slug,
+    resolve_planning_read_dir,
+)
 from specify_cli.ownership.inference import infer_execution_mode, score_execution_mode_signals
 from specify_cli.ownership.models import ExecutionMode
 from specify_cli.ownership.workspace_strategy import create_planning_workspace
 # Deep import: status.emit imports this module during status/__init__ execution,
 # so the status facade is not yet initialized here — importing from it would cycle.
 from specify_cli.status.wp_metadata import WPMetadata, read_wp_frontmatter
+
+
+#: Operator recovery command named by workspace husk resolution errors
+#: (NFR-003, #1833). Pinned by tests — keep in sync with the doctor command.
+WORKSPACE_HUSK_RECOVERY_COMMAND = "spec-kitty doctor workspaces --fix"
+
+
+class WorkspaceResolutionError(RuntimeError):
+    """Structured workspace resolution failure (#1833 — fall-through is failure).
+
+    Raised (or rendered) when a resolved lane workspace path is not an actual
+    git worktree, so git commands invoked there would silently walk up and
+    operate on the primary repository.
+    """
+
+    def __init__(self, *, workspace_path: Path, failed_check: str, detail: str) -> None:
+        self.workspace_path = workspace_path
+        self.failed_check = failed_check
+        self.detail = detail
+        super().__init__(
+            f"Workspace resolution failed: {workspace_path} failed check '{failed_check}'. "
+            f"{detail} "
+            f"Recover with: {WORKSPACE_HUSK_RECOVERY_COMMAND}"
+        )
+
+
+def husk_resolution_error(workspace_path: Path) -> WorkspaceResolutionError:
+    """Build the structured error for a husk directory (exists, no ``.git`` entry)."""
+    return WorkspaceResolutionError(
+        workspace_path=workspace_path,
+        failed_check="git-worktree-marker (.git entry)",
+        detail=(
+            "The directory exists but contains no .git entry (a stale 'husk'); "
+            "git commands run there would fall through to the primary repository "
+            "and produce misattributed verdicts."
+        ),
+    )
+
+
+def verify_workspace_toplevel(workspace_path: Path) -> WorkspaceResolutionError | None:
+    """Assert ``git -C <path> rev-parse --show-toplevel`` resolves to the path itself.
+
+    Last-line defense for workspace paths arriving from other resolver
+    lineages (#1833 R4). Returns a structured error on mismatch or git
+    failure, ``None`` when the path is the toplevel of its own working tree.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(workspace_path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        return WorkspaceResolutionError(
+            workspace_path=workspace_path,
+            failed_check="git-toplevel",
+            detail=f"git rev-parse --show-toplevel failed: {result.stderr.strip()}.",
+        )
+    actual_toplevel = Path(result.stdout.strip())
+    try:
+        same = actual_toplevel.resolve() == workspace_path.resolve()
+    except OSError:
+        same = False
+    if not same:
+        return WorkspaceResolutionError(
+            workspace_path=workspace_path,
+            failed_check="git-toplevel",
+            detail=(
+                f"git resolves the working tree toplevel to {actual_toplevel}, "
+                f"not the resolved workspace path {workspace_path}."
+            ),
+        )
+    return None
 
 
 _FEATURE_CONTEXT_INDEX_CACHE: dict[tuple[str, str], dict[str, WorkspaceContext]] = {}
@@ -86,7 +167,7 @@ class WorkspaceContext:
 
     # Base tracking
     base_branch: str  # Branch this was created from (e.g., "kitty/mission-010-feature-lane-a" or "main")
-    base_commit: str  # Git SHA this was created from
+    base_commit: str | None  # Git SHA this was created from; None when unavailable
 
     # Dependencies
     dependencies: list[str]  # List of WP IDs this depends on (e.g., ["WP01"])
@@ -122,6 +203,8 @@ class WorkspaceContext:
             raise ValueError("Workspace context is missing required lane_id")
         if not isinstance(filtered.get("lane_wp_ids"), list):
             raise ValueError("Workspace context is missing required lane_wp_ids")
+        if filtered.get("base_commit") == "unknown":
+            filtered["base_commit"] = None
         return cls(**filtered)
 
 
@@ -146,8 +229,34 @@ class ResolvedWorkspace:
 
     @property
     def exists(self) -> bool:
-        """Return True when the resolved worktree currently exists on disk."""
-        return self.worktree_path.exists()
+        """Return True when the resolved worktree is an actual git worktree on disk.
+
+        A bare directory under ``.worktrees/`` with no ``.git`` entry (a
+        "husk", #1833) is NOT a usable workspace: git commands run there fall
+        through to the primary repository. Note git worktrees carry a ``.git``
+        *file* (not directory), so this checks entry existence, not type.
+        The ``.git``-marker requirement applies to lane workspaces only; a
+        ``repo_root`` resolution points at the primary checkout itself.
+        """
+        if not self.worktree_path.exists():
+            return False
+        if self.resolution_kind != "lane_workspace":
+            return True
+        return (self.worktree_path / ".git").exists()
+
+    @property
+    def is_husk(self) -> bool:
+        """Return True for a lane workspace path that exists but lacks ``.git``.
+
+        Husks must be treated as absent-but-blocked: callers should surface a
+        structured error (see :func:`husk_resolution_error`) instead of
+        silently recreating a worktree on top — recreation hides the anomaly.
+        """
+        return (
+            self.resolution_kind == "lane_workspace"
+            and self.worktree_path.exists()
+            and not (self.worktree_path / ".git").exists()
+        )
 
 
 @dataclass(frozen=True)
@@ -203,7 +312,12 @@ def save_context(repo_root: Path, context: WorkspaceContext) -> Path:
     Returns:
         Path to saved context file
     """
-    workspace_name = f"{context.mission_slug}-{context.lane_id}"
+    # The context-JSON filename is keyed to the on-disk lane-worktree dir name;
+    # compose it through the seam (emit-don't-guess, FR-005). Legacy grammar
+    # ({slug}-{lane}, no mid8) ⇒ mission_id=None reproduces it byte-identically.
+    workspace_name = worktree_dir_name(
+        context.mission_slug, mission_id=None, lane_id=context.lane_id
+    )
     context_path = get_context_path(repo_root, workspace_name)
 
     # Write JSON with pretty formatting
@@ -357,7 +471,12 @@ def resolve_active_wp_for_branch(
         )
 
     context = matching_contexts[0]
+    # STATUS leg (C-001): coord-aware — events may live in the coord husk.
     feature_dir = resolve_feature_dir_for_slug(repo_root, context.mission_slug)
+    # PRIMARY leg (C-001): tasks/ WP-frontmatter always lives in the primary checkout.
+    planning_dir = resolve_planning_read_dir(
+        repo_root, context.mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
     lane_wp_ids = _context_lane_wp_ids(context)
 
     if not feature_dir.is_dir():
@@ -409,7 +528,7 @@ def resolve_active_wp_for_branch(
             f"canonical active_wp={active_wp_id}; lane_id={context.lane_id}"
         )
 
-    wp_path = _find_wp_file(feature_dir / "tasks", active_wp_id)
+    wp_path = _find_wp_file(planning_dir / "tasks", active_wp_id)
     if wp_path is None:
         return _active_wp_diagnostic(
             context,
@@ -553,8 +672,9 @@ def build_normalized_wp_index(
     callers share one canonical classification result.
     """
     cache_key = _normalized_feature_cache_key(repo_root, mission_slug)
-    feature_dir = resolve_feature_dir_for_slug(repo_root, mission_slug)
-    tasks_dir = feature_dir / "tasks"
+    tasks_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    ) / "tasks"
     snapshot = _normalized_feature_snapshot(tasks_dir)
     cached = _FEATURE_WP_METADATA_CACHE.get(cache_key)
     if cached is not None and _FEATURE_WP_METADATA_SNAPSHOT_CACHE.get(cache_key) == snapshot:
@@ -601,7 +721,10 @@ def get_normalized_wp(
         error = _FEATURE_WP_METADATA_ERROR_CACHE.get(cache_key, {}).get(wp_id)
         if error is not None:
             raise error
-        raise ValueError(f"Work package {wp_id} was not found under {resolve_feature_dir_for_slug(repo_root, mission_slug) / 'tasks'}")
+        raise ValueError(
+            f"Work package {wp_id} was not found under "
+            f"{resolve_planning_read_dir(repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK) / 'tasks'}"
+        )
     return entry
 
 
@@ -638,9 +761,12 @@ def resolve_workspace_for_wp(
             repo_root=repo_root,
         )
         # Try to populate lane_wp_ids from lanes.json if available.
+        # lanes.json is a PRIMARY-partition artifact (LANE_STATE kind).
         lane_wp_ids: list[str] = []
-        feature_dir = resolve_feature_dir_for_slug(repo_root, mission_slug)
-        lanes_manifest = read_lanes_json(feature_dir)
+        lanes_read_dir = resolve_planning_read_dir(
+            repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+        )
+        lanes_manifest = read_lanes_json(lanes_read_dir)
         if lanes_manifest is not None:
             planning_lane = lanes_manifest.lane_for_wp(wp_id)
             if planning_lane is not None:
@@ -677,15 +803,18 @@ def resolve_workspace_for_wp(
             context=context,
         )
 
-    feature_dir = resolve_feature_dir_for_slug(repo_root, mission_slug)
+    # lanes.json is a PRIMARY-partition artifact (LANE_STATE kind).
+    lanes_read_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+    )
     from specify_cli.lanes.branch_naming import lane_branch_name
     from specify_cli.lanes.compute import PLANNING_LANE_ID, is_planning_lane
-    from specify_cli.lanes.persistence import require_lanes_json
+    from specify_cli.lanes.persistence import require_lanes_json, resolve_lanes_dir
 
-    lanes_manifest = require_lanes_json(feature_dir)
+    lanes_manifest = require_lanes_json(lanes_read_dir)
     lane = lanes_manifest.lane_for_wp(wp_id)
     if lane is None:
-        raise ValueError(f"{wp_id} resolved to execution_mode={execution_mode.value!r} but is not assigned to any lane in {feature_dir / 'lanes.json'}")
+        raise ValueError(f"{wp_id} resolved to execution_mode={execution_mode.value!r} but is not assigned to any lane in {resolve_lanes_dir(lanes_read_dir)}")
 
     # lane-planning resolves to the main repository checkout, not a .worktrees/ path.
     if is_planning_lane(lane):
@@ -704,7 +833,12 @@ def resolve_workspace_for_wp(
             context=None,
         )
 
-    workspace_name = f"{mission_slug}-{lane.lane_id}"
+    # Route the COMPOSE (not just the .worktrees join) through the seam so no
+    # name-guess survives the assign-then-join indirection (FR-005, WP09 ratchet).
+    # Legacy worktree grammar ({slug}-{lane}, no mid8) ⇒ mission_id=None.
+    workspace_name = worktree_dir_name(
+        mission_slug, mission_id=None, lane_id=lane.lane_id
+    )
     return ResolvedWorkspace(
         mission_slug=mission_slug,
         wp_id=wp_id,
@@ -712,7 +846,9 @@ def resolve_workspace_for_wp(
         mode_source=normalized_wp.mode_source,
         resolution_kind="lane_workspace",
         workspace_name=workspace_name,
-        worktree_path=repo_root / ".worktrees" / workspace_name,
+        worktree_path=_seam_worktree_path(
+            repo_root, mission_slug, mission_id=None, lane_id=lane.lane_id
+        ),
         branch_name=lane_branch_name(mission_slug, lane.lane_id),
         lane_id=lane.lane_id,
         lane_wp_ids=list(lane.wp_ids),
@@ -733,16 +869,21 @@ def resolve_feature_worktree(repo_root: Path, mission_slug: str) -> Path | None:
         if candidate.is_dir():
             return candidate
 
-    feature_dir = resolve_feature_dir_for_slug(repo_root, mission_slug)
+    # lanes.json is a PRIMARY-partition artifact (LANE_STATE kind).
+    lanes_read_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+    )
     from specify_cli.lanes.persistence import read_lanes_json
 
-    lanes_manifest = read_lanes_json(feature_dir)
+    lanes_manifest = read_lanes_json(lanes_read_dir)
 
     if lanes_manifest is not None:
         for lane in lanes_manifest.lanes:
-            candidate = repo_root / ".worktrees" / f"{mission_slug}-{lane.lane_id}"
-            if candidate.is_dir():
-                return candidate
+            lane_candidate: Path = _seam_worktree_path(
+                repo_root, mission_slug, mission_id=None, lane_id=lane.lane_id
+            )
+            if lane_candidate.is_dir():
+                return lane_candidate
     return None
 
 
@@ -760,7 +901,9 @@ def find_orphaned_contexts(repo_root: Path) -> list[tuple[str, WorkspaceContext]
     for context in list_contexts(repo_root):
         workspace_path = repo_root / context.worktree_path
         if not workspace_path.exists():
-            workspace_name = f"{context.mission_slug}-{context.lane_id}"
+            workspace_name = worktree_dir_name(
+                context.mission_slug, mission_id=None, lane_id=context.lane_id
+            )
             orphaned.append((workspace_name, context))
 
     return orphaned
@@ -784,10 +927,19 @@ def cleanup_orphaned_contexts(repo_root: Path) -> int:
 
 
 __all__ = [
-    "ActiveWPResolution",
+    # ActiveWPResolution: demoted — no cross-module src/ from-import callers
+    # (WP01 harden-dead-symbol-gate-01KW0RJR).
     "NormalizedWorkPackage",
     "ResolvedWorkspace",
+    # WORKSPACE_HUSK_RECOVERY_COMMAND: demoted — no cross-module src/
+    # from-import callers (WP01 harden-dead-symbol-gate-01KW0RJR).
     "WorkspaceContext",
+    # WorkspaceResolutionError: demoted — no cross-module src/ from-import
+    # callers (WP01 harden-dead-symbol-gate-01KW0RJR).
+    # Resolution error raised and caught within this module; tests access
+    # it via explicit import, which works regardless of __all__.
+    "husk_resolution_error",
+    "verify_workspace_toplevel",
     "build_normalized_wp_index",
     "build_feature_context_index",
     "clear_workspace_resolution_caches",

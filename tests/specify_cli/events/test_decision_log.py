@@ -28,6 +28,7 @@ from spec_kitty_events.mission_next import (
 )
 import pytest
 
+from specify_cli.core.commit_guard import GuardCapability
 from specify_cli.events.decision_log import DecisionGitLog
 from specify_cli.next._internal_runtime.events import NullEmitter
 from specify_cli.next._internal_runtime.significance import (
@@ -35,9 +36,7 @@ from specify_cli.next._internal_runtime.significance import (
     TimeoutExpiredPayload,
 )
 
-pytestmark = [pytest.mark.unit]
-
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 # ---------------------------------------------------------------------------
 # Payload factories
 # ---------------------------------------------------------------------------
@@ -127,7 +126,12 @@ class TestCommitTriggered:
             kwargs = mock_commit.call_args.kwargs
             assert kwargs["repo_root"] == tmp_path
             assert kwargs["worktree_root"] == tmp_path
-            assert kwargs["destination_ref"] == "kitty/mission-abc"
+            # T010: destination is carried on the CommitTarget passed in, not a
+            # re-derived destination_ref string.
+            assert kwargs["target"].ref == "kitty/mission-abc"
+            # Decision-record bookkeeping is not the merge flow: it asserts
+            # STANDARD, so a protected destination is refused (PR #1850 fix).
+            assert kwargs["capability"] is GuardCapability.STANDARD
             assert "[skip ci]" in kwargs["message"]
             assert _decisions_file(tmp_path) in kwargs["paths"]
 
@@ -457,8 +461,13 @@ class TestMissionIdInEnvelope:
         )
         assert lines[0]["mission_id"] != slug, "slug must not be used as mission_id"
 
-    def test_slug_fallback_when_no_mission_id(self, tmp_path: Path) -> None:
-        """When mission_id is not provided, mission_slug is used as fallback."""
+    def test_no_slug_fallback_when_no_mission_id(self, tmp_path: Path) -> None:
+        """When mission_id is not provided, the envelope must NOT contain the slug.
+
+        WP04 / T015: inverted from the stale contract that certified slug-as-mission_id.
+        The corrected contract is fail-closed: an absent ULID yields mission_id=None
+        in the event envelope (null in JSON), never the slug (FR-004).
+        """
         slug = "fallback-slug-mission"
         log = DecisionGitLog(
             repo_root=tmp_path,
@@ -473,4 +482,49 @@ class TestMissionIdInEnvelope:
 
         decisions_file = tmp_path / "kitty-specs" / slug / "decisions.events.jsonl"
         lines = _read_lines(decisions_file)
-        assert lines[0]["mission_id"] == slug
+        assert lines[0]["mission_id"] is None, (
+            f"mission_id must be None (null), not the slug {slug!r}; "
+            f"got {lines[0]['mission_id']!r}"
+        )
+        assert lines[0]["mission_id"] != slug, "slug must never be persisted as mission_id"
+
+
+# ---------------------------------------------------------------------------
+# FR-001 traversal guard — unsafe mission_slug rejected at construction (WP03)
+# ---------------------------------------------------------------------------
+
+
+class TestMissionSlugTraversalGuard:
+    """Negative tests: untrusted traversal slugs must not reach the filesystem.
+
+    Each test asserts that constructing a DecisionGitLog with an unsafe
+    mission_slug raises ValueError (fail-closed) rather than silently writing
+    to an escaped path.  Mutation check: neutralising the guard in
+    decision_log.py (removing the assert_safe_path_segment call) would cause
+    these tests to fail because no ValueError would be raised.
+    """
+
+    @pytest.mark.parametrize("bad_slug", [
+        "../escaped",
+        "../../etc/passwd",
+        "foo/bar",
+        "foo\\bar",
+        ".hidden",
+        "a..b",
+        "",
+        "   ",
+    ])
+    def test_traversal_slug_rejected_at_construction(
+        self, tmp_path: Path, bad_slug: str
+    ) -> None:
+        """A traversal mission_slug must raise ValueError, no file created."""
+        with pytest.raises(ValueError):
+            DecisionGitLog(
+                repo_root=tmp_path,
+                worktree_root=tmp_path,
+                destination_ref="kitty/mission-safe",
+                mission_slug=bad_slug,
+                inner=NullEmitter(),
+            )
+        # No escaped path may have been created anywhere under tmp_path
+        assert not any(tmp_path.rglob("decisions.events.jsonl"))

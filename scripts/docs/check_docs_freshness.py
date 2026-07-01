@@ -9,6 +9,10 @@ docs-freshness sub-check into one :class:`FreshnessReport`:
 3. Link health — HEAD-request external URLs (``none``/``spot``/``full``).
 4. Page-inventory completeness — every ``.md`` under ``docs/`` must be in
    the inventory (mirrors ``LEAK-MISSING-INVENTORY``).
+5. Inventory-lockfile drift — the committed inventory must equal a fresh
+   generation from in-file frontmatter (ADR 2026-06-27-1 D1). **Blocking**
+   from Mission B: drift is an ``error``-severity ``INVENTORY-LOCKFILE-DRIFT``
+   finding (was report-only in Mission A) and runs by default (no opt-in flag).
 
 Exit codes (per contract):
 
@@ -60,8 +64,11 @@ __all__ = [
 
 DEFAULT_INVENTORY_PATH: Final[str] = "docs/development/3-2-page-inventory.yaml"
 DEFAULT_DOCS_ROOT: Final[str] = "docs/"
-DEFAULT_REFERENCE_PATH: Final[str] = "docs/reference/cli-commands.md"
-DEFAULT_AGENT_REFERENCE_PATH: Final[str] = "docs/reference/agent-subcommands.md"
+# The CLI reference lives under docs/api/ after the Common Docs structural move
+# (Mission B WP16 retired docs/reference/). Pointing the default at the old
+# docs/reference/ path short-circuits the whole freshness gate with INPUT-MISSING.
+DEFAULT_REFERENCE_PATH: Final[str] = "docs/api/cli-commands.md"
+DEFAULT_AGENT_REFERENCE_PATH: Final[str] = "docs/api/agent-subcommands.md"
 
 LinkCheckMode = Literal["none", "spot", "full"]
 Severity = Literal["error", "warning"]
@@ -304,6 +311,13 @@ def run_orchestrator(
 
     Pure orchestration logic — split out from :func:`main` so tests can
     drive it without spelunking through argparse.
+
+    The inverted ruler (ADR 2026-06-27-1 D1) regenerates the inventory from
+    in-file frontmatter and reports any drift against the committed lockfile as
+    ``INVENTORY-LOCKFILE-DRIFT`` findings. Mission B makes this **blocking and
+    default-on**: drift is ``error``-severity (so it flips the aggregate exit
+    code) and the check runs unconditionally — there is no longer an opt-in
+    guard, since a guarded check the CI workflow never enables is dead code.
     """
     started_at = _now_iso()
     findings: list[FreshnessFinding] = []
@@ -411,6 +425,12 @@ def run_orchestrator(
     # --- Sub-check 4: page-inventory completeness --------------------------
     completeness = _check_page_inventory_completeness(inventory, docs_root)
     findings.extend(completeness)
+
+    # --- Sub-check 5: inventory lockfile drift (blocking, default-on) -------
+    # Mission B (WP14): no opt-in guard — the check runs every time. The guard
+    # used to gate it behind ``--inventory-lockfile``, which the CI workflow
+    # never passed, making the severity escalation below dead code in CI.
+    findings.extend(_check_inventory_lockfile_drift(inventory, docs_root))
 
     visible_paths_count = sum(
         1 for f in findings if f.rule_id.startswith("REF-")
@@ -651,6 +671,67 @@ def _check_page_inventory_completeness(
             )
         )
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Inventory lockfile drift (inverted ruler — report-only)
+# ---------------------------------------------------------------------------
+
+
+def _check_inventory_lockfile_drift(
+    inventory: Path, docs_root: Path
+) -> list[FreshnessFinding]:
+    """Regenerate the rollup from frontmatter and report drift as errors.
+
+    This is the inverted ruler (ADR 2026-06-27-1 D1): rather than asserting
+    "every page is in the sidecar", it asserts "the committed inventory equals
+    a fresh generation from frontmatter". Mission B (WP14) makes it **blocking**
+    — every drift finding is an ``error`` (see :func:`_lockfile_finding`) so the
+    aggregate exit code reds on drift.
+    """
+    from scripts.docs.inventory_lockfile import run_generate_and_compare
+
+    if not docs_root.exists() or not docs_root.is_dir():
+        return []
+
+    # ``strict=True`` is threaded for intent/consistency with the blocking flip;
+    # it is a harmless no-op in this codepath — ``run_generate_and_compare`` only
+    # uses ``strict`` to set its own process exit code, which we ignore here (we
+    # read ``report.drift`` directly). The gate change that actually flips the
+    # aggregate exit is the ``error`` severity in :func:`_lockfile_finding`.
+    report = run_generate_and_compare(
+        docs_root=docs_root,
+        inventory=inventory,
+        repo_root=None,
+        strict=True,
+    )
+    findings: list[FreshnessFinding] = []
+    for path in report.drift.added:
+        findings.append(_lockfile_finding(path, "present in frontmatter, absent from inventory"))
+    for path in report.drift.removed:
+        findings.append(_lockfile_finding(path, "present in inventory, absent from frontmatter walk"))
+    for path in report.drift.changed:
+        findings.append(_lockfile_finding(path, "inventory row disagrees with regenerated frontmatter"))
+    return findings
+
+
+def _lockfile_finding(location: str, message: str) -> FreshnessFinding:
+    """Build a blocking ``INVENTORY-LOCKFILE-DRIFT`` error (Mission B / WP14).
+
+    The severity is ``error`` — this is the real gate flip: the aggregate exit
+    code keys off ``any(f.severity == "error")``, so an ``error`` drift finding
+    reds ``check_docs_freshness``.
+    """
+    return FreshnessFinding(
+        rule_id="INVENTORY-LOCKFILE-DRIFT",
+        severity="error",
+        location=location,
+        message=message,
+        suggested_action=(
+            "regenerate the lockfile with scripts/docs/inventory_lockfile.py "
+            "--write docs/development/3-2-page-inventory.yaml, then commit it"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

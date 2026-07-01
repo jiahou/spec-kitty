@@ -17,10 +17,7 @@ import pytest
 
 # Marked for mutmut sandbox skip — see ADR 2026-04-20-1.
 # Reason: subprocess CLI invocation
-pytestmark = pytest.mark.non_sandbox
-
-
-
+pytestmark = [pytest.mark.non_sandbox, pytest.mark.fast]
 # --------------------------------------------------------------------------- #
 # verify_enhanced tests
 # --------------------------------------------------------------------------- #
@@ -144,7 +141,7 @@ def test_mission_current_no_feature_shows_message(tmp_path: Path) -> None:
     ):
         result = runner.invoke(app, ["current"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "No active mission detected" in result.output
 
 
@@ -320,7 +317,7 @@ def test_verify_setup_passes_feature_dir_to_run_enhanced_verify(tmp_path: Path) 
     ):
         # Call with json_output to avoid console rendering issues, and skip tool checks
         verify_setup(
-            feature="099-research-feature",
+            mission="099-research-feature",
             json_output=True,
             check_files=False,
             check_tools=False,

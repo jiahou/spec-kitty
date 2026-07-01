@@ -55,6 +55,16 @@ def _build_feature(tmp_path: Path, *, owned_file: str) -> Path:
     return feature_dir
 
 
+def _add_create_intent(feature_dir: Path, path: str) -> None:
+    wp_file = feature_dir / "tasks" / "WP01-invalid.md"
+    content = wp_file.read_text(encoding="utf-8")
+    content = content.replace(
+        "authoritative_surface: src/example/\n",
+        f"authoritative_surface: src/example/\ncreate_intent:\n  - {path}\n",
+    )
+    wp_file.write_text(content, encoding="utf-8")
+
+
 def _run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
     if "status" in cmd and "--porcelain" in cmd:
         return (0, "M tasks.md", "")
@@ -67,8 +77,12 @@ def _invoke_finalize(tmp_path: Path, feature_dir: Path, extra_args: list[str] | 
     args = ["finalize-tasks", "--mission", feature_dir.name, "--json"]
     if extra_args:
         args.extend(extra_args)
-    safe_commit_patcher = patch(
-        "specify_cli.cli.commands.agent.mission.safe_commit",
+    # WP05 (T014): the ``mission.safe_commit`` re-export shim is gone; the canonical
+    # commit boundary is ``commit_router.commit_for_mission``. The spy is attached to
+    # THAT seam so the "rejected before any commit" contract is asserted at the real
+    # commit boundary, not a retired alias.
+    commit_patcher = patch(
+        "specify_cli.coordination.commit_router.commit_for_mission",
         return_value=True,
     )
     with (
@@ -77,9 +91,9 @@ def _invoke_finalize(tmp_path: Path, feature_dir: Path, extra_args: list[str] | 
         patch("specify_cli.cli.commands.agent.mission._show_branch_context", return_value=(tmp_path, "main")),
         patch("specify_cli.cli.commands.agent.mission.run_command", side_effect=_run_command),
         patch("specify_cli.cli.commands.agent.mission.get_emitter"),
-        safe_commit_patcher as safe_commit,
+        commit_patcher as commit_for_mission,
     ):
-        return runner.invoke(app, args), safe_commit
+        return runner.invoke(app, args), commit_for_mission
 
 
 def _json_payload(stdout: str) -> dict[str, object]:
@@ -88,16 +102,20 @@ def _json_payload(stdout: str) -> dict[str, object]:
     return json.loads(lines[-1])
 
 
+def _strict_json_payload(stdout: str) -> dict[str, object]:
+    return json.loads(stdout)
+
+
 def test_validate_only_rejects_kitty_specs_owned_files(tmp_path: Path) -> None:
     feature_dir = _build_feature(
         tmp_path,
         owned_file="kitty-specs/077-invalid-owned-files/occurrence_map.yaml",
     )
 
-    result, safe_commit = _invoke_finalize(tmp_path, feature_dir, ["--validate-only"])
+    result, commit_for_mission = _invoke_finalize(tmp_path, feature_dir, ["--validate-only"])
 
     assert result.exit_code == 1
-    safe_commit.assert_not_called()
+    commit_for_mission.assert_not_called()
     payload = _json_payload(result.stdout)
     assert payload["error_code"] == INVALID_WP_OWNED_FILES_KITTY_SPECS
     assert payload["invalid_owned_files"] == [
@@ -114,10 +132,10 @@ def test_full_finalize_rejects_before_commit(tmp_path: Path) -> None:
         owned_file="./kitty-specs/077-invalid-owned-files/plan.md",
     )
 
-    result, safe_commit = _invoke_finalize(tmp_path, feature_dir)
+    result, commit_for_mission = _invoke_finalize(tmp_path, feature_dir)
 
     assert result.exit_code == 1
-    safe_commit.assert_not_called()
+    commit_for_mission.assert_not_called()
     payload = _json_payload(result.stdout)
     assert payload["error_code"] == INVALID_WP_OWNED_FILES_KITTY_SPECS
     assert payload["invalid_owned_files"] == [
@@ -126,3 +144,32 @@ def test_full_finalize_rejects_before_commit(tmp_path: Path) -> None:
             "path": "./kitty-specs/077-invalid-owned-files/plan.md",
         }
     ]
+
+
+def test_validate_only_json_suppresses_create_intent_info_note(tmp_path: Path) -> None:
+    feature_dir = _build_feature(tmp_path, owned_file="src/example/new_module.py")
+    _add_create_intent(feature_dir, "src/example/new_module.py")
+
+    result, _commit_for_mission = _invoke_finalize(tmp_path, feature_dir, ["--validate-only"])
+
+    assert result.exit_code == 0
+    payload = _strict_json_payload(result.stdout)
+    assert payload["result"] == "validation_passed"
+    assert "create_intent" not in result.stdout
+    assert "create_intent" not in result.stderr
+
+
+def test_validate_only_json_suppresses_ownership_stderr_on_error(tmp_path: Path) -> None:
+    feature_dir = _build_feature(tmp_path, owned_file="src/example/missing_module.py")
+
+    result, commit_for_mission = _invoke_finalize(tmp_path, feature_dir, ["--validate-only"])
+
+    assert result.exit_code == 1
+    commit_for_mission.assert_not_called()
+    payload = _strict_json_payload(result.stdout)
+    assert payload["error"] == (
+        "Ownership validation failed: literal-path owned_files entries match zero files. "
+        "Fix the paths or add them to 'create_intent'."
+    )
+    assert payload["ownership_literal_path_errors"]
+    assert result.stderr == ""

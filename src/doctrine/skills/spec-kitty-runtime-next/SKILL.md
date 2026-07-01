@@ -1,7 +1,7 @@
 ---
 name: spec-kitty-runtime-next
 description: >-
-  Drive the canonical spec-kitty next --agent <name> control loop for mission
+  Drive the canonical spec-kitty next --mission <handle> control loop for mission
   advancement. Load agent profiles at init, apply action-scoped doctrine
   context at each step boundary, and pull specific tactics/directives on demand.
   Triggers: "run the next step", "what should runtime do next", "advance the
@@ -85,18 +85,11 @@ steps:
     depends_on: [specify]
     prompt_template: plan.md
 
-  - id: tasks_outline
+  - id: tasks
     depends_on: [plan]
-    prompt_template: tasks.md
-
-  - id: tasks_packages
-    depends_on: [tasks_outline]
-
-  - id: tasks_finalize
-    depends_on: [tasks_packages]
 
   - id: implement
-    depends_on: [tasks_finalize]
+    depends_on: [tasks]
     prompt_template: implement.md
 
   - id: review
@@ -108,13 +101,14 @@ steps:
     prompt_template: accept.md
 ```
 
-### The 4 Decision Kinds
+### Decision Kinds
 
 Every call to `spec-kitty next` returns exactly one decision kind:
 
 | Kind | Meaning | Agent Action |
 |---|---|---|
 | `step` | Normal action available | Read `prompt_file` and execute |
+| `query` | Read-only current-state preview | Inspect state; do not execute a prompt or mark a result |
 | `decision_required` | Runtime needs input | Answer with `--answer` and `--decision-id` |
 | `blocked` | Guards failing, cannot proceed | Read `reason` + `guard_failures`, resolve blockers |
 | `terminal` | Mission complete | Run `/spec-kitty.accept`; if it passes, merge, then: mission review → author or verify retrospective (`retrospect create`) → surface findings (`summary` aggregates; `synthesize` reviews proposals) |
@@ -190,7 +184,7 @@ Runtime state is persisted between calls:
 
 ```
 .kittify/runtime/
-├── mission-runs.json       # Index: {"mission-slug": {"run_id": "...", "run_dir": "..."}}
+├── feature-runs.json       # Index: {"mission-slug": {"run_id": "...", "run_dir": "..."}}
 └── runs/
     └── <run_id>/
         └── state.json      # Runtime snapshot (current step, inputs, etc.)
@@ -352,8 +346,8 @@ spec-kitty next --agent <agent> --mission <mission-slug> --result failed --json
 spec-kitty next --agent <agent> --mission <mission-slug> --result blocked --json
 ```
 
-> **Note:** `--feature` is a hidden deprecated alias for `--mission`.
-> Always use `--mission` in new scripts.
+> **Note:** `--mission` is the sole selector. The legacy `--feature` alias has
+> been removed (#1060); passing `--feature` now exits with `No such option`.
 
 The `--result` flag tells the runtime the outcome of the previous step.
 If omitted, `spec-kitty next` returns current state without advancing (query mode).
@@ -401,7 +395,7 @@ When the runtime needs input:
 # The decision includes question, options, and decision_id
 # Answer using:
 spec-kitty next --agent <agent> --mission <mission-slug> \
-  --answer "<choice>" --decision-id "<decision_id>" --json
+  --result success --answer "<choice>" --decision-id "<decision_id>" --json
 ```
 
 If the agent cannot determine the answer, escalate to the user with the
@@ -491,6 +485,7 @@ fi
 **The loop continues until:**
 
 - `terminal` — mission complete, exit loop
+- `query` — read-only preview, no state mutation
 - `blocked` — cannot proceed without external resolution
 - `decision_required` — only if the agent cannot answer (escalate to user)
 
@@ -528,25 +523,25 @@ null prompt is a runtime bug.
 
 ## Standalone Invocations (Outside Missions)
 
-Not all governed work happens inside an active mission. When a user asks for help with a task that has no active `spec-kitty next` loop — a code review, a quick implementation, an ad-hoc analysis — you should still invoke Spec Kitty's governance layer via the profile invocation surface.
+Not all governed work happens inside an active mission. When a user asks for
+help with a task that has no active `spec-kitty next` loop — a code review, a
+quick implementation, an ad-hoc analysis — you should still invoke Spec Kitty's
+governance layer with standalone dispatch.
 
 Spec Kitty never spawns a parallel LLM call. You are the host; Spec Kitty routes, assembles governance context, and records the trail.
 
-### When to use which command
+### When to use standalone dispatch
 
-| Situation | Command |
-|-----------|---------|
-| Request is clear, profile unknown | `spec-kitty do "<request>" --json` |
-| Request is clear, profile known | `spec-kitty ask <profile> "<request>" --json` |
-| Need routing decision only (no implementation) | `spec-kitty advise "<request>" --json` |
+If the user says anything like "use spec kitty to ...", "hey spec kitty ...",
+or "spec kitty <anything>", run standalone dispatch unless they are clearly
+asking for a full mission.
 
 ### The governance injection loop
 
 1. **Get context**:
    ```bash
-   spec-kitty do "implement the login handler" --json
-   # or:
-   spec-kitty ask pedro "review WP05" --json
+   spec-kitty dispatch "implement the login handler" --json
+   spec-kitty dispatch "review WP05" --profile reviewer --json
    ```
    Response includes `invocation_id`, `governance_context_text`, and `governance_context_available`.
 
@@ -557,7 +552,7 @@ Spec Kitty never spawns a parallel LLM call. You are the host; Spec Kitty routes
 3. **Execute**:
    Do the work. Generate the code, analysis, or plan.
 
-4. **Close the Op** (mandatory — `do`/`ask`/`advise` leave it open):
+4. **Close the Op** (mandatory — `dispatch` leaves it open):
    ```bash
    spec-kitty profile-invocation complete \
      --invocation-id <invocation_id> \
@@ -571,12 +566,12 @@ Spec Kitty never spawns a parallel LLM call. You are the host; Spec Kitty routes
 
 Every standalone invocation writes a Tier 1 JSONL file to:
 ```
-.kittify/events/profile-invocations/<invocation_id>.jsonl
+kitty-ops/<invocation_id>.jsonl
 ```
 
 Viewable at any time with `spec-kitty invocations list --json`. No SaaS connection required.
 
-For full CLI surface documentation, see `.agents/skills/spec-kitty.advise/SKILL.md`.
+For full CLI surface documentation, see `src/doctrine/skills/spec-kitty/SKILL.md`.
 
 ---
 

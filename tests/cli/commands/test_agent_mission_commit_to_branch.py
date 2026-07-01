@@ -10,6 +10,8 @@ import pytest
 from rich.console import Console
 
 import specify_cli.cli.commands.agent.mission as mission_module
+import specify_cli.cli.commands.agent.mission_setup_plan as setup_plan_module
+import specify_cli.coordination.commit_router as commit_router_module
 from specify_cli.cli.commands.agent.mission import _commit_to_branch
 
 pytestmark = pytest.mark.git_repo
@@ -52,6 +54,31 @@ def test_commit_to_branch_treats_empty_safe_commit_as_benign(tmp_path: Path) -> 
     assert _run_git(tmp_path, "rev-parse", "HEAD") == head_before
 
 
+def test_commit_to_branch_empty_resolved_paths_clean_artifact_noops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_repo(tmp_path)
+    plan_file = tmp_path / "plan.md"
+    head_before = _run_git(tmp_path, "rev-parse", "HEAD")
+
+    def no_commit_paths(*_args: object, **_kwargs: object) -> tuple[Path, tuple[Path, ...]]:
+        return tmp_path, ()
+
+    monkeypatch.setattr(mission_module, "_planning_commit_worktree", no_commit_paths)
+
+    _commit_to_branch(
+        plan_file,
+        "001-demo",
+        "plan",
+        tmp_path,
+        "mission/work",
+        json_output=True,
+    )
+
+    assert _run_git(tmp_path, "rev-parse", "HEAD") == head_before
+
+
 def test_commit_to_branch_legacy_called_process_empty_commit_does_not_print_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -67,9 +94,17 @@ def test_commit_to_branch_legacy_called_process_empty_commit_does_not_print_succ
             stderr="nothing to commit, working tree clean",
         )
 
-    monkeypatch.setattr(mission_module, "safe_commit", fake_safe_commit)
+    # WP06 (#2056): the ``mission.safe_commit`` re-export shim is gone. The
+    # commit path now runs ``_commit_to_branch`` → ``commit_for_mission`` →
+    # ``commit_router.safe_commit``. The empty-commit ``CalledProcessError`` is
+    # caught inside ``commit_for_mission`` (mapped to ``status="unchanged"``), so
+    # the canonical interception point is the router's ``safe_commit`` symbol.
+    monkeypatch.setattr(commit_router_module, "safe_commit", fake_safe_commit)
+    # WP06 (#2056): ``_commit_to_branch`` (and its ``_print_artifact_unchanged``
+    # console write) relocated to ``mission_setup_plan``; patch that module's
+    # ``console`` to capture the "unchanged" notice.
     monkeypatch.setattr(
-        mission_module,
+        setup_plan_module,
         "console",
         Console(file=output, force_terminal=False, color_system=None, width=120),
     )
@@ -105,7 +140,15 @@ def test_commit_to_branch_still_commits_changed_artifact(tmp_path: Path) -> None
     assert _run_git(tmp_path, "log", "-1", "--pretty=%s") == "Add plan for feature 001-demo"
 
 
-def test_commit_to_branch_reraises_empty_safe_commit_shape_when_artifact_is_dirty(tmp_path: Path) -> None:
+def test_commit_to_branch_treats_empty_safe_commit_shape_as_unchanged_when_dirty(tmp_path: Path) -> None:
+    """WP02/#2056: a `safe_commit: git commit failed` shape is classified unchanged.
+
+    After the de-god collapse routed `_commit_to_branch` through the canonical
+    `commit_for_mission` seam, the router maps the empty-changeset error shape
+    (`safe_commit: git commit failed`) to a benign `unchanged` outcome rather
+    than re-raising. The artifact is left untouched on disk (still dirty); the
+    helper returns the typed no-op result instead of propagating a RuntimeError.
+    """
     _init_repo(tmp_path)
     plan_file = tmp_path / "plan.md"
     plan_file.write_text("# Plan\n\nUpdated.\n")
@@ -114,14 +157,15 @@ def test_commit_to_branch_reraises_empty_safe_commit_shape_when_artifact_is_dirt
     hook.write_text("#!/bin/sh\nexit 1\n")
     hook.chmod(0o755)
 
-    with pytest.raises(RuntimeError, match="safe_commit: git commit failed"):
-        _commit_to_branch(
-            plan_file,
-            "001-demo",
-            "plan",
-            tmp_path,
-            "mission/work",
-            json_output=True,
-        )
+    result = _commit_to_branch(
+        plan_file,
+        "001-demo",
+        "plan",
+        tmp_path,
+        "mission/work",
+        json_output=True,
+    )
 
+    assert result.status == "unchanged"
+    # The artifact is not committed — it stays dirty in the working tree.
     assert _run_git(tmp_path, "status", "--porcelain", "--", "plan.md") == "M plan.md"

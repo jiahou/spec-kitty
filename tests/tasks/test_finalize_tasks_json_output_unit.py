@@ -22,13 +22,31 @@ from unittest.mock import patch
 import pytest
 from typer.testing import CliRunner
 
+from specify_cli.cli.commands.agent import mission_finalize
 from specify_cli.cli.commands.agent.mission import app
+from specify_cli.coordination.commit_router import CommitRouterResult
 
 pytestmark = pytest.mark.fast
 
 runner = CliRunner()
 
 _FAKE_SHA = "a" * 40
+
+
+def _committed_router_result(*, commit_success: bool = True) -> CommitRouterResult:
+    """Build the CommitRouterResult the planning-commit seam returns.
+
+    WP02/#2056 de-god re-routed ``_commit_to_branch`` through the canonical
+    ``commit_for_mission`` seam, so tests mock that seam (not the retired
+    ``mission.safe_commit`` shim, which is no longer on the call path).
+    """
+    if commit_success:
+        return CommitRouterResult(
+            status="committed", placement_ref="main", commit_hash=_FAKE_SHA
+        )
+    return CommitRouterResult(
+        status="error", placement_ref="main", diagnostic="safe_commit: git commit failed"
+    )
 
 
 def _build_feature(tmp_path: Path) -> tuple[Path, Path]:
@@ -90,8 +108,8 @@ def _patch_context(
             return_value=(None, "main"),
         ),
         patch(
-            "specify_cli.cli.commands.agent.mission.safe_commit",
-            return_value=commit_success,
+            "specify_cli.coordination.commit_router.commit_for_mission",
+            return_value=_committed_router_result(commit_success=commit_success),
         ),
         patch(
             "specify_cli.cli.commands.agent.mission.run_command",
@@ -122,6 +140,30 @@ def _make_run_command(git_status_out: str):
 class TestFinalizeTasks:
     """Unit tests for finalize-tasks JSON output schema."""
 
+    def test_missing_meta_warning_is_suppressed_in_json_mode(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Missing-meta diagnostics must not precede the JSON payload."""
+        feature_dir, _ = _build_feature(tmp_path)
+        (feature_dir / "meta.json").unlink()
+
+        mission_finalize._warn_missing_meta(feature_dir, None, json_output=True)
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_missing_meta_warning_still_emits_in_human_mode(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Human mode keeps the operator-facing missing-meta warning."""
+        feature_dir, _ = _build_feature(tmp_path)
+        (feature_dir / "meta.json").unlink()
+
+        mission_finalize._warn_missing_meta(feature_dir, None, json_output=False)
+
+        assert "meta.json missing" in capsys.readouterr().out
+
     def test_json_output_commit_hash_is_40_char_hex(self, tmp_path: Path) -> None:
         """commit_hash in JSON output should be a 40-character hex SHA."""
         # Arrange
@@ -135,7 +177,10 @@ class TestFinalizeTasks:
             patch("specify_cli.cli.commands.agent.mission.locate_project_root", return_value=tmp_path),
             patch("specify_cli.cli.commands.agent.mission._find_feature_directory", return_value=feature_dir),
             patch("specify_cli.cli.commands.agent.mission._show_branch_context", return_value=(None, "main")),
-            patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True),
+            patch(
+                "specify_cli.coordination.commit_router.commit_for_mission",
+                return_value=_committed_router_result(),
+            ),
             patch("specify_cli.cli.commands.agent.mission.run_command", side_effect=_make_run_command("M tasks.md")),
             patch("specify_cli.cli.commands.agent.mission.get_emitter"),
         ):
@@ -168,7 +213,10 @@ class TestFinalizeTasks:
             patch("specify_cli.cli.commands.agent.mission.locate_project_root", return_value=tmp_path),
             patch("specify_cli.cli.commands.agent.mission._find_feature_directory", return_value=feature_dir),
             patch("specify_cli.cli.commands.agent.mission._show_branch_context", return_value=(None, "main")),
-            patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True),
+            patch(
+                "specify_cli.coordination.commit_router.commit_for_mission",
+                return_value=_committed_router_result(),
+            ),
             patch("specify_cli.cli.commands.agent.mission.run_command", side_effect=_make_run_command("M tasks.md")),
             patch("specify_cli.cli.commands.agent.mission.get_emitter"),
         ):
@@ -196,7 +244,10 @@ class TestFinalizeTasks:
             patch("specify_cli.cli.commands.agent.mission.locate_project_root", return_value=tmp_path),
             patch("specify_cli.cli.commands.agent.mission._find_feature_directory", return_value=feature_dir),
             patch("specify_cli.cli.commands.agent.mission._show_branch_context", return_value=(None, "main")),
-            patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True),
+            patch(
+                "specify_cli.coordination.commit_router.commit_for_mission",
+                return_value=_committed_router_result(),
+            ),
             patch("specify_cli.cli.commands.agent.mission.run_command", side_effect=_make_run_command("")),
             patch("specify_cli.cli.commands.agent.mission.get_emitter"),
         ):
@@ -224,7 +275,10 @@ class TestFinalizeTasks:
             patch("specify_cli.cli.commands.agent.mission.locate_project_root", return_value=tmp_path),
             patch("specify_cli.cli.commands.agent.mission._find_feature_directory", return_value=feature_dir),
             patch("specify_cli.cli.commands.agent.mission._show_branch_context", return_value=(None, "main")),
-            patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True),
+            patch(
+                "specify_cli.coordination.commit_router.commit_for_mission",
+                return_value=_committed_router_result(),
+            ),
             patch("specify_cli.cli.commands.agent.mission.run_command", side_effect=_make_run_command("M tasks.md")),
             patch("specify_cli.cli.commands.agent.mission.get_emitter"),
         ):
@@ -263,7 +317,10 @@ class TestFinalizeTasks:
             patch("specify_cli.cli.commands.agent.mission.locate_project_root", return_value=tmp_path),
             patch("specify_cli.cli.commands.agent.mission._find_feature_directory", return_value=feature_dir),
             patch("specify_cli.cli.commands.agent.mission._show_branch_context", return_value=(None, "main")),
-            patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True),
+            patch(
+                "specify_cli.coordination.commit_router.commit_for_mission",
+                return_value=_committed_router_result(),
+            ),
             patch("specify_cli.cli.commands.agent.mission.run_command", side_effect=_make_run_command("M tasks.md")),
             patch("specify_cli.cli.commands.agent.mission.get_emitter"),
         ):
@@ -294,7 +351,10 @@ class TestFinalizeTasks:
             patch("specify_cli.cli.commands.agent.mission.locate_project_root", return_value=tmp_path),
             patch("specify_cli.cli.commands.agent.mission._find_feature_directory", return_value=feature_dir),
             patch("specify_cli.cli.commands.agent.mission._show_branch_context", return_value=(None, "main")),
-            patch("specify_cli.cli.commands.agent.mission.safe_commit", return_value=True),
+            patch(
+                "specify_cli.coordination.commit_router.commit_for_mission",
+                return_value=_committed_router_result(),
+            ),
             patch("specify_cli.cli.commands.agent.mission.run_command", side_effect=_make_run_command("M tasks.md")),
             patch("specify_cli.cli.commands.agent.mission.get_emitter"),
         ):

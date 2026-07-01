@@ -20,12 +20,13 @@ from typing import Any
 
 from ulid import ULID
 
+from mission_runtime import CommitTarget, MissionTopology
+from specify_cli.core.commit_guard import GuardCapability
 from specify_cli.core.git_ops import get_current_branch, is_git_repo
 from specify_cli.core.paths import is_worktree_context, locate_project_root
 from specify_cli.git import safe_commit
-from specify_cli.lanes.branch_naming import mid8, strip_numeric_prefix
+from specify_cli.lanes.branch_naming import mission_dir_name, resolve_mid8
 from specify_cli.mission_metadata import validate_purpose_summary
-from specify_cli.sync.events import emit_mission_created
 
 logger = logging.getLogger(__name__)
 
@@ -174,13 +175,20 @@ def _commit_feature_file(
     if current_branch is None:
         raise MissionCreationError("Not in a git repository")
 
+    # Mission creation runs pre-spec: the destination is the branch ``create``
+    # reports (the planning destination), which is a non-protected planning
+    # branch. Capability is STANDARD — the placement-matched commit needs no
+    # protected-branch bookkeeping authorization. If a project legitimately
+    # plans on a protected branch, WP05's placement projection routes the
+    # commit; this caller does not duplicate that decision (T010).
     commit_msg = f"Add {artifact_type} for feature {mission_slug}"
     safe_commit(
         repo_root=repo_root,
         worktree_root=repo_root,
-        destination_ref=current_branch,
+        target=CommitTarget(ref=current_branch),
         message=commit_msg,
         paths=(file_path,),
+        capability=GuardCapability.STANDARD,
     )
 
 
@@ -198,6 +206,7 @@ def create_mission_core(
     friendly_name: str | None = None,
     purpose_tldr: str | None = None,
     purpose_context: str | None = None,
+    topology: MissionTopology = MissionTopology.COORD,
     force_recreate_coordination_branch: bool = False,
 ) -> MissionCreationResult:
     """Create a new feature with all scaffolding.
@@ -229,6 +238,14 @@ def create_mission_core(
     purpose_context:
         Optional short paragraph explaining the mission in stakeholder terms.
         When omitted, it defaults to a branch-aware summary sentence.
+    topology:
+        Operator's create-time mission shape (#2218). Defaults to
+        :attr:`MissionTopology.COORD` for backward-compat. The coordination
+        branch is minted only for the coordination-bearing shapes
+        (``COORD`` / ``LANES_WITH_COORD``); ``SINGLE_BRANCH`` / ``LANES`` skip
+        the mint and never write ``coordination_branch``. The explicit choice
+        is persisted verbatim into ``meta.json`` — never re-derived from
+        ``classify_topology`` (which cannot reproduce ``LANES`` pre-finalize).
 
     Returns
     -------
@@ -307,9 +324,14 @@ def create_mission_core(
     # until merge time (single-writer context on main).
     # ------------------------------------------------------------------
     # Mint the ULID first so we can derive mid8 for the directory name.
+    # resolve_mid8 derives the mid8 from the declared mission_id (authoritative,
+    # FR-004/NFR-003); mission_dir_name composes <human-slug>-<mid8> canonically,
+    # stripping any NNN- prefix (FR-032, FR-044).
     mission_id = str(ULID())
-    human_slug = strip_numeric_prefix(mission_slug)
-    mission_slug_formatted = f"{human_slug}-{mid8(mission_id)}"
+    mission_slug_formatted = mission_dir_name(
+        mission_slug,
+        mid8=resolve_mid8("", mission_id=mission_id),
+    )
 
     feature_dir = resolved_root / KITTY_SPECS_DIR / mission_slug_formatted
     feature_dir.mkdir(parents=True, exist_ok=True)
@@ -381,25 +403,58 @@ def create_mission_core(
     meta.setdefault("created_at", datetime.now(timezone.utc).isoformat())  # noqa: UP017
 
     # ------------------------------------------------------------------
-    # 6.5 Coordination branch (WP03 / issue #1348)
+    # 6.5 Coordination branch (WP03 / issue #1348, #2218)
     #
     # Mint (or idempotently reuse) the per-mission coordination branch
-    # ``kitty/mission-<slug>-<mid8>`` parented off ``planning_branch``.
-    # This is the topology foundation that WP04 (CoordinationWorkspace) and
-    # WP05 (BookkeepingTransaction) build upon.  Persisting the branch ref
-    # in ``meta.json`` makes downstream commands self-describing — no
-    # re-derivation, no drift.
+    # ``kitty/mission-<slug>-<mid8>`` parented off ``planning_branch`` — but
+    # ONLY for the coordination-bearing shapes the operator chose. The
+    # branch-flat shapes (``SINGLE_BRANCH`` / ``LANES``) skip the mint and
+    # never write ``coordination_branch``, so create-time topology choice is
+    # honoured end-to-end (#2218). Persisting the branch ref in ``meta.json``
+    # makes downstream commands self-describing — no re-derivation, no drift.
     # ------------------------------------------------------------------
-    from specify_cli.missions._create import ensure_coordination_branch
+    from specify_cli.missions._create import topology_mints_coordination_branch
 
-    coordination_outcome = ensure_coordination_branch(
-        repo_root=resolved_root,
-        mission_slug=mission_slug_formatted,
-        mission_id=mission_id,
-        target_branch=planning_branch,
-        force_recreate=force_recreate_coordination_branch,
-    )
-    meta["coordination_branch"] = coordination_outcome.branch_name
+    coordination_branch_value: str | None = None
+    coordination_branch_created_flag = False
+    if topology_mints_coordination_branch(topology):
+        from specify_cli.missions._create import ensure_coordination_branch
+
+        coordination_outcome = ensure_coordination_branch(
+            repo_root=resolved_root,
+            mission_slug=mission_slug_formatted,
+            mission_id=mission_id,
+            target_branch=planning_branch,
+            force_recreate=force_recreate_coordination_branch,
+        )
+        coordination_branch_value = coordination_outcome.branch_name
+        coordination_branch_created_flag = coordination_outcome.created
+        meta["coordination_branch"] = coordination_outcome.branch_name
+
+    # ------------------------------------------------------------------
+    # 6.6 Mission topology (FR-002 / #2069, #2218)
+    #
+    # STORE the operator's explicit ``MissionTopology`` choice verbatim so it is
+    # READ thereafter, never re-inferred from disk/git at resolve time. The
+    # explicit choice is authoritative because ``classify_topology`` CANNOT
+    # reproduce the ``LANES`` selection at create time (no ``lanes.json`` exists
+    # pre-``finalize-tasks``). We only use the classifier to CORROBORATE the
+    # coordination-determined cells (``COORD`` / ``SINGLE_BRANCH``): the minted
+    # state must agree with the stored choice, else fail closed. ``flattened`` is
+    # a separate boolean provenance flag, NOT a topology value.
+    # ------------------------------------------------------------------
+    from mission_runtime import classify_topology
+
+    if topology in (MissionTopology.COORD, MissionTopology.SINGLE_BRANCH):
+        corroborated = classify_topology(meta.get("coordination_branch") or None, has_lanes=False)
+        if corroborated is not topology:
+            raise MissionCreationError(
+                f"Topology corroboration failed for '{mission_slug_formatted}': stored "
+                f"'{topology.value}' but the minted coordination state classifies as "
+                f"'{corroborated.value}'."
+            )
+    meta["topology"] = topology.value
+    meta.setdefault("flattened", False)
 
     from specify_cli.mission_metadata import set_documentation_state, write_meta
 
@@ -489,32 +544,13 @@ def create_mission_core(
             _phase_evt_exc,
         )
 
-    # Best-effort SaaS fan-out (occurs after local persistence above).
-    with contextlib.suppress(Exception):
-        emit_mission_created(
-            mission_slug=mission_slug_formatted,
-            mission_number=None,  # no number pre-merge (FR-044)
-            mission_type=str(meta.get("mission_type") or mission or "software-dev"),
-            target_branch=planning_branch,
-            wp_count=0,
-            friendly_name=normalized_friendly_name,
-            purpose_tldr=normalized_purpose_tldr,
-            purpose_context=normalized_purpose_context,
-            created_at=str(meta["created_at"]) if meta.get("created_at") else None,
-            mission_id=meta.get("mission_id"),
-        )
+    # Dossier sync (fire-and-forget via registered adapter)
+    # SaaS fan-out is already handled by emit_mission_created_local above —
+    # it calls fire_lifecycle_saas_fanout internally via append_lifecycle_event.
+    # No direct INTEGRATION imports needed here (FR-004/FR-006).
+    from specify_cli.status import fire_dossier_sync
 
-    # Dossier sync (fire-and-forget)
-    with contextlib.suppress(Exception):
-        from specify_cli.sync.dossier_pipeline import (
-            trigger_feature_dossier_sync_if_enabled,
-        )
-
-        trigger_feature_dossier_sync_if_enabled(
-            feature_dir,
-            mission_slug_formatted,
-            resolved_root,
-        )
+    fire_dossier_sync(feature_dir, mission_slug_formatted, resolved_root)
 
     # ------------------------------------------------------------------
     # 9. Consume pending origin if present (ticket-first flow)
@@ -547,8 +583,8 @@ def create_mission_core(
         origin_binding_attempted=origin_binding_attempted,
         origin_binding_succeeded=origin_binding_succeeded,
         origin_binding_error=origin_binding_error,
-        coordination_branch=coordination_outcome.branch_name,
-        coordination_branch_created=coordination_outcome.created,
+        coordination_branch=coordination_branch_value,
+        coordination_branch_created=coordination_branch_created_flag,
     )
 
 
@@ -558,51 +594,22 @@ def _consume_pending_origin_if_present(
     feature_dir: Path,
     meta: dict[str, Any],
 ) -> tuple[bool, bool, str | None, dict[str, Any]]:
-    """Bind a staged pending origin after mission creation, if present."""
-    from specify_cli.tracker.origin import OriginBindingError, bind_mission_origin
-    from specify_cli.tracker.origin_models import OriginCandidate
-    from specify_cli.tracker.ticket_context import clear_pending_origin, read_pending_origin
+    """Bind a staged pending origin after mission creation, if present.
 
-    pending = read_pending_origin(repo_root)
-    if not pending:
-        return False, False, None, meta
+    Dispatches to the registered PendingOriginConsumer via
+    ``core.adapters.consume_pending_origin`` so that this module carries no
+    direct INTEGRATION imports (FR-004/FR-006).  The concrete implementation
+    lives in ``tracker/origin_consumer.py`` and is registered at tracker
+    startup.  When no consumer is registered the call is a safe no-op
+    that returns ``(False, False, None, meta)``.
+    """
+    from specify_cli.core.adapters import consume_pending_origin
 
-    provider = str(pending.get("provider") or "").strip().lower()
-    issue_id = str(pending.get("issue_id") or "").strip()
-    issue_key = str(pending.get("issue_key") or "").strip()
-
-    if not provider or not issue_id or not issue_key:
-        return (
-            True,
-            False,
-            "Pending origin is missing required provider/issue identifiers.",
-            meta,
-        )
-
-    candidate = OriginCandidate(
-        external_issue_id=issue_id,
-        external_issue_key=issue_key,
-        title=str(pending.get("title") or "").strip(),
-        status=str(pending.get("status") or "").strip(),
-        url=str(pending.get("url") or "").strip(),
-        match_type="pending_origin",
-        body=str(pending.get("body") or "").strip() or None,
+    # Typed binding required: mypy uses follow_imports=skip for specify_cli.*
+    # so the return of consume_pending_origin is seen as Any here; the
+    # explicit annotation re-introduces the correct return type so the caller
+    # does not propagate Any (no blanket suppression needed).
+    result: tuple[bool, bool, str | None, dict[str, Any]] = consume_pending_origin(
+        repo_root, feature_dir, meta
     )
-
-    try:
-        updated_meta, _ = bind_mission_origin(
-            feature_dir=feature_dir,
-            candidate=candidate,
-            provider=provider,
-            resource_type=None,
-            resource_id=None,
-        )
-    except OriginBindingError as exc:
-        logger.warning("Pending origin bind failed for %s: %s", feature_dir, exc)
-        return True, False, str(exc), meta
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Pending origin bind failed unexpectedly for %s: %s", feature_dir, exc)
-        return True, False, str(exc), meta
-
-    clear_pending_origin(repo_root)
-    return True, True, None, updated_meta
+    return result

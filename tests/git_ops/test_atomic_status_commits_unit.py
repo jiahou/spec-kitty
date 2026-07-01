@@ -28,6 +28,17 @@ from specify_cli.cli.commands.agent.tasks import (
     _validate_ready_for_review,
     app,
 )
+from specify_cli.coordination.commit_router import CommitRouterResult
+
+
+def _committed_result(ref: str = "main") -> CommitRouterResult:
+    """A router result mirroring a successful ``safe_commit`` (WP07 routing)."""
+    return CommitRouterResult(status="committed", placement_ref=ref, commit_hash="0" * 40)
+
+
+def _unchanged_result(ref: str = "main") -> CommitRouterResult:
+    """A router result that maps to the old falsy ``safe_commit`` return (WP07)."""
+    return CommitRouterResult(status="unchanged", placement_ref=ref)
 from specify_cli.status.locking import (
     FeatureStatusLockTimeoutError,
     feature_status_lock,
@@ -85,6 +96,22 @@ def workflow_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Create a minimal repo root for workflow review command tests."""
     repo_root = tmp_path
     (repo_root / ".kittify").mkdir()
+    (repo_root / ".kittify" / "config.yaml").write_text("# Config\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "add", ".kittify/config.yaml"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "seed repo"], cwd=repo_root, check=True, capture_output=True)
     monkeypatch.setenv("SPECIFY_REPO_ROOT", str(repo_root))
     monkeypatch.chdir(repo_root)
     monkeypatch.setattr(
@@ -541,13 +568,13 @@ Test content.
             finally:
                 lock_state["held"] = False
 
-        def fake_safe_commit(**kwargs: object) -> bool:
-            del kwargs
+        def fake_commit_for_mission(*args: object, **kwargs: object) -> CommitRouterResult:
+            del args, kwargs
             assert lock_state["held"] is True
-            return True
+            return _committed_result()
 
         with patch("specify_cli.cli.commands.agent.tasks.feature_status_lock", tracking_lock):
-            with patch("specify_cli.cli.commands.agent.tasks.safe_commit", side_effect=fake_safe_commit):
+            with patch("specify_cli.cli.commands.agent.tasks.commit_for_mission", side_effect=fake_commit_for_mission):
                 result = runner.invoke(
                     app,
                     ["move-task", "WP01", "--to", "for_review", "--json"],
@@ -587,7 +614,7 @@ Test content.
 
         with (
             patch("specify_cli.cli.commands.agent.tasks.emit_status_transition_transactional", side_effect=tracking_emit),
-            patch("specify_cli.cli.commands.agent.tasks.safe_commit", return_value=True),
+            patch("specify_cli.cli.commands.agent.tasks.commit_for_mission", return_value=_committed_result("status-test")),
             patch("specify_cli.cli.commands.agent.tasks.console.print") as mock_print,
         ):
             result = runner.invoke(
@@ -635,7 +662,7 @@ Test content.
         mock_slug.return_value = "017-test-feature"
 
         with (
-            patch("specify_cli.cli.commands.agent.tasks.safe_commit", return_value=False),
+            patch("specify_cli.cli.commands.agent.tasks.commit_for_mission", return_value=_unchanged_result()),
             patch("specify_cli.cli.commands.agent.tasks.console.print") as mock_print,
         ):
             result = runner.invoke(
@@ -644,8 +671,13 @@ Test content.
             )
 
         assert result.exit_code == 0, result.stdout
+        # WP02 (#2155 / T010): the contract is that move_task WARNS (never fails)
+        # when the router reports a non-committed result — exit_code stays 0. The
+        # warning wording now surfaces the router status/diagnostic ("...did not
+        # land (<status>)") instead of the bare "Failed to auto-commit" so a
+        # swallowed guard refusal is no longer hidden behind a soft, opaque message.
         assert any(
-            "Failed to auto-commit" in str(call.args[0])
+            "auto-commit did not land" in str(call.args[0])
             for call in mock_print.call_args_list
             if call.args
         )
@@ -656,8 +688,13 @@ class TestMarkStatusAtomicCommit:
 
     @pytest.fixture
     def git_repo_with_feature(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        """Create a git repo with a feature for mark-status testing."""
-        monkeypatch.setenv("SPEC_KITTY_TEST_MODE", "1")
+        """Create a git repo with a feature for mark-status testing.
+
+        The fixture branch is protected ``main``; the documented operator
+        escape hatch is the ONE sanctioned waiver for committing there
+        (``SPEC_KITTY_TEST_MODE`` no longer waives the pre-check).
+        """
+        monkeypatch.setenv("SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS", "1")
         repo = tmp_path / "test-repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
@@ -718,14 +755,14 @@ class TestMarkStatusAtomicCommit:
             finally:
                 lock_state["held"] = False
 
-        def fake_safe_commit(**kwargs: object) -> bool:
-            del kwargs
+        def fake_commit_for_mission(*args: object, **kwargs: object) -> CommitRouterResult:
+            del args, kwargs
             assert lock_state["held"] is True
-            return True
+            return _committed_result()
 
         with (
             patch("specify_cli.cli.commands.agent.tasks.feature_status_lock", tracking_lock),
-            patch("specify_cli.cli.commands.agent.tasks.safe_commit", side_effect=fake_safe_commit),
+            patch("specify_cli.cli.commands.agent.tasks.commit_for_mission", side_effect=fake_commit_for_mission),
             patch("specify_cli.cli.commands.agent.tasks.console.print") as mock_print,
         ):
             result = runner.invoke(
@@ -795,7 +832,7 @@ class TestMarkStatusAtomicCommit:
         _write_feature_tasks_md(feature_dir)
 
         with (
-            patch("specify_cli.cli.commands.agent.tasks.safe_commit", return_value=False),
+            patch("specify_cli.cli.commands.agent.tasks.commit_for_mission", return_value=_unchanged_result()),
             patch("specify_cli.cli.commands.agent.tasks.console.print") as mock_print,
         ):
             result = runner.invoke(
@@ -830,7 +867,7 @@ class TestMarkStatusAtomicCommit:
         _write_feature_tasks_md(feature_dir)
 
         with (
-            patch("specify_cli.cli.commands.agent.tasks.safe_commit", side_effect=RuntimeError("commit boom")),
+            patch("specify_cli.cli.commands.agent.tasks.commit_for_mission", side_effect=RuntimeError("commit boom")),
             patch("specify_cli.cli.commands.agent.tasks.console.print") as mock_print,
         ):
             result = runner.invoke(

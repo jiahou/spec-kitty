@@ -284,11 +284,21 @@ class TestBuildDoneEvidence:
 
 
 class TestLoadMissionId:
-    """Tests for tolerant mission_id reads from meta.json."""
+    """Tests for tolerant mission_id reads from meta.json (on_malformed="none" contract).
+
+    Both missing and malformed meta.json must return None — the converted
+    site uses load_meta(allow_missing=True, on_malformed="none").
+    """
 
     def test_malformed_meta_returns_none(self, feature_dir: Path) -> None:
         """Malformed meta.json degrades to None instead of raising."""
         (feature_dir / "meta.json").write_text("{bad json", encoding="utf-8")
+
+        assert _load_mission_id(feature_dir) is None
+
+    def test_missing_meta_returns_none(self, feature_dir: Path) -> None:
+        """Missing meta.json degrades to None instead of raising FileNotFoundError."""
+        assert not (feature_dir / "meta.json").exists()
 
         assert _load_mission_id(feature_dir) is None
 
@@ -298,12 +308,6 @@ class TestLoadMissionId:
 
 class TestEmitStatusTransition:
     """Tests for the main emit orchestration function."""
-
-    def test_feature_status_lock_root_falls_back_to_feature_dir(self, tmp_path: Path) -> None:
-        """Non-standard feature dirs still get a deterministic local lock root."""
-        feature_dir = tmp_path / "standalone-feature"
-
-        assert emit_module._feature_status_lock_root(feature_dir, repo_root=None) == feature_dir
 
     def test_transition_request_rejects_mixed_legacy_args(self, feature_dir: Path):
         """TransitionRequest calls must not also pass legacy arguments."""
@@ -879,19 +883,25 @@ class TestPhase1CompatibilityBridge:
     def test_phase1_dual_write_disabled_on_invalid_meta(
         self,
         feature_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        monkeypatch.setattr(
-            emit_module,
-            "load_meta",
-            lambda feature_dir: (_ for _ in ()).throw(ValueError("bad meta")),
-        )
+        # Write malformed JSON to meta.json — observable contract: returns False
+        # and logs a warning about the invalid file (not a call-graph assertion).
+        (feature_dir / "meta.json").write_text("{bad json", encoding="utf-8")
 
         with caplog.at_level("WARNING"):
             assert _phase1_dual_write_enabled(feature_dir) is False
 
         assert "Invalid meta.json" in caplog.text
+
+    def test_phase1_dual_write_disabled_on_missing_meta(
+        self,
+        feature_dir: Path,
+    ) -> None:
+        """Missing meta.json silently disables phase-1 mirroring (returns False)."""
+        assert not (feature_dir / "meta.json").exists()
+
+        assert _phase1_dual_write_enabled(feature_dir) is False
 
     def test_find_wp_file_handles_missing_tasks_and_multiple_matches(
         self,

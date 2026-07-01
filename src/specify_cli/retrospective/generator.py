@@ -18,14 +18,18 @@ Design decision:
 from __future__ import annotations
 
 from specify_cli.core.constants import KITTY_SPECS_DIR
+from specify_cli.lanes.branch_naming import resolve_mid8
 import contextlib
 import datetime
 import json
+import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from specify_cli.mission_metadata import load_meta_or_empty
 from specify_cli.retrospective.schema import (
+    FindingsStatus,
     GenActor,
     GenEvidenceRef,
     GenFinding,
@@ -35,16 +39,23 @@ from specify_cli.retrospective.schema import (
     ProvenanceKind,
     validate_record,
 )
-# NOTE: ``REVIEWER_SELF_APPROVAL`` is imported lazily inside the consuming
-# function (see below) rather than at module scope. This module is reached
-# during ``status`` package initialization (status.models →
-# retrospective.schema → retrospective.__init__ → generator), so a module-level
-# ``from specify_cli.status import ...`` would form an import cycle against the
-# partially-initialized facade. The lazy import keeps the consumer on the public
-# facade without re-introducing a deep ``status.*`` submodule import.
+# NOTE: ``REVIEWER_SELF_APPROVAL`` and ``Lane`` are imported lazily inside the
+# consuming functions rather than at module scope. This module is reached
+# during ``status`` package initialization via:
+#   status/__init__.py → status/models.py → retrospective/__init__.py → generator.py
+# A module-level ``from specify_cli.status import ...`` or
+# ``from specify_cli.status.models import ...`` would form a circular import
+# against the partially-initialized status package. The lazy imports keep
+# the consumers on the public facade without triggering the cycle.
+# The former lazy → module-level conversion was attempted but reverted because
+# Python initializes retrospective.__init__ before retrospective.schema when
+# any sub-module of retrospective is imported, triggering generator.py before
+# status.models finishes loading.
 
 if TYPE_CHECKING:
     from specify_cli.retrospective.policy import RetrospectivePolicy
+
+_LOGGER = logging.getLogger(__name__)
 
 # Public constant: version this generator so future tooling can reason about
 # field-by-field freshness.
@@ -62,6 +73,57 @@ _NEEDS_CLARIFICATION_RE = re.compile(r"\[NEEDS CLARIFICATION:", re.IGNORECASE)
 _FR_REF_RE = re.compile(r"\b(FR-\d{3,})\b")
 
 _WP_ID_RE = re.compile(r"^\w{2,5}\d{2,3}$")
+
+# FR-008: the absent-``data-model.md`` gap is conditional on the spec declaring
+# concrete domain entities. A spec "declares domain entities" when it carries a
+# populated "Key Entities" section — at least one real ``- **Name**:`` bullet, not
+# the unfilled template placeholder ``- **[Entity 1]**``.
+_KEY_ENTITIES_HEADING_RE = re.compile(r"^#{1,6}\s+Key Entities", re.IGNORECASE | re.MULTILINE)
+_ENTITY_BULLET_RE = re.compile(r"^\s*[-*]\s+\*\*(?!\[)[^*\n]+\*\*", re.MULTILINE)
+_ANY_HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
+
+# FR-007: tracer ingestion. A tracer entry is a numbered/bulleted item with a bold
+# lead, e.g. ``1. **[implement] symptom ...**`` or ``- **symptom**``.
+_TRACE_ENTRY_RE = re.compile(r"(?m)^\s*(?:\d+\.|[-*])\s+\*\*(.+?)\*\*")
+# Disposition keyword markers used to route a tracer entry to a findings channel.
+# Gap markers take precedence (an explicit "candidate gap" beats an otherwise-clean
+# disposition).
+_TRACE_GAP_MARKERS: tuple[str, ...] = (
+    "candidate gap",
+    "candidate-gap",
+    "open (",
+    "open)",
+    "**open",
+)
+_TRACE_HELPED_MARKERS: tuple[str, ...] = (
+    "no gap",
+    "expected",
+    "worked as designed",
+    "**fixed",
+    "fixed —",
+    "fixed -",
+)
+
+
+def _spec_declares_domain_entities(spec_text: str) -> bool:
+    """Return True when spec.md declares concrete domain entities (FR-008).
+
+    Detects a populated "Key Entities" section: the heading is present AND at least
+    one entity bullet carries a real name (not the ``- **[Entity 1]**`` template
+    placeholder). Missions with no Key Entities section — or only unfilled
+    placeholders — are treated as having no domain entities, so the absent-
+    ``data-model.md`` gap is suppressed for governance/wiring missions.
+    """
+    if not spec_text:
+        return False
+    heading = _KEY_ENTITIES_HEADING_RE.search(spec_text)
+    if heading is None:
+        return False
+    section = spec_text[heading.end():]
+    next_heading = _ANY_HEADING_RE.search(section)
+    if next_heading is not None:
+        section = section[: next_heading.start()]
+    return _ENTITY_BULLET_RE.search(section) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -84,41 +146,36 @@ def _resolve_mission_dir(mission_handle: str, repo_root: Path) -> Path | None:
         return None
 
     # Direct match
-    candidate = specs_root / mission_handle
+    candidate: Path = specs_root / mission_handle
     if candidate.exists() and candidate.is_dir():
         return candidate
 
     # Partial match: scan all dirs, match by slug or mission_id
-    for child in sorted(specs_root.iterdir()):
-        if not child.is_dir():
+    for child in sorted(specs_root.iterdir(), key=lambda p: p.name):
+        child_path = Path(child)
+        if not child_path.is_dir():
             continue
         # Match directory name prefix
-        if child.name == mission_handle or child.name.endswith(f"-{mission_handle}"):
-            return child
+        if child_path.name == mission_handle or child_path.name.endswith(f"-{mission_handle}"):
+            return child_path
         # Match via meta.json mission_id or mission_slug
-        meta_path = child / "meta.json"
+        meta_path = child_path / "meta.json"
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 mid = str(meta.get("mission_id", ""))
                 slug = str(meta.get("mission_slug", ""))
-                if mid == mission_handle or mid[:8] == mission_handle or slug == mission_handle:
-                    return child
+                # SELECTOR prefix-match, not a name compose: compute the canonical
+                # mid8 via the authoritative resolver and compare it to the handle
+                # (FR-001). resolve_mid8 returns "" for an empty/short mission_id,
+                # so an identity-less meta never spuriously matches a mid8 handle.
+                candidate_mid8 = resolve_mid8(slug, mission_id=mid)
+                if mid == mission_handle or candidate_mid8 == mission_handle or slug == mission_handle:
+                    return child_path
             except (json.JSONDecodeError, OSError):
                 continue
 
     return None
-
-
-def _load_meta(feature_dir: Path) -> dict:
-    """Load meta.json; return empty dict if missing or malformed."""
-    meta_path = feature_dir / "meta.json"
-    if not meta_path.exists():
-        return {}
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
 
 
 def _read_optional_text(path: Path) -> str | None:
@@ -131,7 +188,7 @@ def _read_optional_text(path: Path) -> str | None:
     return None
 
 
-def _load_events(feature_dir: Path) -> list[dict]:
+def _load_events(feature_dir: Path) -> list[dict[str, Any]]:
     """Load all status events from status.events.jsonl.
 
     Returns a list of event dicts sorted by natural file order (append order).
@@ -139,7 +196,7 @@ def _load_events(feature_dir: Path) -> list[dict]:
     events_path = feature_dir / "status.events.jsonl"
     if not events_path.exists():
         return []
-    events: list[dict] = []
+    events: list[dict[str, Any]] = []
     for line in events_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -161,6 +218,29 @@ def _load_wp_files(feature_dir: Path) -> list[tuple[str, str]]:
     for wp_path in wp_files:
         with contextlib.suppress(OSError):
             result.append((wp_path.name, wp_path.read_text(encoding="utf-8")))
+    return result
+
+
+def _load_traces(feature_dir: Path) -> list[tuple[str, str]]:
+    """Load tracer markdown files from ``<feature_dir>/traces/*.md`` (FR-007).
+
+    Returns sorted ``(rel_path, text)`` pairs. Best-effort: a tracer that cannot be
+    read as UTF-8 text (binary/corrupt) is skipped with a warning rather than
+    crashing the generator (#2217 edge case). An empty/structureless tracer reads
+    cleanly and simply contributes no findings downstream.
+    """
+    traces_dir = feature_dir / "traces"
+    if not traces_dir.is_dir():
+        return []
+    result: list[tuple[str, str]] = []
+    for trace_path in sorted(traces_dir.glob("*.md"), key=lambda p: p.name):
+        try:
+            text = trace_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            _LOGGER.warning("Skipping unreadable tracer %s: %s", trace_path.name, exc)
+            continue
+        rel = f"kitty-specs/{feature_dir.name}/traces/{trace_path.name}"
+        result.append((rel, text))
     return result
 
 
@@ -196,7 +276,7 @@ def _next_proposal_id(counter: list[int]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _has_review_feedback(event: dict) -> bool:
+def _has_review_feedback(event: dict[str, Any]) -> bool:
     """Return True when a lane event carries documented review feedback."""
     if event.get("review_ref"):
         return True
@@ -220,11 +300,11 @@ _BACKWARD_LANE_MOVES: frozenset[tuple[str, str]] = frozenset({
 })
 
 
-def _is_backward_lane_event(event: dict) -> bool:
+def _is_backward_lane_event(event: dict[str, Any]) -> bool:
     return (event.get("from_lane", ""), event.get("to_lane", "")) in _BACKWARD_LANE_MOVES
 
 
-def _is_review_rejection_event(event: dict) -> bool:
+def _is_review_rejection_event(event: dict[str, Any]) -> bool:
     return (
         event.get("from_lane", "") == "in_review"
         and event.get("to_lane", "") in ("planned", "in_progress", "claimed")
@@ -232,11 +312,11 @@ def _is_review_rejection_event(event: dict) -> bool:
     )
 
 
-def _is_lane_friction_event(event: dict) -> bool:
+def _is_lane_friction_event(event: dict[str, Any]) -> bool:
     return _is_backward_lane_event(event) and not _is_review_rejection_event(event)
 
 
-def _detect_rejection_cycles(events: list[dict]) -> dict[str, int]:
+def _detect_rejection_cycles(events: list[dict[str, Any]]) -> dict[str, int]:
     """Return a mapping of wp_id -> rejection_cycle_count.
 
     A rejection cycle is a documented reviewer-feedback transition out of
@@ -253,7 +333,7 @@ def _detect_rejection_cycles(events: list[dict]) -> dict[str, int]:
     return rejection_counts
 
 
-def _detect_lane_friction(events: list[dict]) -> dict[str, int]:
+def _detect_lane_friction(events: list[dict[str, Any]]) -> dict[str, int]:
     """Return backward lane moves that are not documented reviewer rejections."""
     friction_counts: dict[str, int] = {}
     for event in events:
@@ -265,7 +345,7 @@ def _detect_lane_friction(events: list[dict]) -> dict[str, int]:
     return friction_counts
 
 
-def _detect_done_wps(events: list[dict]) -> set[str]:
+def _detect_done_wps(events: list[dict[str, Any]]) -> set[str]:
     """Return wp_ids that reached 'done' or 'approved' state."""
     done_wps: set[str] = set()
     for event in events:
@@ -300,7 +380,7 @@ _ARBITER_MARKERS: tuple[str, ...] = (
 )
 
 
-def _is_force_override_event(event: dict) -> bool:
+def _is_force_override_event(event: dict[str, Any]) -> bool:
     """Return True if this event is a meaningful operator-driven --force override.
 
     Excludes finalize-tasks / bootstrap synthetic events whose force=True is a
@@ -315,7 +395,7 @@ def _is_force_override_event(event: dict) -> bool:
     return event.get("from_lane") != event.get("to_lane")
 
 
-def _detect_force_overrides(events: list[dict]) -> dict[str, int]:
+def _detect_force_overrides(events: list[dict[str, Any]]) -> dict[str, int]:
     """Count operator-driven --force transitions per WP."""
     counts: dict[str, int] = {}
     for event in events:
@@ -327,7 +407,7 @@ def _detect_force_overrides(events: list[dict]) -> dict[str, int]:
     return counts
 
 
-def _event_wp_id(event: dict) -> str:
+def _event_wp_id(event: dict[str, Any]) -> str:
     """Return WP id from status event top-level fields or lifecycle payload."""
     wp_id = event.get("wp_id")
     if isinstance(wp_id, str) and wp_id:
@@ -340,13 +420,13 @@ def _event_wp_id(event: dict) -> str:
     return ""
 
 
-def _is_reviewer_self_approval_event(event: dict) -> bool:
+def _is_reviewer_self_approval_event(event: dict[str, Any]) -> bool:
     from specify_cli.status import REVIEWER_SELF_APPROVAL
 
-    return event.get("event_type") == REVIEWER_SELF_APPROVAL
+    return bool(event.get("event_type") == REVIEWER_SELF_APPROVAL)
 
 
-def _detect_reviewer_self_approvals(events: list[dict]) -> dict[str, int]:
+def _detect_reviewer_self_approvals(events: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for event in events:
         if not _is_reviewer_self_approval_event(event):
@@ -357,7 +437,7 @@ def _detect_reviewer_self_approvals(events: list[dict]) -> dict[str, int]:
     return counts
 
 
-def _event_note(event: dict) -> str:
+def _event_note(event: dict[str, Any]) -> str:
     """Return the human-readable note/reason text from an event, lower-cased."""
     parts: list[str] = []
     reason = event.get("reason")
@@ -372,7 +452,7 @@ def _event_note(event: dict) -> str:
     return " ".join(parts).lower()
 
 
-def _is_arbiter_event(event: dict) -> bool:
+def _is_arbiter_event(event: dict[str, Any]) -> bool:
     """Return True if event note/reason contains an arbiter override marker."""
     note = _event_note(event)
     if not note:
@@ -380,7 +460,7 @@ def _is_arbiter_event(event: dict) -> bool:
     return any(marker in note for marker in _ARBITER_MARKERS)
 
 
-def _detect_arbiter_overrides(events: list[dict]) -> dict[str, int]:
+def _detect_arbiter_overrides(events: list[dict[str, Any]]) -> dict[str, int]:
     """Count arbiter-override events per WP."""
     counts: dict[str, int] = {}
     for event in events:
@@ -392,13 +472,14 @@ def _detect_arbiter_overrides(events: list[dict]) -> dict[str, int]:
     return counts
 
 
-def _detect_implementation_cycles(events: list[dict]) -> dict[str, int]:
+def _detect_implementation_cycles(events: list[dict[str, Any]]) -> dict[str, int]:
     """Count distinct planned→in_progress (or claimed→in_progress) cycles per WP.
 
     A WP that needs >1 implementation cycle indicates rework that didn't
     surface as a documented review rejection.  Bootstrap and synthetic
     transitions are excluded.
     """
+    from specify_cli.status import Lane as _Lane  # cycle-breaker; see module note
     counts: dict[str, int] = {}
     for event in events:
         wp_id = event.get("wp_id", "")
@@ -409,7 +490,7 @@ def _detect_implementation_cycles(events: list[dict]) -> dict[str, int]:
             continue
         from_lane = event.get("from_lane", "")
         to_lane = event.get("to_lane", "")
-        if from_lane in ("planned", "claimed") and to_lane == "in_progress":
+        if from_lane in (_Lane.PLANNED, _Lane.CLAIMED) and to_lane == _Lane.IN_PROGRESS:
             counts[wp_id] = counts.get(wp_id, 0) + 1
     # Only WPs with MORE THAN ONE cycle are interesting (the first cycle is normal).
     return {wp: n for wp, n in counts.items() if n > 1}
@@ -446,7 +527,11 @@ def _classify_risk(suggested_action: str) -> tuple[str, bool]:
     return "structural", False
 
 
-def _event_id_range_for(events: list[dict], wp_id: str, predicate) -> str:  # type: ignore[no-untyped-def]
+def _event_id_range_for(
+    events: list[dict[str, Any]],
+    wp_id: str,
+    predicate: Any,
+) -> str:
     """Return ``first..last`` (or single id) for events matching ``predicate`` on a WP."""
     ids = [
         str(ev.get("event_id", ""))
@@ -460,7 +545,7 @@ def _event_id_range_for(events: list[dict], wp_id: str, predicate) -> str:  # ty
 
 def _build_event_mining_findings(
     *,
-    events: list[dict],
+    events: list[dict[str, Any]],
     events_rel: str,
     finding_id_counters: dict[str, list[int]],
     ev_reg: _EvidenceRegistry,
@@ -557,7 +642,7 @@ def _build_event_mining_findings(
 
 def _build_lane_friction_findings(
     *,
-    events: list[dict],
+    events: list[dict[str, Any]],
     lane_friction_counts: dict[str, int],
     events_rel: str,
     finding_id_counters: dict[str, list[int]],
@@ -635,21 +720,205 @@ def _resolve_mission_number(raw: object) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Mission-local ingestor findings (T036, T037) — extracted for complexity budget
+# ---------------------------------------------------------------------------
+
+
+def _parse_trace_entries(text: str) -> list[tuple[str, str]]:
+    """Split tracer markdown into ``(summary, body)`` entries (FR-007).
+
+    An entry begins at a numbered/bulleted item with a bold lead and runs until the
+    next such item (or end of file). The bold lead is the summary; the full span is
+    the body (used for disposition classification). Content with no structured
+    entries yields ``[]`` — best-effort, never raises.
+    """
+    matches = list(_TRACE_ENTRY_RE.finditer(text))
+    entries: list[tuple[str, str]] = []
+    for idx, match in enumerate(matches):
+        summary = match.group(1).strip()
+        if not summary:
+            continue
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[match.start():body_end].strip()
+        entries.append((summary, body))
+    return entries
+
+
+def _classify_trace_disposition(body: str) -> str:
+    """Route a tracer entry to a findings channel by its documented disposition.
+
+    Returns one of ``"gap"`` / ``"helped"`` / ``"not_helpful"``. Gap markers win
+    over helped markers; an entry with neither is treated as documented friction
+    (not_helpful).
+    """
+    lowered = body.lower()
+    if any(marker in lowered for marker in _TRACE_GAP_MARKERS):
+        return "gap"
+    if any(marker in lowered for marker in _TRACE_HELPED_MARKERS):
+        return "helped"
+    return "not_helpful"
+
+
+def _build_trace_findings(
+    *,
+    traces: list[tuple[str, str]],
+    finding_id_counters: dict[str, list[int]],
+    ev_reg: _EvidenceRegistry,
+) -> tuple[list[GenFinding], list[GenFinding], list[GenFinding]]:
+    """Build ``(helped, not_helpful, gaps)`` tooling findings from tracers (FR-007).
+
+    Each tracer entry becomes a ``tooling``-category finding routed by its
+    disposition. Tracers with no structured entries contribute nothing.
+    """
+    helped: list[GenFinding] = []
+    not_helpful: list[GenFinding] = []
+    gaps: list[GenFinding] = []
+    bucket: dict[str, tuple[list[GenFinding], str]] = {
+        "helped": (helped, "h"),
+        "not_helpful": (not_helpful, "n"),
+        "gap": (gaps, "g"),
+    }
+    for trace_rel, text in traces:
+        for summary, body in _parse_trace_entries(text):
+            target, prefix = bucket[_classify_trace_disposition(body)]
+            target.append(
+                GenFinding(
+                    id=_next_finding_id(prefix, finding_id_counters),
+                    category="tooling",
+                    summary=f"Tracer: {summary}"[:200],
+                    details=body[:1000],
+                    evidence_refs=[ev_reg.add_file(trace_rel)],
+                )
+            )
+    return helped, not_helpful, gaps
+
+
+def _build_ingestor_findings(
+    *,
+    workflow_failures_text: str | None,
+    analysis_report_text: str | None,
+    review_report_text: str | None,
+    workflow_failures_rel: str,
+    analysis_report_rel: str,
+    review_report_rel: str,
+    finding_id_counters: dict[str, list[int]],
+    ev_reg: _EvidenceRegistry,
+    traces: list[tuple[str, str]] | None = None,
+) -> tuple[list[GenFinding], list[GenFinding], list[GenFinding]]:
+    """Build helped/not_helpful/gaps findings from mission-local ingestor artifacts.
+
+    Returns (helped_additions, not_helpful_additions, gaps_additions).
+    All ingestors are optional: if the file is absent (text is None) the ingestor
+    is a no-op and the generator continues without raising. The tracer ingestor
+    (FR-007) extends this same seam — ``traces`` feed the same finding channels as
+    the workflow-failures-log / analysis-report / mission-review artifacts.
+    """
+    helped: list[GenFinding] = []
+    not_helpful: list[GenFinding] = []
+    gaps: list[GenFinding] = []
+
+    # workflow-failures-log.md ingestor (T036)
+    if workflow_failures_text is not None:
+        failure_lines = [
+            line.strip()
+            for line in workflow_failures_text.splitlines()
+            if line.strip().startswith(("- [ ] FAIL:", "### FAIL:"))
+        ]
+        if failure_lines:
+            for failure_line in failure_lines:
+                not_helpful.append(
+                    GenFinding(
+                        id=_next_finding_id("n", finding_id_counters),
+                        category="process",
+                        summary=failure_line[:200],
+                        details=(
+                            "Workflow failure recorded in workflow-failures-log.md. "
+                            f"Entry: {failure_line}"
+                        ),
+                        evidence_refs=[ev_reg.add_file(workflow_failures_rel)],
+                    )
+                )
+        else:
+            # File present but no structured failure entries
+            helped.append(
+                GenFinding(
+                    id=_next_finding_id("h", finding_id_counters),
+                    category="process",
+                    summary="workflow-failures-log.md present with no recorded failures",
+                    details=(
+                        "A workflow-failures-log.md file is present but contains no "
+                        "structured failure entries (lines starting with '- [ ] FAIL:' "
+                        "or '### FAIL:'). This may indicate all workflows completed cleanly."
+                    ),
+                    evidence_refs=[ev_reg.add_file(workflow_failures_rel)],
+                )
+            )
+
+    # analysis-report.md ingestor (T037)
+    if analysis_report_text is not None:
+        not_helpful.append(
+            GenFinding(
+                id=_next_finding_id("n", finding_id_counters),
+                category="doc",
+                summary="analysis-report.md present with findings",
+                details=(
+                    "An analysis-report.md artifact is present for this mission. "
+                    "Review its findings to understand documented issues and decisions."
+                ),
+                evidence_refs=[ev_reg.add_file(analysis_report_rel)],
+            )
+        )
+
+    # mission-review-report.md ingestor (T037)
+    if review_report_text is not None:
+        not_helpful.append(
+            GenFinding(
+                id=_next_finding_id("n", finding_id_counters),
+                category="review_loop",
+                summary="mission-review-report.md present with findings",
+                details=(
+                    "A mission-review-report.md artifact is present for this mission. "
+                    "Review its findings to understand documented review outcomes."
+                ),
+                evidence_refs=[ev_reg.add_file(review_report_rel)],
+            )
+        )
+
+    # Tracer ingestor (T012 / FR-007) — extends this seam, same finding channels.
+    trace_helped, trace_not_helpful, trace_gaps = _build_trace_findings(
+        traces=traces or [],
+        finding_id_counters=finding_id_counters,
+        ev_reg=ev_reg,
+    )
+    helped.extend(trace_helped)
+    not_helpful.extend(trace_not_helpful)
+    gaps.extend(trace_gaps)
+
+    return helped, not_helpful, gaps
+
+
+# ---------------------------------------------------------------------------
 # Findings classification (T009) — extracted to keep generate_retrospective simple
 # ---------------------------------------------------------------------------
 
 
 def _build_findings(
     *,
-    events: list[dict],
+    events: list[dict[str, Any]],
     spec_text: str,
-    plan_text: str,
     research_text: str | None,
     data_model_text: str | None,
+    workflow_failures_text: str | None,
+    analysis_report_text: str | None,
+    review_report_text: str | None,
+    traces: list[tuple[str, str]],
     wp_files: list[tuple[str, str]],
     wp_evidence_ids: dict[str, str],
     events_rel: str,
     spec_rel: str,
+    workflow_failures_rel: str,
+    analysis_report_rel: str,
+    review_report_rel: str,
     generate_proposals: bool,
     ev_reg: _EvidenceRegistry,
 ) -> tuple[list[GenFinding], list[GenFinding], list[GenFinding], list[GenProposal]]:
@@ -668,13 +937,20 @@ def _build_findings(
     lane_friction_counts = _detect_lane_friction(events)
     done_wps = _detect_done_wps(events)
 
-    # --- Helped: WPs completed without rejection cycles (only notable by contrast)
+    # --- Helped: WPs completed without rejection cycles.
+    # Notable by contrast when rejection/friction exists; always notable when
+    # ingestor artifacts (workflow-failures-log, analysis-report, mission-review-report)
+    # are present, because those records document concrete failures that the
+    # clean WPs avoided.
+    has_ingestor_content = bool(
+        workflow_failures_text or analysis_report_text or review_report_text
+    )
     clean_wps = [
         wp
         for wp in sorted(done_wps)
         if rejection_counts.get(wp, 0) == 0 and lane_friction_counts.get(wp, 0) == 0
     ]
-    if rejection_counts or lane_friction_counts:
+    if rejection_counts or lane_friction_counts or has_ingestor_content:
         for wp_id in clean_wps:
             wp_file_name = f"{wp_id}.md"
             if wp_file_name in wp_evidence_ids:
@@ -792,19 +1068,38 @@ def _build_findings(
                     evidence_refs=[ev_reg.add_file(spec_rel)],
                 )
             )
-        if data_model_text is None and (spec_text or plan_text):
+        # FR-008: only flag the absent data-model when the spec declares concrete
+        # domain entities. Governance/wiring missions with no Key Entities section
+        # legitimately have no data model, so the gap would be a false positive.
+        if data_model_text is None and _spec_declares_domain_entities(spec_text):
             gaps.append(
                 GenFinding(
                     id=_next_finding_id("g", finding_id_counters),
                     category="doc",
                     summary="data-model.md absent",
                     details=(
-                        "spec.md is present but data-model.md is missing. "
+                        "spec.md declares domain entities but data-model.md is missing. "
                         "A data model document clarifies domain entity relationships."
                     ),
                     evidence_refs=[ev_reg.add_file(spec_rel)],
                 )
             )
+
+    # --- Mission-local ingestor findings (T036, T037, T012/FR-007 tracers)
+    ingestor_helped, ingestor_not_helpful, ingestor_gaps = _build_ingestor_findings(
+        workflow_failures_text=workflow_failures_text,
+        analysis_report_text=analysis_report_text,
+        review_report_text=review_report_text,
+        workflow_failures_rel=workflow_failures_rel,
+        analysis_report_rel=analysis_report_rel,
+        review_report_rel=review_report_rel,
+        traces=traces,
+        finding_id_counters=finding_id_counters,
+        ev_reg=ev_reg,
+    )
+    helped.extend(ingestor_helped)
+    not_helpful.extend(ingestor_not_helpful)
+    gaps.extend(ingestor_gaps)
 
     # Stable sort: byte-deterministic output
     helped.sort(key=lambda f: (f.category, f.summary))
@@ -833,10 +1128,10 @@ def generate_retrospective(
 ) -> GenRetrospectiveRecord:
     """Generate a deterministic retrospective record for the given mission.
 
-    Reads mission artifacts in the order specified by the WP02 prompt:
-    meta.json → spec.md → plan.md → research.md → data-model.md → contracts/
-    → quickstart.md → tasks.md → tasks/WP*.md → status.events.jsonl
-    → mission-review-report.md → charter context.
+    Reads mission artifacts in canonical order:
+    meta.json → spec.md → plan.md → research.md → data-model.md
+    → tasks.md → tasks/WP*.md → status.events.jsonl
+    → workflow-failures-log.md → analysis-report.md → mission-review-report.md.
 
     Missing optional artifacts become 'gaps' entries, NOT exceptions.
 
@@ -878,7 +1173,7 @@ def generate_retrospective(
     # ------------------------------------------------------------------
     # Step 2: Read artifacts in canonical order
     # ------------------------------------------------------------------
-    meta = _load_meta(feature_dir)
+    meta = load_meta_or_empty(feature_dir)
 
     spec_text = _read_optional_text(feature_dir / "spec.md") or ""
     plan_text = _read_optional_text(feature_dir / "plan.md") or ""
@@ -887,6 +1182,14 @@ def generate_retrospective(
     # Optional artifacts
     research_text = _read_optional_text(feature_dir / "research.md")
     data_model_text = _read_optional_text(feature_dir / "data-model.md")
+
+    # Mission-local ingestor artifacts (T036, T037)
+    workflow_failures_text = _read_optional_text(feature_dir / "workflow-failures-log.md")
+    analysis_report_text = _read_optional_text(feature_dir / "analysis-report.md")
+    review_report_text = _read_optional_text(feature_dir / "mission-review-report.md")
+
+    # Tracer artifacts (T012 / FR-007): traces/*.md feed the ingestor seam.
+    traces = _load_traces(feature_dir)
 
     wp_files = _load_wp_files(feature_dir)
     events = _load_events(feature_dir)
@@ -900,6 +1203,9 @@ def generate_retrospective(
     tasks_rel = f"kitty-specs/{feature_dir.name}/tasks.md"
     events_rel = f"kitty-specs/{feature_dir.name}/status.events.jsonl"
     meta_rel = f"kitty-specs/{feature_dir.name}/meta.json"
+    workflow_failures_rel = f"kitty-specs/{feature_dir.name}/workflow-failures-log.md"
+    analysis_report_rel = f"kitty-specs/{feature_dir.name}/analysis-report.md"
+    review_report_rel = f"kitty-specs/{feature_dir.name}/mission-review-report.md"
 
     if meta:
         ev_reg.add_file(meta_rel)
@@ -925,13 +1231,19 @@ def generate_retrospective(
     helped, not_helpful, gaps, proposals = _build_findings(
         events=events,
         spec_text=spec_text,
-        plan_text=plan_text,
         research_text=research_text,
         data_model_text=data_model_text,
+        workflow_failures_text=workflow_failures_text,
+        analysis_report_text=analysis_report_text,
+        review_report_text=review_report_text,
+        traces=traces,
         wp_files=wp_files,
         wp_evidence_ids=wp_evidence_ids,
         events_rel=events_rel,
         spec_rel=spec_rel,
+        workflow_failures_rel=workflow_failures_rel,
+        analysis_report_rel=analysis_report_rel,
+        review_report_rel=review_report_rel,
         generate_proposals=policy.generate_proposals,
         ev_reg=ev_reg,
     )
@@ -941,7 +1253,7 @@ def generate_retrospective(
     # NOTE: "missing" and "failed" are event-payload-only states and
     # MUST NOT appear in a persisted RetrospectiveRecord.
     # ------------------------------------------------------------------
-    findings_status = "has_findings" if any([helped, not_helpful, gaps, proposals]) else "ran_no_findings"
+    findings_status: FindingsStatus = "has_findings" if any([helped, not_helpful, gaps, proposals]) else "ran_no_findings"
 
     # ------------------------------------------------------------------
     # Step 6: Resolve mission identity from meta.json
@@ -975,7 +1287,7 @@ def generate_retrospective(
         created_by=actor,
         provenance=provenance,
         policy_source=dict(policy_source),
-        findings_status=findings_status,  # type: ignore[arg-type]
+        findings_status=findings_status,
         helped=helped,
         not_helpful=not_helpful,
         gaps=gaps,

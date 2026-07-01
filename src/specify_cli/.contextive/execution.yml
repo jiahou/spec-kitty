@@ -1,7 +1,7 @@
 # GENERATED FILE — do not edit manually.
 # Run: python scripts/generate_contextive_glossaries.py generate
 #
-# Source: glossary/contexts/execution.md
+# Source: docs/context/execution.md
 
 contexts:
   - name: "Execution"
@@ -43,3 +43,5 @@ contexts:
         definition: "User-facing command surface that triggers a lifecycle operation (for example specify, plan, tasks, review, merge)."
       - name: "Tool"
         definition: "Concrete runtime product used to execute commands (for example Claude Code, Codex, opencode)."
+      - name: "Tool Surface"
+        definition: "A tool-visible artifact or configuration entry that Spec Kitty installs, verifies, repairs, or packages for a concrete execution tool."

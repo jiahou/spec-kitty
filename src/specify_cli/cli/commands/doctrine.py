@@ -4,6 +4,10 @@ Surface area:
 
 * ``spec-kitty doctrine fetch [--pack <name>] [--dry-run]`` — fetch one or
   all configured org doctrine packs into their local snapshot directories.
+* ``spec-kitty doctrine regenerate-graph [--check] [--json]`` — deterministically
+  regenerate the shipped DRG ``graph.yaml`` from the built-in doctrine tree
+  (FR-009 / WP09). ``--check`` compares without writing and exits non-zero when
+  the committed graph is stale.
 * ``spec-kitty doctrine pack validate <pack-path> [--json]`` — validate a
   doctrine pack against the artifact / DRG / org-charter contracts.
 * ``spec-kitty doctrine pack assemble <out> <inputs...> [--force]
@@ -43,6 +47,8 @@ from rich.console import Console
 from rich.table import Table
 
 __all__ = ["app"]
+
+_JSON_OPTION_HELP = "Emit machine-readable JSON instead of rich text."
 
 app = typer.Typer(
     name="doctrine",
@@ -135,7 +141,7 @@ def fetch(
 
     any_failed = False
     for pack in target_packs:
-        result = fetch_pack(pack)
+        result = fetch_pack(pack, repo_root)
         if result.ok:
             console.print(
                 f"[green]Pack '{pack.name}': {result.artifacts_written} "
@@ -154,6 +160,135 @@ def fetch(
 
 
 # ----------------------------------------------------------------------
+# regenerate-graph — deterministic DRG regeneration (FR-009 / WP09 T026)
+# ----------------------------------------------------------------------
+def _doctrine_root() -> Path:
+    """Return the built-in doctrine root that owns the shipped ``graph.yaml``.
+
+    The extractor walks ``<doctrine_root>/directives/built-in`` etc. and writes
+    ``<doctrine_root>/graph.yaml``. Regeneration must target the *working-tree*
+    source (``src/doctrine``) when invoked from inside a spec-kitty checkout —
+    that is the file the freshness gate reads and that a developer commits.
+
+    Resolution order:
+      1. Walk up from CWD for a ``src/doctrine`` dir carrying built-in
+         artifacts (``directives/built-in``) and a committed ``graph.yaml``.
+      2. Fall back to the installed :mod:`doctrine` package directory (e.g. a
+         consumer project running the CLI from a non-editable install).
+    """
+    cwd = Path.cwd().resolve()
+    for candidate in [cwd, *cwd.parents]:
+        src_doctrine = candidate / "src" / "doctrine"
+        if (src_doctrine / "directives" / "built-in").is_dir():
+            return src_doctrine
+
+    import doctrine
+
+    return Path(doctrine.__file__).resolve().parent
+
+
+@app.command(name="regenerate-graph")
+def regenerate_graph(
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help=(
+            "Do not write; regenerate into a temp file and compare against the "
+            "committed graph.yaml. Exit 1 when stale (operator-runnable freshness "
+            "gate). Exit 0 when fresh."
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=_JSON_OPTION_HELP,
+    ),
+) -> None:
+    """Regenerate the shipped DRG ``graph.yaml`` deterministically (FR-009).
+
+    Composes the DRG extractor + calibrator into ``src/doctrine/graph.yaml``.
+    Running twice on unchanged inputs yields byte-identical output. With
+    ``--check`` the command never writes: it regenerates into a temp file and
+    compares against the committed graph, exiting non-zero when stale — the
+    operator-facing twin of the ``test_shipped_graph_yaml_is_fresh`` gate.
+    """
+    import tempfile
+
+    from doctrine.drg.migration.extractor import generate_graph
+    from doctrine.drg.validator import DRGValidationError
+
+    doctrine_root = _doctrine_root()
+    committed = doctrine_root / "graph.yaml"
+
+    if check:
+        with tempfile.TemporaryDirectory() as tmp:
+            generated = Path(tmp) / "graph.yaml"
+            try:
+                generate_graph(doctrine_root, generated)
+            except DRGValidationError as exc:
+                _emit_regen_result(
+                    status="invalid",
+                    path=committed,
+                    json_output=json_output,
+                    detail="; ".join(exc.errors),
+                )
+                raise typer.Exit(1) from exc
+            fresh = generated.read_text(encoding="utf-8") == committed.read_text(
+                encoding="utf-8"
+            )
+        _emit_regen_result(
+            status="fresh" if fresh else "stale",
+            path=committed,
+            json_output=json_output,
+        )
+        raise typer.Exit(0 if fresh else 1)
+
+    try:
+        generate_graph(doctrine_root, committed)
+    except DRGValidationError as exc:
+        _emit_regen_result(
+            status="invalid",
+            path=committed,
+            json_output=json_output,
+            detail="; ".join(exc.errors),
+        )
+        raise typer.Exit(1) from exc
+
+    _emit_regen_result(status="written", path=committed, json_output=json_output)
+    raise typer.Exit(0)
+
+
+def _emit_regen_result(
+    *,
+    status: str,
+    path: Path,
+    json_output: bool,
+    detail: str | None = None,
+) -> None:
+    """Render the regenerate-graph outcome as JSON or rich text."""
+    if json_output:
+        payload: dict[str, object] = {"status": status, "path": str(path)}
+        if detail is not None:
+            payload["detail"] = detail
+        console.print_json(json.dumps(payload))
+        return
+
+    if status == "written":
+        console.print(f"[green]Regenerated DRG graph:[/green] {path}")
+    elif status == "fresh":
+        console.print(f"[green]DRG graph is fresh:[/green] {path}")
+    elif status == "stale":
+        console.print(
+            f"[red]DRG graph is stale:[/red] {path}\n"
+            "Run [bold]spec-kitty doctrine regenerate-graph[/bold] and commit the result."
+        )
+    elif status == "invalid":
+        console.print(
+            f"[red]DRG graph failed validation:[/red] {detail or '(no detail)'}"
+        )
+
+
+# ----------------------------------------------------------------------
 # pack validate
 # ----------------------------------------------------------------------
 @pack_app.command(name="validate")
@@ -165,7 +300,7 @@ def pack_validate(
     json_output: bool = typer.Option(
         False,
         "--json",
-        help="Emit machine-readable JSON instead of rich text.",
+        help=_JSON_OPTION_HELP,
     ),
 ) -> None:
     """Validate a doctrine pack against schema and DRG constraints.
@@ -212,7 +347,7 @@ def pack_assemble(
     json_output: bool = typer.Option(
         False,
         "--json",
-        help="Emit machine-readable JSON instead of rich text.",
+        help=_JSON_OPTION_HELP,
     ),
 ) -> None:
     """Assemble multiple doctrine packs into a single distributable.
@@ -244,8 +379,9 @@ def pack_assemble(
 # new — scaffold a stub artifact (FR-016 / WP09 T048)
 # ----------------------------------------------------------------------
 
-#: Canonical artifact kinds the scaffolder supports.  The plural form names
-#: the on-disk directory (``directives/``, ``styleguides/``, …) and the
+#: Canonical artifact kinds the scaffolder supports. The plural form names the
+#: pack-mode directory (``directives/``, ``styleguides/``, …); project mode uses
+#: the singular project overlay directories for the runtime-managed kinds. The
 #: singular form becomes the YAML filename suffix
 #: (``foo.directive.yaml``).  Order is the canonical listing order from
 #: the pack contract; consumed by ``--help`` rendering.
@@ -258,6 +394,13 @@ _CANONICAL_KIND_SINGULAR_TO_PLURAL: dict[str, str] = {
     "procedure": "procedures",
     "agent_profile": "agent_profiles",
     "mission_step_contract": "mission_step_contracts",
+}
+
+_PROJECT_KIND_DIRS: dict[str, str] = {
+    "directive": "directive",
+    "tactic": "tactic",
+    "styleguide": "styleguide",
+    "procedure": "procedure",
 }
 
 #: Per-kind stub bodies.  Each stub is the *minimum* YAML payload that
@@ -372,9 +515,9 @@ def _resolve_scaffold_root(
 ) -> Path:
     """Return the doctrine root that scaffolded files should land under.
 
-    Project-layer scaffolding (no ``--pack``) writes to
-    ``<repo_root>/.kittify/doctrine/``.  Pack-mode scaffolding writes to
-    the user-supplied pack root verbatim.
+    Project-layer scaffolding (no ``--pack``) writes under
+    ``<repo_root>/.kittify/doctrine/``. Pack-mode scaffolding writes to the
+    user-supplied pack root verbatim.
     """
     if pack is not None:
         return pack
@@ -436,7 +579,10 @@ def new(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
-    target_dir = doctrine_root / plural
+    target_dir_name = (
+        plural if pack is not None else _PROJECT_KIND_DIRS.get(kind_singular, plural)
+    )
+    target_dir = doctrine_root / target_dir_name
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / _artifact_filename(kind_singular, artifact_id)
 
@@ -502,6 +648,38 @@ def _detect_artifact_kind(path: Path) -> tuple[str, str] | None:
     return None
 
 
+#: Sentinel strings that authors mistakenly put in ``applies_to_languages``
+#: to mean "applies to all languages".  These are NOT valid language tokens;
+#: omitting the field entirely is the correct way to express always-applicable.
+_APPLIES_TO_LANGUAGES_SENTINELS: frozenset[str] = frozenset({"any", "all"})
+
+
+def _check_applies_to_languages(data: dict[str, object]) -> str | None:
+    """Return an error message if ``applies_to_languages`` contains a sentinel.
+
+    Checks the raw YAML dict (before Pydantic) so the guard fires regardless
+    of artifact kind and gives authors an actionable message instead of a
+    generic schema error.
+    """
+    raw = data.get("applies_to_languages")
+    if not isinstance(raw, list):
+        return None
+    bad = [
+        str(token)
+        for token in raw
+        if isinstance(token, str)
+        and token.strip().lower() in _APPLIES_TO_LANGUAGES_SENTINELS
+    ]
+    if not bad:
+        return None
+    quoted = ", ".join(f"'{t}'" for t in bad)
+    return (
+        f"`any`/`all` are not language tokens — "
+        f"omit `applies_to_languages` to mean always-applicable "
+        f"(found: {quoted})"
+    )
+
+
 def _validate_single_artifact(
     path: Path,
 ) -> tuple[bool, str | None]:
@@ -530,6 +708,9 @@ def _validate_single_artifact(
         return False, "empty YAML document"
     if not isinstance(data, dict):
         return False, "expected a YAML mapping at top level"
+    lang_err = _check_applies_to_languages(data)
+    if lang_err is not None:
+        return False, lang_err
     schema_cls = _artifact_schema_registry()[plural][1]
     try:
         schema_cls.model_validate(data)

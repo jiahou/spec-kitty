@@ -166,14 +166,16 @@ When wrapping top-level commands, carefully map parameters:
 
 **Always document inversions in code comments!**
 
-## DO NOT:
+## DO NOT
+
 - Duplicate business logic from top-level commands
 - Call legacy `scripts/` code (tasks_cli.py is removed!)
 - Re-implement validation/orchestration logic
 - Skip lane validation before workspace creation
 - Use subprocess to call top-level commands (import and call directly!)
 
-## DO:
+## DO
+
 - Import and call top-level commands directly
 - Add agent-specific UX (prompts, auto-detection, status tracking)
 - Map parameter names if needed (document differences and inversions!)
@@ -255,4 +257,4 @@ top_level_merge(delete_branch=not keep_branch)  # Correct!
 - [Top-Level Implement](../implement.py) - Business logic for workspace creation
 - [Top-Level Accept](../accept.py) - Acceptance workflow logic
 - [Top-Level Merge](../merge.py) - Merge orchestration logic
-- [Execution Lanes Documentation](../../../../docs/explanation/execution-lanes.md) - User guide
+- [Execution Lanes Documentation](../../../../docs/architecture/execution-lanes.md) - User guide

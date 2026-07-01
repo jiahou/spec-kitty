@@ -29,13 +29,16 @@ from pathlib import Path
 from typing import Any
 
 from specify_cli.skills._user_input_block import rewrite as _rewrite_user_input
+from specify_cli.skills._agent_roster import SUPPORTED_AGENTS
 from specify_cli.agent_upgrade_prompt import prepend_agent_upgrade_check
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SUPPORTED_AGENTS: tuple[str, ...] = ("codex", "vibe", "pi", "letta")
+#: Re-exported from the leaf authority :data:`specify_cli.skills._agent_roster`
+#: so historical ``command_renderer.SUPPORTED_AGENTS`` references keep working
+#: while the roster has exactly one definition (#1941).
 
 # Matches the YAML frontmatter block at the very start of a template file
 # (delimited by ``---`` lines).  Handles both ``---\nkey: value\n---`` and
@@ -230,11 +233,9 @@ def _extract_frontmatter_description(text: str) -> str | None:
     for line in fm_body.splitlines():
         line = line.strip()
         if line.startswith("description:"):
-            value = line[len("description:"):].strip()
+            value = line[len("description:") :].strip()
             # Strip surrounding quotes if present.
-            if (value.startswith('"') and value.endswith('"')) or (
-                value.startswith("'") and value.endswith("'")
-            ):
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
                 value = value[1:-1]
             return value[:_DESC_MAX_LEN] if value else None
     return None
@@ -261,11 +262,7 @@ def _extract_purpose_description(body: str) -> str | None:
 
     # Take the first sentence (up to the first period, "?", "!", or newline).
     sentence_end = re.search(r"[.?!\n]", section_text)
-    sentence = (
-        section_text[: sentence_end.end()].strip().rstrip(".")
-        if sentence_end
-        else section_text.strip()
-    )
+    sentence = section_text[: sentence_end.end()].strip().rstrip(".") if sentence_end else section_text.strip()
 
     sentence = sentence.strip()
     if not sentence:
@@ -309,7 +306,7 @@ def ensure_skill_frontmatter(content: str, skill_name: str) -> str:
     Command-template skills already flow through :class:`RenderedSkill`.
     Canonical skill-pack installers and repair paths use this helper for older
     generated skills that were authored as plain Markdown, including the
-    ``spec-kitty.advise`` repro from #964. Existing frontmatter is preserved
+    ``spec-kitty`` repro from #964. Existing frontmatter is preserved
     byte-for-byte.
     """
     if _RE_LEADING_FRONTMATTER.match(content):
@@ -492,6 +489,6 @@ def render(
         body=prepend_agent_upgrade_check(body),
         source_template=template_path.resolve(),
         source_hash=source_hash,
-        agent_key=agent_key,  # type: ignore[arg-type]
+        agent_key=agent_key,
         spec_kitty_version=spec_kitty_version,
     )

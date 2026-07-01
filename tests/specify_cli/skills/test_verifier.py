@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from specify_cli.skills.manifest import (
@@ -17,7 +18,8 @@ from specify_cli.skills.verifier import VerifyResult, repair_skills, verify_inst
 
 import pytest
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
+
 
 def _make_entry(
     skill_name: str = "test-skill",
@@ -257,6 +259,37 @@ def test_repair_handles_missing_source(tmp_path: Path) -> None:
     assert failed == 1
 
 
+def test_repair_rejects_external_symlink_destination(tmp_path: Path) -> None:
+    """Repair must not write through a managed-skill symlink escaping the repo."""
+    canonical = "---\nname: test-skill\n---\n# Canonical\nCorrect content.\n"
+    registry = _create_registry(tmp_path, "test-skill", {"SKILL.md": canonical})
+
+    external = tmp_path / "home" / ".claude" / "skills" / "test-skill" / "SKILL.md"
+    external.parent.mkdir(parents=True, exist_ok=True)
+    external.write_text("EXTERNAL", encoding="utf-8")
+
+    repo = tmp_path / "repo"
+    installed_path = ".claude/skills/test-skill/SKILL.md"
+    link_path = repo / installed_path
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(external, link_path)
+
+    entry = _make_entry(
+        skill_name="test-skill",
+        source_file="SKILL.md",
+        installed_path=installed_path,
+        content_hash="sha256:stale",
+    )
+    save_manifest(ManagedSkillManifest(entries=[entry]), repo)
+
+    verify_result = VerifyResult(ok=False, missing=[entry])
+
+    repaired, failed = repair_skills(repo, verify_result, registry)
+    assert repaired == 0
+    assert failed == 1
+    assert external.read_text(encoding="utf-8") == "EXTERNAL"
+
+
 def test_repair_updates_manifest(tmp_path: Path) -> None:
     """After repair, manifest entries have updated content hashes."""
     canonical = "---\nname: test-skill\n---\n# Canonical\nFresh content.\n"
@@ -288,13 +321,13 @@ def test_repair_updates_manifest(tmp_path: Path) -> None:
 
 def test_repair_adds_frontmatter_to_plain_skill(tmp_path: Path) -> None:
     """Repair normalizes plain Markdown SKILL.md files from older generated packs."""
-    canonical = "# spec-kitty.advise\n\nGet governance context for an action.\n"
-    registry = _create_registry(tmp_path, "spec-kitty.advise", {"SKILL.md": canonical})
+    canonical = "# spec-kitty\n\nGet governance context for an action.\n"
+    registry = _create_registry(tmp_path, "spec-kitty", {"SKILL.md": canonical})
 
     entry = _make_entry(
-        skill_name="spec-kitty.advise",
+        skill_name="spec-kitty",
         source_file="SKILL.md",
-        installed_path=".agents/skills/spec-kitty.advise/SKILL.md",
+        installed_path=".agents/skills/spec-kitty/SKILL.md",
         agent_key="codex",
         content_hash="sha256:old-stale-hash",
         delivery_mode="copy",
@@ -308,10 +341,10 @@ def test_repair_adds_frontmatter_to_plain_skill(tmp_path: Path) -> None:
     assert repaired == 1
     assert failed == 0
 
-    restored = tmp_path / ".agents/skills/spec-kitty.advise/SKILL.md"
+    restored = tmp_path / ".agents/skills/spec-kitty/SKILL.md"
     content = restored.read_text(encoding="utf-8")
     assert content.startswith("---\n")
-    assert "name: spec-kitty.advise\n" in content
+    assert "name: spec-kitty\n" in content
     assert "description: Get governance context for an action.\n" in content
 
 
@@ -335,5 +368,25 @@ def test_repair_rejects_path_traversal(tmp_path: Path) -> None:
     verify_result = VerifyResult(ok=False, missing=[entry])
 
     repaired, failed = repair_skills(tmp_path, verify_result, registry)
+    assert repaired == 0
+    assert failed == 1
+
+
+def test_repair_rejects_unsafe_skill_name_for_global_sync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repair refuses global-root sync when the manifest skill name is unsafe."""
+    registry = _create_registry(tmp_path, "..evil", {"SKILL.md": "# bad\n"})
+    entry = _make_entry(
+        skill_name="..evil",
+        installed_path=".claude/skills/..evil/SKILL.md",
+        delivery_mode="symlink",
+    )
+    verify_result = VerifyResult(ok=False, missing=[entry])
+    monkeypatch.setattr(
+        "specify_cli.skills.verifier.get_primary_global_skill_root",
+        lambda _agent_key: tmp_path / "_global",
+    )
+
+    repaired, failed = repair_skills(tmp_path, verify_result, registry)
+
     assert repaired == 0
     assert failed == 1

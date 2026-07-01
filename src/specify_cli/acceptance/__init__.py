@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_mission
+from specify_cli.missions._read_path_resolver import (
+    _canonicalize_primary_read_handle,
+    primary_feature_dir_for_mission,
+    resolve_feature_dir_for_mission,
+)
 import logging
 import os
 import re
@@ -17,13 +21,12 @@ from specify_cli.core.agent_config import get_auto_commit_default
 from specify_cli.core.paths import require_explicit_feature as _require_explicit_feature
 from specify_cli.decisions.models import DecisionStatus
 from specify_cli.decisions.store import load_index
-from specify_cli.git.commit_helpers import assert_not_protected_branch
 from specify_cli.mission import MissionError, get_deliverables_path, get_mission_for_feature
 from specify_cli.mission_metadata import load_meta, record_acceptance, resolve_mission_identity, write_meta
 from specify_cli.status import CanonicalStatusNotFoundError
 from specify_cli.status import Lane
 from specify_cli.status import EVENTS_FILENAME, StoreError
-from specify_cli.validators.paths import PathValidationError, validate_mission_paths
+from specify_cli.validators.paths import validate_mission_paths
 
 from specify_cli.task_utils import (
     LANES,
@@ -31,10 +34,10 @@ from specify_cli.task_utils import (
     WorkPackage,
     get_lane_from_frontmatter,
     git_status_lines,
-    is_legacy_format,
     run_git,
     split_frontmatter,
 )
+from specify_cli.upgrade.pre30_guard import check_pre30_layout
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +59,156 @@ PRIMARY_ARTIFACT_FILES = (
     RESEARCH_FILE,
     DATA_MODEL_FILE,
 )
+
 _DECISION_ID_MARKER = "decision_id:"
 _ACCEPTED_READY_LANES = frozenset({"approved", "done"})
+_PATH_CONVENTIONS_NOT_SATISFIED = "Path conventions not satisfied."
+
+# Paths written by the accept pipeline itself.  These must be excluded from the
+# git-dirty gate so that a second accept run on unchanged mission state produces
+# the same pass/fail verdict as the first (convergence / idempotency guarantee).
+# ``status.json`` is a daemon-materialized view; ``acceptance-matrix.json`` is
+# written by ``_check_lane_gates`` when ``mutate_matrix=True``.
+ACCEPT_OWNED_PATHS = frozenset(
+    {
+        "acceptance-matrix.json",
+        "status.json",
+    }
+)
 _LEGACY_NOT_DONE_LANES = ("planned", "claimed", "doing", "in_progress", "for_review")
 _ACTIONABLE_LANE_BLOCKER_HINTS = {
     "in_review": "review is still in progress; complete the review and move the work package to approved or done",
     "blocked": "work package is blocked; resolve the blocker and move the work package to approved or done",
     "canceled": "work package is canceled; reopen or replace it, then move the work package to approved or done",
 }
+
+
+def _porcelain_dirty_path(line: str) -> str:
+    """Return the path component from a git porcelain v1 status line."""
+    path = line[3:].strip()
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1].strip()
+    return path
+
+
+def _accept_owned_dirty_paths(repo_root: Path, *feature_dirs: Path) -> set[str]:
+    """Return repo-relative accept-owned paths for the current mission only."""
+    owned: set[str] = set()
+    for feature_dir in feature_dirs:
+        try:
+            feature_rel = feature_dir.resolve().relative_to(repo_root.resolve()).as_posix()
+        except ValueError:
+            continue
+        for filename in ACCEPT_OWNED_PATHS:
+            owned.add(f"{feature_rel}/{filename}")
+    return owned
+
+
+def _mission_routes_through_coordination(repo_root: Path, feature: str) -> bool:
+    """True when ``feature`` routes through coordination under its STORED topology.
+
+    FR-008 / FR-005: the accept dirty-tree gate is topology-aware. Read the WP02
+    **stored** :class:`MissionTopology` via :func:`resolve_topology` and ask the
+    ONE canonical :func:`routes_through_coordination` predicate — never the
+    retired per-ref ``.kind`` arm (the predicate takes a ``MissionTopology``, not
+    a ``CommitTarget``; passing a placement ref made it always-``False`` and
+    silently disabled the residue filter). Under coordination topology the
+    recognized coordination residue on the primary checkout is dropped from the
+    dirty set; under a flat (``single_branch`` / ``lanes``) topology the predicate
+    is ``False`` so the residue filter never runs and a flat mission's real
+    primary artifacts STILL block.
+
+    An unresolvable handle degrades to a non-coordination shape (fail-closed /
+    conservative: the full dirty set is preserved, never widening the gate on a
+    resolution edge case — NFR-003 / C-004), exactly as the canonical
+    ``cli/commands/agent/mission.py`` routing site relies on.
+    """
+    from mission_runtime import resolve_topology, routes_through_coordination
+
+    return routes_through_coordination(resolve_topology(repo_root, feature))
+
+
+def _accept_dirty_gate(
+    git_dirty_raw: list[str],
+    *,
+    repo_root: Path,
+    feature: str,
+    feature_dir: Path,
+    read_feature_dir: Path,
+    status_feature_dir: Path,
+) -> list[str]:
+    """Compute the accept dirty set: accept-owned exclusion + FR-008 coord residue.
+
+    Three filters compose:
+
+    1. **Accept-owned convergence (#1883):** the accept gate's own writes
+       (``acceptance-matrix.json`` + ``status.json``) are scoped to this
+       mission's primary anchor dir, the coord-aware read dir, and the canonical
+       status-read dir. Excluding all three absorbs accept-owned residue left
+       dirty by a prior ``--no-commit`` / diagnose run, so ``accept ∘ accept``
+       converges in every mode.
+    2. **Self-bookkeeping exclusion (#2251):** spec-kitty's own bookkeeping
+       files (``meta.json``, encoding-provenance JSONL, and ``kitty-ops/<ULID>.jsonl``
+       Op-record orphans) are excluded via the SINGLE shared
+       :func:`mission_runtime.is_self_bookkeeping_path` authority — no independent
+       literal carried here (G-5 invariant / #1914 framing).
+    3. **FR-008 topology-aware residue:** under coordination topology the
+       recognized coordination residue (stale primary copies of artifacts owned
+       by the coordination branch) is excluded via the SAME per-ref pattern the
+       record-analysis preflight uses (:func:`routes_through_coordination` + the
+       WP04 :func:`is_coordination_artifact_residue_path` predicate). A flat
+       mission routes through PRIMARY, so its real primary artifacts STILL block.
+       ``ACCEPT_OWNED_PATHS`` is NOT widened.
+
+    Non-accept-owned, non-self-bookkeeping, non-residue dirt is preserved verbatim
+    (fail-closed, NFR-003).
+    """
+    from mission_runtime import is_self_bookkeeping_path
+
+    accept_owned_dirty_paths = _accept_owned_dirty_paths(
+        repo_root,
+        feature_dir,
+        read_feature_dir,
+        status_feature_dir,
+    )
+    git_dirty = [
+        line
+        for line in git_dirty_raw
+        if _porcelain_dirty_path(line) not in accept_owned_dirty_paths
+        and not is_self_bookkeeping_path(_porcelain_dirty_path(line))
+    ]
+    return _filter_coordination_residue(git_dirty, repo_root=repo_root, feature=feature)
+
+
+def _filter_coordination_residue(
+    dirty_lines: list[str],
+    *,
+    repo_root: Path,
+    feature: str,
+) -> list[str]:
+    """Drop coordination-residue dirty lines when the mission routes through coord.
+
+    FR-008 convergence on the ``mission.py`` reference pattern: only when
+    :func:`routes_through_coordination` holds does
+    :func:`is_coordination_artifact_residue_path` (the WP04 stored-topology
+    residue authority — flat→``False``) get to exclude a path. The predicate is
+    NOT a widening of ``ACCEPT_OWNED_PATHS``: it is the per-ref coordination gate
+    applied to recognized coordination-owned artifacts (spec / plan / tasks /
+    lanes / status / matrices / checklists) left stale on the primary checkout.
+    Real source edits, unknown mission scratch files, and another mission's
+    artifacts are not recognized residue, so they still block.
+    """
+    from mission_runtime import is_coordination_artifact_residue_path
+
+    if not _mission_routes_through_coordination(repo_root, feature):
+        return dirty_lines
+    return [
+        line
+        for line in dirty_lines
+        if not is_coordination_artifact_residue_path(
+            _porcelain_dirty_path(line), mission_slug=feature
+        )
+    ]
 
 
 class AcceptanceError(TaskCliError):
@@ -258,60 +403,50 @@ class AcceptanceResult:
 
 
 def _iter_work_packages(repo_root: Path, feature: str) -> Iterable[WorkPackage]:
-    """Iterate over work packages, supporting both legacy and new formats.
+    """Iterate over work packages in flat tasks/ directory layout.
 
-    Legacy format: WP files in tasks/{lane}/ subdirectories
-    New format: WP files in flat tasks/ directory with lane in frontmatter
+    Pre-3.0 missions (lane-directory layout) are hard-rejected with
+    :class:`~specify_cli.upgrade.pre30_guard.Pre30LayoutError` — run
+    ``spec-kitty upgrade`` to migrate before running the acceptance scan.
     """
-    feature_path = resolve_feature_dir_for_mission(repo_root, feature)
+    # WORK_PACKAGE_TASK is a PRIMARY-partition kind: route the WP-task read
+    # through the kind-aware seam so a coord-topology mission reads its tasks off
+    # the PRIMARY surface (where they live), not the materialized -coord husk
+    # whose tasks/ dir is absent (closeout N+1 — debbie §3).
+    feature_path = _wp_tasks_read_dir(repo_root, feature)
     tasks_dir = feature_path / "tasks"
     if not tasks_dir.exists():
         raise AcceptanceError(f"Feature '{feature}' has no tasks directory at {tasks_dir}.")
 
-    use_legacy = is_legacy_format(feature_path)
+    # Pre-3.0 layout: hard-reject (defense-in-depth — collect_feature_summary
+    # also guards eagerly). The retirement of the legacy reader must NOT degrade
+    # into a silent warn-and-skip: yielding zero work packages makes
+    # AcceptanceSummary vacuously ``all_done`` and lets ``accept`` auto-commit an
+    # unmigrated mission whose real (possibly un-done) WPs still sit in
+    # ``tasks/planned/`` etc. (#1057 / squad Blocker 1). Fail closed with the
+    # ``spec-kitty upgrade`` migration message, matching the task commands.
+    check_pre30_layout(feature_path)
 
-    if use_legacy:
-        # Legacy format: iterate over lane subdirectories
-        for lane_dir in sorted(tasks_dir.iterdir()):
-            if not lane_dir.is_dir():
-                continue
-            lane = lane_dir.name
-            if lane not in LANES:
-                continue
-            for path in sorted(lane_dir.rglob("*.md")):
-                text = _read_text_strict(path)
-                front, body, padding = split_frontmatter(text)
-                relative = path.relative_to(lane_dir)
-                yield WorkPackage(
-                    feature=feature,
-                    path=path,
-                    current_lane=lane,
-                    relative_subpath=relative,
-                    frontmatter=front,
-                    body=body,
-                    padding=padding,
-                )
-    else:
-        # New format: flat tasks/ directory, lane from frontmatter
-        for path in sorted(tasks_dir.glob("*.md")):
-            if path.name.lower() == "readme.md":
-                continue
-            text = _read_text_strict(path)
-            front, body, padding = split_frontmatter(text)
-            try:
-                lane = get_lane_from_frontmatter(path, warn_on_missing=False)
-            except CanonicalStatusNotFoundError:
-                lane = "uninitialized"
-            relative = path.relative_to(tasks_dir)
-            yield WorkPackage(
-                feature=feature,
-                path=path,
-                current_lane=lane,
-                relative_subpath=relative,
-                frontmatter=front,
-                body=body,
-                padding=padding,
-            )
+    # Flat-layout: tasks/ directory, lane from frontmatter.
+    for path in sorted(tasks_dir.glob("*.md")):
+        if path.name.lower() == "readme.md":
+            continue
+        text = _read_text_strict(path)
+        front, body, padding = split_frontmatter(text)
+        try:
+            lane = get_lane_from_frontmatter(path, warn_on_missing=False)
+        except CanonicalStatusNotFoundError:
+            lane = "uninitialized"
+        relative = path.relative_to(tasks_dir)
+        yield WorkPackage(
+            feature=feature,
+            path=path,
+            current_lane=lane,
+            relative_subpath=relative,
+            frontmatter=front,
+            body=body,
+            padding=padding,
+        )
 
 
 def detect_mission_slug(
@@ -365,6 +500,49 @@ def _find_unchecked_tasks(tasks_file: Path) -> list[str]:
         if re.match(r"^\s*-\s*\[ \]", line):
             unchecked.append(line.strip())
     return unchecked
+
+
+def _normalized_unchecked_tasks(
+    unchecked_tasks: list[str],
+    lanes: Mapping[str, list[str]],
+) -> list[str]:
+    """Apply FR-009 + the ``tasks.md missing`` normalization to unchecked tasks.
+
+    FR-009 (#2085a): unchecked-tasks completion derives from WP terminal status.
+    When every tracked WP is approved/done, the work landed through the lane
+    lifecycle, so the redundant ``tasks.md`` checkbox bookkeeping is not
+    required — unticked checkboxes must not strand a finished mission. A mission
+    with a non-terminal WP (e.g. ``in_review`` / ``for_review``) still reports
+    its unchecked items. The ``[<tasks.md> missing]`` sentinel is also dropped
+    (it is surfaced separately via the missing-artifacts gate).
+
+    The acceptance-MATRIX gate (C-010) is untouched: it remains the genuine
+    verification surface — this normalization only governs the checkbox gate.
+    """
+    if unchecked_tasks == [f"{TASKS_FILE} missing"]:
+        return []
+    if _all_work_packages_terminal(lanes):
+        return []
+    return unchecked_tasks
+
+
+def _all_work_packages_terminal(lanes: Mapping[str, list[str]]) -> bool:
+    """True when every tracked WP is in a terminal-ready lane (approved/done).
+
+    FR-009: WP terminal status is the authority for completion, so an
+    orchestrated mission whose work landed through the lane lifecycle is
+    complete even if the ``tasks.md`` checkboxes were never hand-ticked. Mirrors
+    :attr:`AcceptanceSummary.all_done` but operates on the lane buckets directly
+    so the ``unchecked_tasks`` derivation does not depend on summary
+    construction order. Returns ``False`` when no WP is tracked at all (an empty
+    mission has nothing terminal to vouch for completion).
+    """
+    tracked = any(wp_ids for wp_ids in lanes.values())
+    if not tracked:
+        return False
+    return not any(
+        wp_ids for lane, wp_ids in lanes.items() if lane not in _ACCEPTED_READY_LANES
+    )
 
 
 def _check_needs_clarification(files: Sequence[Path]) -> list[str]:
@@ -449,7 +627,17 @@ def normalize_feature_encoding(repo_root: Path, feature: str) -> list[Path]:
         "\u00b7": "*",  # Middle dot -> asterisk
     }
 
-    feature_dir = resolve_feature_dir_for_mission(repo_root, feature)
+    # Every artifact this normalizer touches — the planning docs in
+    # ``PRIMARY_ARTIFACT_FILES`` plus the ``tasks/`` (WORK_PACKAGE_TASK),
+    # ``research/`` (RESEARCH) and ``checklists/`` (CHECKLIST) subtrees — is a
+    # PRIMARY-partition kind, so the encoding-recovery scan must read the PRIMARY
+    # surface, not the coord-aware husk. Pre-fix this used
+    # ``resolve_feature_dir_for_mission`` (coord-aware); on a coord-topology
+    # mission it scanned the materialized ``-coord`` worktree, missing the real
+    # primary artifacts an encoding fault lives in (closeout N+1 sibling — debbie
+    # §3). ``_planning_read_dir`` resolves the PRIMARY surface via the same
+    # kind-aware seam; behavior-neutral for a FLATTENED mission.
+    feature_dir = _planning_read_dir(repo_root, feature)
     if not feature_dir.exists():
         return []
 
@@ -550,23 +738,173 @@ def _collect_snapshot_wps(feature: str, feature_dir: Path, activity_issues: list
 
 
 def _status_read_feature_dir(repo_root: Path, feature: str, feature_dir: Path) -> Path:
-    """Return canonical status read path for acceptance lane validation."""
-    mid8 = ""
-    try:
-        meta = load_meta(feature_dir) or {}
-    except Exception:  # noqa: BLE001 — fall back to suffix detection
-        meta = {}
-    raw_mid8 = meta.get("mid8")
-    if isinstance(raw_mid8, str) and raw_mid8:
-        mid8 = raw_mid8
-    else:
-        from specify_cli.lanes.branch_naming import mid8_from_slug
-        mid8 = mid8_from_slug(feature)
+    """Return canonical status read path for acceptance lane validation.
 
-    from specify_cli.missions._read_path_resolver import resolve_mission_read_path
+    Routes through the SINGLE guarded read-side seam
+    (:func:`resolve_handle_to_read_path`, IC-01 / FR-001): the seam owns the
+    primary-meta probe and the ONE sanctioned mid8 cascade
+    (``meta.mid8`` → ``resolve_mid8(meta.mission_id)`` → ``mid8_from_slug``,
+    NFR-005/#1868) internally, so this caller no longer derives the mid8 in
+    parallel (WP01 reroute — byte-identical: the seam derives the same mid8 and
+    forwards it to the existence-gated topology resolver with
+    ``require_exists=False``).
 
-    status_dir = resolve_mission_read_path(repo_root, feature, mid8)
+    The acceptance-specific ``status_dir if status_dir.exists() else feature_dir``
+    fallback is preserved verbatim: acceptance validation must stay LENIENT and
+    degrade to the primary anchor dir rather than fail-close.
+    """
+    from specify_cli.missions._read_path_resolver import resolve_handle_to_read_path
+
+    status_dir = resolve_handle_to_read_path(repo_root, feature)
     return status_dir if status_dir.exists() else feature_dir
+
+
+# Planning artifacts the accept gate inspects, mapped to their canonical
+# ``MissionArtifactKind`` (FR-002 / data-model.md site map rows 2-9). Every entry
+# is a PRIMARY-partition kind (``is_primary_artifact_kind`` True), so each resolves
+# the SAME primary feature dir through the WP01 read seam. ``quickstart.md`` carries
+# no dedicated kind; it is a planning checklist doc and is classified ``CHECKLIST``
+# (a PRIMARY-partition kind) explicitly here — no silent default (DECISION 1 spirit).
+def _accept_planning_artifact_kinds() -> dict[str, Any]:
+    from mission_runtime import MissionArtifactKind
+
+    return {
+        SPEC_FILE: MissionArtifactKind.SPEC,
+        PLAN_FILE: MissionArtifactKind.FINALIZED_EXECUTION_PLAN,
+        TASKS_FILE: MissionArtifactKind.TASKS_INDEX,
+        RESEARCH_FILE: MissionArtifactKind.RESEARCH,
+        DATA_MODEL_FILE: MissionArtifactKind.DATA_MODEL,
+        QUICKSTART_FILE: MissionArtifactKind.CHECKLIST,
+    }
+
+
+def _planning_read_dir(repo_root: Path, feature: str) -> Path:
+    """Return the PRIMARY mission dir the accept gate reads planning artifacts from.
+
+    FR-002 (#2085): the accept gate's PLANNING reads (spec/plan/tasks/research/
+    data-model/quickstart) are split off the coord-aware ``status_feature_dir`` and
+    routed onto the SINGLE kind-aware read seam
+    (:func:`~specify_cli.missions._read_path_resolver.resolve_planning_read_dir`,
+    WP01). Because every planning artifact the gate reads is a PRIMARY-partition
+    kind, they all resolve the same primary feature dir; we resolve once (keyed on
+    ``SPEC``) and the per-artifact existence checks reuse it. This is NOT a parallel
+    resolver (C-001 forbids a NEW resolver, not consuming the existing one): it is a
+    thin caller of the shared chokepoint, mirroring ``mission.py::_planning_read_dir``.
+
+    The STATUS/acceptance reads (``status.events.jsonl``, acceptance-matrix) keep
+    using ``status_feature_dir`` with its leniency (C-002) — they are NOT routed here.
+    """
+    from mission_runtime import is_primary_artifact_kind
+
+    from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
+
+    kinds = _accept_planning_artifact_kinds()
+    # Guard the "resolve once and reuse" invariant: every planning artifact the gate
+    # reads MUST be a PRIMARY-partition kind, so they all resolve the same primary
+    # dir. If a future single-line reclassification in ``mission_runtime.artifacts``
+    # moves one across the partition (NFR-004), fail LOUD here rather than silently
+    # reading a stale coord surface for one artifact.
+    non_primary = sorted(name for name, kind in kinds.items() if not is_primary_artifact_kind(kind))
+    if non_primary:
+        raise AcceptanceError(
+            "Accept-gate planning split invariant violated: planning artifact(s) "
+            f"{non_primary} are no longer PRIMARY-partition kinds; the per-artifact "
+            "read dir must be resolved individually (FR-002 / data-model.md)."
+        )
+    # Explicit ``Path`` annotation: under the project's ``follow_imports = "skip"``
+    # mypy config the cross-module ``resolve_planning_read_dir`` return is seen as
+    # ``Any``; the annotation re-narrows it (the function IS typed ``-> Path``) so the
+    # chokepoint return is not an ``Any`` leak — matching ``mission.py::_planning_read_dir``.
+    read_dir: Path = resolve_planning_read_dir(repo_root, feature, kind=kinds[SPEC_FILE])
+    return read_dir
+
+
+def _wp_tasks_read_dir(repo_root: Path, feature: str) -> Path:
+    """Return the PRIMARY mission dir the accept gate reads WP tasks from.
+
+    Closeout N+1 (debbie §3): the accept gate's WP-task iteration
+    (:func:`_iter_work_packages`) reads ``tasks/WP*.md`` — a
+    ``WORK_PACKAGE_TASK`` artifact, a PRIMARY-partition kind. Pre-fix it resolved
+    the coord-aware :func:`resolve_feature_dir_for_mission`, landing on the
+    materialized ``-coord`` worktree whose ``tasks/`` directory is ABSENT (WP
+    tasks live on PRIMARY for both read and write — INV-5 symmetry). The REAL
+    accept gate then raised ``AcceptanceError: ... has no tasks directory`` for a
+    coord-topology mission whose WP tasks live (correctly) only on primary.
+
+    This routes the WP-task read through the SAME kind-aware chokepoint
+    (:func:`~specify_cli.missions._read_path_resolver.resolve_planning_read_dir`)
+    the planning-doc reads use, keyed on ``WORK_PACKAGE_TASK`` — mirroring the
+    WP04 ``map-requirements`` fix (tasks.py: ``resolve_planning_read_dir`` for the
+    WP-task glob). Behavior-neutral for a FLATTENED mission (candidate == primary).
+    The STATUS reads stay on ``status_feature_dir`` (C-002), unchanged.
+    """
+    from mission_runtime import MissionArtifactKind, is_primary_artifact_kind
+
+    from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
+
+    # Fail LOUD if a future reclassification moves WORK_PACKAGE_TASK off the
+    # primary partition (NFR-004): the gate's WP-task read must stay on the same
+    # single primary surface as the WP-task write, never silently a coord husk.
+    if not is_primary_artifact_kind(MissionArtifactKind.WORK_PACKAGE_TASK):
+        raise AcceptanceError(
+            "Accept-gate WP-task read invariant violated: WORK_PACKAGE_TASK is no "
+            "longer a PRIMARY-partition kind; the WP-task read dir must be resolved "
+            "against its current partition (closeout N+1 / data-model.md)."
+        )
+    read_dir: Path = resolve_planning_read_dir(
+        repo_root, feature, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
+    return read_dir
+
+
+def _primary_anchor_feature_dir(repo_root: Path, feature: str, read_dir: Path) -> Path:
+    """Return the primary-checkout mission dir anchoring ``AcceptanceSummary``.
+
+    ``resolve_feature_dir_for_mission`` hands back the coord-aware READ
+    directory — the coordination worktree once one is materialized. The
+    summary's identity anchor (``AcceptanceSummary.feature_dir``) must stay on
+    the primary checkout (status source of truth is feature metadata on main:
+    ``_commit_acceptance_meta`` records acceptance into the primary
+    ``meta.json``), while artifact/status reads stay coord-aware through
+    ``_status_read_feature_dir``.
+
+    The primary dir name can differ from the read dir name — backfilled legacy
+    missions carry no ``-<mid8>`` suffix on the primary side while their coord
+    mission dir does — so the anchor is derived from the mission *handle*,
+    never recomposed from the read dir's name:
+
+    1. literal handle → primary composition (covers canonical ``<slug>-<mid8>``
+       names AND backfilled legacy names);
+    2. handle resolver (mid8 / ULID / numeric prefix / human slug) → the
+       primary directory it indexed;
+    3. fall back to the resolved read dir rather than fail when no
+       primary-side directory exists (identity/existence was already validated
+       by the read resolution).
+    """
+    # WP05/FR-005: route through _canonicalize_primary_read_handle so every
+    # handle form (bare mid8 / ULID / numeric prefix / bare human slug) lands
+    # on the correct composed primary dir.
+    primary_candidate: Path = primary_feature_dir_for_mission(
+        repo_root,
+        _canonicalize_primary_read_handle(repo_root, feature),
+    )
+    if primary_candidate.exists():
+        return primary_candidate
+
+    from specify_cli.context.mission_resolver import (
+        AmbiguousHandleError,
+        MissionNotFoundError,
+        resolve_mission,
+    )
+
+    try:
+        resolved = resolve_mission(feature, repo_root)
+    except (AmbiguousHandleError, MissionNotFoundError):
+        return read_dir
+    resolved_primary: Path = resolved.feature_dir
+    if resolved_primary.exists():
+        return resolved_primary
+    return read_dir
 
 
 def _validate_wp_readiness(
@@ -878,12 +1216,32 @@ def collect_feature_summary(
     strict_metadata: bool = True,
     mutate_matrix: bool = True,
 ) -> AcceptanceSummary:
-    feature_dir = resolve_feature_dir_for_mission(repo_root, feature)
+    read_feature_dir = resolve_feature_dir_for_mission(repo_root, feature)
+    feature_dir = _primary_anchor_feature_dir(repo_root, feature, read_feature_dir)
     tasks_dir = feature_dir / "tasks"
     if not feature_dir.exists():
         raise AcceptanceError(f"Mission directory not found: {feature_dir}")
 
-    branch, worktree_root, primary_repo_root, git_dirty = _resolve_git_context(repo_root)
+    # #1057 / squad Blocker 1: hard-reject a pre-3.0 lane-directory mission BEFORE
+    # building the summary. WP tasks are a PRIMARY-partition kind, so they live on
+    # the primary anchor dir; the legacy detector reads ``tasks/{lane}/`` there.
+    # Without this guard the retired legacy reader degraded into an empty WP set →
+    # vacuously ``all_done`` → ``accept`` auto-committed an unmigrated mission. The
+    # raised ``Pre30LayoutError`` carries the ``spec-kitty upgrade`` instruction and
+    # is surfaced as exit 1 by every acceptance/verify entrypoint.
+    check_pre30_layout(feature_dir)
+
+    branch, worktree_root, primary_repo_root, git_dirty_raw = _resolve_git_context(repo_root)
+
+    status_feature_dir = _status_read_feature_dir(repo_root, feature, feature_dir)
+    git_dirty = _accept_dirty_gate(
+        git_dirty_raw,
+        repo_root=repo_root,
+        feature=feature,
+        feature_dir=feature_dir,
+        read_feature_dir=read_feature_dir,
+        status_feature_dir=status_feature_dir,
+    )
 
     lanes: dict[str, list[str]] = {lane: [] for lane in LANES}
     work_packages: list[WorkPackageState] = []
@@ -892,11 +1250,19 @@ def collect_feature_summary(
     skipped_checks: list[AcceptanceCheckDiagnostic] = []
     blocked_checks: list[AcceptanceCheckDiagnostic] = []
 
-    status_feature_dir = _status_read_feature_dir(repo_root, feature, feature_dir)
     snapshot_wps = _collect_snapshot_wps(feature, status_feature_dir, activity_issues)
 
+    # #2122: PRIMARY-partition reads (WP tasks/, planning artifacts) must key on
+    # the canonical PRIMARY slug, not the raw handle. A mid8/ULID/numeric handle
+    # passed straight to the kind-aware seam composes a nonexistent
+    # `kitty-specs/<handle>` dir. `feature_dir` is the already-resolved primary
+    # anchor, so its name is the canonical primary slug (which can legitimately
+    # differ from the coord read-dir name for backfilled legacy missions).
+    # STATUS reads above/below stay coord-aware on the raw `feature` (C-002).
+    primary_slug = feature_dir.name
+
     expected_wp_ids: list[str] = []
-    for wp in _iter_work_packages(repo_root, feature):
+    for wp in _iter_work_packages(repo_root, primary_slug):
         wp_id = wp.work_package_id or wp.path.stem
         title = (wp.title or "").strip('"')
         expected_wp_ids.append(wp_id)
@@ -938,54 +1304,86 @@ def collect_feature_summary(
 
     _validate_wp_readiness(expected_wp_ids, snapshot_wps, status_feature_dir / EVENTS_FILENAME, activity_issues)
 
-    unchecked_tasks = _find_unchecked_tasks(status_feature_dir / TASKS_FILE)
+    # FR-002 (#2085): PLANNING reads (spec/plan/tasks/research/data-model/quickstart)
+    # resolve the PRIMARY surface via the WP01 kind-aware seam; the STATUS reads above
+    # (status.events.jsonl) and below (acceptance-matrix via _check_lane_gates) stay on
+    # the coord-aware status_feature_dir (C-002). The single status_feature_dir variable
+    # is split per-partition WITHOUT renaming it (additive: a new planning_read_dir).
+    planning_read_dir = _planning_read_dir(repo_root, primary_slug)
+
+    unchecked_tasks = _find_unchecked_tasks(planning_read_dir / TASKS_FILE)
     needs_clarification = _check_needs_clarification(
         [
-            status_feature_dir / "spec.md",
-            status_feature_dir / "plan.md",
-            status_feature_dir / "quickstart.md",
-            status_feature_dir / TASKS_FILE,
-            status_feature_dir / "research.md",
-            status_feature_dir / "data-model.md",
+            planning_read_dir / "spec.md",
+            planning_read_dir / "plan.md",
+            planning_read_dir / "quickstart.md",
+            planning_read_dir / TASKS_FILE,
+            planning_read_dir / "research.md",
+            planning_read_dir / "data-model.md",
         ]
     )
-    missing_required, missing_optional = _missing_artifacts(status_feature_dir)
+    missing_required, missing_optional = _missing_artifacts(planning_read_dir)
 
     path_violations: list[str] = []
+    path_convention_warning: str | None = None
     try:
         mission = get_mission_for_feature(feature_dir)
     except MissionError:
         mission = None
 
     if mission and mission.config.paths:
-        try:
-            validate_mission_paths(
-                mission,
-                repo_root,
-                strict=True,
-                path_prefix=_path_prefix_for_mission(mission, feature_dir),
-            )
-        except PathValidationError as exc:
-            path_violations.append(exc.result.format_errors() or str(exc))
+        # Mission path conventions block acceptance by default, but under
+        # ``--lenient`` (``strict_metadata=False``) they are advisory: surface
+        # them as a non-blocking warning instead of a hard ``path_violations``
+        # so repos with a non-default layout (e.g. a Go service using
+        # ``internal/`` with no top-level ``tests/``) can be accepted with
+        # ``accept --lenient`` rather than the empty-directory workaround
+        # (issue #1892). ``validate_mission_paths`` is invoked non-strict here so
+        # we own the blocking decision rather than catching a raise.
+        path_result = validate_mission_paths(
+            mission,
+            repo_root,
+            strict=False,
+            path_prefix=_path_prefix_for_mission(mission, feature_dir),
+            # Mission-artifact paths (e.g. ``contracts/``) live on the PRIMARY
+            # mission surface, not the repo root — resolve them via the canonical
+            # ``planning_read_dir`` seam (same surface ``_missing_artifacts`` uses),
+            # never ``repo_root`` (#2115 / #1716 residual). Build paths stay repo-root.
+            feature_dir=planning_read_dir,
+        )
+        if path_result.missing_paths:
+            if strict_metadata:
+                path_violations.append(
+                    path_result.format_errors() or _PATH_CONVENTIONS_NOT_SATISFIED
+                )
+            else:
+                path_convention_warning = (
+                    path_result.format_warnings() or _PATH_CONVENTIONS_NOT_SATISFIED
+                )
 
     warnings: list[str] = []
     if missing_optional:
         warnings.append("Optional artifacts missing: " + ", ".join(missing_optional))
     if path_violations:
-        warnings.append("Path conventions not satisfied.")
+        warnings.append(_PATH_CONVENTIONS_NOT_SATISFIED)
+    elif path_convention_warning:
+        warnings.append(path_convention_warning)
 
+    # T028: use coord-resolved read_feature_dir for lane-gate checks so that
+    # lanes.json and acceptance-matrix.json are read from the coordination
+    # worktree rather than the primary checkout when coord topology is active.
     _check_lane_gates(
         repo_root,
-        feature_dir,
+        read_feature_dir,
         branch,
         activity_issues,
         skipped_checks,
         blocked_checks,
         mutate_matrix=mutate_matrix,
     )
-    _check_workflow_run_evidence(repo_root, feature_dir, branch, activity_issues)
+    _check_workflow_run_evidence(repo_root, read_feature_dir, branch, activity_issues)
 
-    normalized_unchecked_tasks = unchecked_tasks if unchecked_tasks != [f"{TASKS_FILE} missing"] else []
+    normalized_unchecked_tasks = _normalized_unchecked_tasks(unchecked_tasks, lanes)
     recommended_fix_order = _build_recommended_fix_order(
         lanes=lanes,
         metadata_issues=metadata_issues,
@@ -1058,32 +1456,64 @@ def _commit_acceptance_meta(
     actor_name: str,
     mode: AcceptanceMode,
 ) -> tuple[str | None, str | None, bool]:
-    """Record acceptance in meta.json and commit; return (parent_commit, accept_commit, commit_created)."""
-    assert_not_protected_branch(summary.repo_root, operation="record acceptance")
+    """Record acceptance in meta.json and commit; return (parent_commit, accept_commit, commit_created).
+
+    T016 / WP04 / FR-001 / FR-003 / FR-009: the former
+    ``assert_not_protected_branch → raise`` deadlock is removed.  Protection
+    provenance flows through ``ProtectionPolicy.resolve`` (FR-007 / SF-2).
+
+    When HEAD is on an UNPROTECTED branch (the normal mission-lane path):
+    commits go directly to that branch, preserving existing behaviour.
+
+    When HEAD is on a PROTECTED branch (e.g. ``main``, direct-repo solo-fork
+    operator): commits are routed through ``commit_for_mission`` which
+    materialises the coordination worktree on demand (C-001 / FR-003).
+    """
+    from specify_cli.core.git_ops import get_current_branch
+    from specify_cli.git.protection_policy import ProtectionPolicy
+
+    repo_root = summary.repo_root
+    mission_slug = summary.feature
+    policy = ProtectionPolicy.resolve(repo_root)
+    current_branch = get_current_branch(repo_root)
+    on_protected_primary = current_branch is not None and policy.is_protected(current_branch)
 
     try:
-        parent_commit: str | None = run_git(["rev-parse", "HEAD"], cwd=summary.repo_root, check=False).stdout.strip() or None
+        parent_commit: str | None = run_git(["rev-parse", "HEAD"], cwd=repo_root, check=False).stdout.strip() or None
     except TaskCliError:
         parent_commit = None
 
     record_acceptance(summary.feature_dir, accepted_by=actor_name, mode=mode, from_commit=parent_commit, accept_commit=None)
 
     meta_path = summary.feature_dir / "meta.json"
-    meta_rel = str(meta_path.relative_to(summary.repo_root))
-    run_git(["add", meta_rel], cwd=summary.repo_root, check=True)
+    meta_rel = str(meta_path.relative_to(repo_root))
+
+    if on_protected_primary:
+        # Protected primary: route through commit_for_mission so the coord
+        # worktree is materialised on demand (C-001 / FR-003).
+        return _commit_acceptance_meta_via_router(
+            repo_root=repo_root,
+            mission_slug=mission_slug,
+            meta_path=meta_path,
+            policy=policy,
+            parent_commit=parent_commit,
+        )
+
+    # Unprotected path (mission-lane branch): commit directly to current branch.
+    run_git(["add", meta_rel], cwd=repo_root, check=True)
 
     # Scope the staged-check and commit to meta.json. A bare ``git commit`` would
     # sweep in any unrelated files the operator had pre-staged before running
     # ``accept``; the explicit ``-- <meta>`` pathspec commits only the
     # acceptance metadata and leaves the operator's staged work untouched.
-    status = run_git(["diff", "--cached", "--name-only", "--", meta_rel], cwd=summary.repo_root, check=True)
+    status = run_git(["diff", "--cached", "--name-only", "--", meta_rel], cwd=repo_root, check=True)
     staged_files = [line.strip() for line in status.stdout.splitlines() if line.strip()]
     if not staged_files:
         return parent_commit, None, False
 
-    run_git(["commit", "-m", f"Accept {summary.feature}", "--", meta_rel], cwd=summary.repo_root, check=True)
+    run_git(["commit", "-m", f"Accept {mission_slug}", "--", meta_rel], cwd=repo_root, check=True)
     try:
-        accept_commit: str | None = run_git(["rev-parse", "HEAD"], cwd=summary.repo_root, check=True).stdout.strip()
+        accept_commit: str | None = run_git(["rev-parse", "HEAD"], cwd=repo_root, check=True).stdout.strip()
     except TaskCliError:
         accept_commit = None
 
@@ -1095,15 +1525,81 @@ def _commit_acceptance_meta(
             if _history:
                 _history[-1]["accept_commit"] = accept_commit
             write_meta(summary.feature_dir, _meta)
-            run_git(["add", meta_rel], cwd=summary.repo_root, check=True)
-            commit_status = run_git(["diff", "--cached", "--name-only", "--", meta_rel], cwd=summary.repo_root, check=True)
+            run_git(["add", meta_rel], cwd=repo_root, check=True)
+            commit_status = run_git(["diff", "--cached", "--name-only", "--", meta_rel], cwd=repo_root, check=True)
             commit_staged_files = [line.strip() for line in commit_status.stdout.splitlines() if line.strip()]
             if commit_staged_files:
                 run_git(
-                    ["commit", "-m", f"Record acceptance commit for {summary.feature}", "--", meta_rel],
-                    cwd=summary.repo_root,
+                    ["commit", "-m", f"Record acceptance commit for {mission_slug}", "--", meta_rel],
+                    cwd=repo_root,
                     check=True,
                 )
+
+    return parent_commit, accept_commit, True
+
+
+def _commit_acceptance_meta_via_router(
+    *,
+    repo_root: Path,
+    mission_slug: str,
+    meta_path: Path,
+    policy: Any,
+    parent_commit: str | None,
+) -> tuple[str | None, str | None, bool]:
+    """Route acceptance commit through ``commit_for_mission`` on a protected primary.
+
+    Called by :func:`_commit_acceptance_meta` when HEAD is on a protected branch.
+    ``commit_for_mission`` handles coord-worktree materialisation (C-001).
+    Extracted to keep ``_commit_acceptance_meta`` complexity within the C901 ceiling.
+
+    ``policy`` accepts any object satisfying the ``_ProtectionPolicyProtocol``
+    structural protocol in ``commit_router`` (duck-typed; always a ``ProtectionPolicy``
+    instance at runtime — using ``Any`` avoids a cross-module Protocol import).
+    """
+    from mission_runtime import MissionArtifactKind
+    from specify_cli.coordination.commit_router import commit_for_mission
+
+    router_result = commit_for_mission(
+        repo_root=repo_root,
+        mission_slug=mission_slug,
+        files=(meta_path,),
+        message=f"Accept {mission_slug}",
+        policy=policy,
+        # meta.json is PRIMARY_METADATA (write-surface-coherence WP02 / T009):
+        # acceptance meta moves to the primary surface on the WRITE side too,
+        # realizing the INV-5 read↔write symmetry. Primary kind → primary target.
+        kind=MissionArtifactKind.PRIMARY_METADATA,
+    )
+
+    if router_result.status == "unchanged":
+        return parent_commit, None, False
+
+    if router_result.status not in ("committed",):
+        raise AcceptanceError(
+            f"Acceptance commit failed ({router_result.status}): "
+            + (router_result.diagnostic or "no diagnostic available")
+        )
+
+    accept_commit: str | None = router_result.commit_hash
+
+    if accept_commit:
+        _meta = load_meta(meta_path.parent)
+        if _meta is not None:
+            _meta["accept_commit"] = accept_commit
+            _history = _meta.get("acceptance_history", [])
+            if _history:
+                _history[-1]["accept_commit"] = accept_commit
+            write_meta(meta_path.parent, _meta)
+            # Second commit: record the accept_commit SHA back into meta.json.
+            commit_for_mission(
+                repo_root=repo_root,
+                mission_slug=mission_slug,
+                files=(meta_path,),
+                message=f"Record acceptance commit for {mission_slug}",
+                policy=policy,
+                # meta.json → PRIMARY_METADATA (write-surface-coherence WP02 / T009).
+                kind=MissionArtifactKind.PRIMARY_METADATA,
+            )
 
     return parent_commit, accept_commit, True
 

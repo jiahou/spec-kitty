@@ -12,16 +12,18 @@ from specify_cli.acceptance import (
     AcceptanceError,
     AcceptanceResult,
     AcceptanceSummary,
+    ArtifactEncodingError,
     acceptance_lane_derivations,
     choose_mode,
     collect_feature_summary,
+    normalize_feature_encoding,
     perform_acceptance,
     resolve_acceptance_actor,
 )
+from specify_cli.upgrade.pre30_guard import Pre30LayoutError
 from specify_cli.cli import StepTracker
 from specify_cli.cli.selector_resolution import resolve_mission_handle
 from specify_cli.cli.helpers import console, show_banner
-from specify_cli.git.commit_helpers import assert_not_protected_branch
 from specify_cli.task_utils import (
     LANES,
     TaskCliError,
@@ -41,7 +43,7 @@ def _safe_emit_error_logged(message: str) -> None:
         pass
 
 
-def _spec_artifact_dirty_paths(repo_root: Path, feature_slug: str) -> list[str]:
+def _spec_artifact_dirty_paths(repo_root: Path, mission_slug: str) -> list[str]:
     """Return tracked-but-uncommitted spec/meta artifacts under the mission dir.
 
     The acceptance pipeline materializes derived artifacts (e.g.
@@ -55,7 +57,7 @@ def _spec_artifact_dirty_paths(repo_root: Path, feature_slug: str) -> list[str]:
     Untracked files (``??``) are deliberately excluded so the cleanup commit
     never sweeps in unrelated, unmanaged files the operator may have created.
     """
-    prefix = f"kitty-specs/{feature_slug}/"
+    prefix = f"kitty-specs/{mission_slug}/"
     dirty: list[str] = []
     for line in git_status_lines(repo_root):
         # Porcelain format: two status chars, a space, then the path.
@@ -71,7 +73,7 @@ def _spec_artifact_dirty_paths(repo_root: Path, feature_slug: str) -> list[str]:
     return dirty
 
 
-def _commit_residual_acceptance_artifacts(repo_root: Path, feature_slug: str) -> bool:
+def _commit_residual_acceptance_artifacts(repo_root: Path, mission_slug: str) -> bool:
     """Stage and commit any leftover acceptance artifacts so the tree is clean.
 
     Returns True when a follow-up commit was created. This preserves the
@@ -79,7 +81,7 @@ def _commit_residual_acceptance_artifacts(repo_root: Path, feature_slug: str) ->
     commit) while guaranteeing a successful ``accept`` leaves no
     staged-but-uncommitted or modified-unstaged spec/meta artifacts behind.
     """
-    dirty = _spec_artifact_dirty_paths(repo_root, feature_slug)
+    dirty = _spec_artifact_dirty_paths(repo_root, mission_slug)
     if not dirty:
         return False
 
@@ -101,11 +103,26 @@ def _commit_residual_acceptance_artifacts(repo_root: Path, feature_slug: str) ->
         return False
 
     run_git(
-        ["commit", "-m", f"Finalize acceptance artifacts for {feature_slug}", "--", *dirty],
+        ["commit", "-m", f"Finalize acceptance artifacts for {mission_slug}", "--", *dirty],
         cwd=repo_root,
         check=True,
     )
     return True
+
+
+def _print_acceptance_warnings(summary: AcceptanceSummary) -> None:
+    """Render non-blocking ``summary.warnings`` in the human console.
+
+    The ``--json`` output already carries ``warnings``, but the human-readable
+    paths did not surface them, so a ``--lenient`` operator (issue #1892) got no
+    signal about what was downgraded from blocking to advisory. Shown only when
+    non-empty so a clean summary prints no spurious section.
+    """
+    if not summary.warnings:
+        return
+    console.print("\n[bold yellow]Warnings[/bold yellow]")
+    for warning in summary.warnings:
+        console.print(f"[yellow]- {warning}[/yellow]")
 
 
 def _print_acceptance_summary(summary: AcceptanceSummary) -> None:
@@ -128,6 +145,8 @@ def _print_acceptance_summary(summary: AcceptanceSummary) -> None:
                 console.print(f"    • {value}")
     else:
         console.print("\n[green]No outstanding acceptance issues detected.[/green]")
+
+    _print_acceptance_warnings(summary)
 
     if summary.optional_missing:
         console.print(
@@ -192,16 +211,79 @@ def _print_acceptance_diagnosis(summary: AcceptanceSummary) -> None:
         for item in summary.blocked_checks:
             console.print(f"[yellow]- {item.check}[/yellow]: {item.detail}")
 
+    _print_acceptance_warnings(summary)
+
     if summary.recommended_fix_order:
         console.print("\n[bold]Recommended fix order[/bold]")
-        for idx, item in enumerate(summary.recommended_fix_order, start=1):
-            console.print(f"  {idx}. {item}")
+        for idx, fix in enumerate(summary.recommended_fix_order, start=1):
+            console.print(f"  {idx}. {fix}")
 
 
 def _summary_payload(summary: AcceptanceSummary) -> dict[str, object]:
-    payload = summary.to_dict()
+    payload: dict[str, object] = summary.to_dict()
     payload.update(acceptance_lane_derivations(summary))
     return payload
+
+
+def _report_encoding_repair(repo_root: Path, repaired: list[Path]) -> None:
+    """Surface which acceptance artifacts the encoding repair rewrote.
+
+    Mirrors the command's existing ``console`` reporting idiom. Paths are shown
+    relative to ``repo_root`` when possible so the operator sees mission-relative
+    artifact names rather than absolute temp paths.
+    """
+    if not repaired:
+        console.print(
+            "[yellow]--normalize-encoding enabled but no artifacts required updates.[/yellow]"
+        )
+        return
+    console.print("[yellow]Normalized acceptance-artifact encoding for:[/yellow]")
+    for path in repaired:
+        try:
+            display = path.relative_to(repo_root)
+        except ValueError:
+            display = path
+        console.print(f"  - {display}")
+
+
+def _collect_summary_with_optional_repair(
+    repo_root: Path,
+    mission_slug: str,
+    *,
+    strict_metadata: bool,
+    mutate_matrix: bool,
+    normalize_encoding: bool,
+) -> AcceptanceSummary:
+    """Collect the acceptance summary, optionally repairing artifact encoding.
+
+    FR-005 / C-003: when ``normalize_encoding`` is True and the strict UTF-8 read
+    raises ``ArtifactEncodingError``, delegate to the **canonical**
+    ``acceptance.normalize_feature_encoding`` (no standalone logic is copied),
+    report the repaired paths, and re-collect exactly once. Any second failure
+    propagates to the caller's ``except AcceptanceError`` handler (exit 1). When
+    the flag is off, the error propagates unchanged so the pre-existing default
+    error path is preserved untouched.
+    """
+    try:
+        return collect_feature_summary(
+            repo_root,
+            mission_slug,
+            strict_metadata=strict_metadata,
+            mutate_matrix=mutate_matrix,
+        )
+    except ArtifactEncodingError:
+        if not normalize_encoding:
+            raise
+        repaired = normalize_feature_encoding(repo_root, mission_slug)
+        _report_encoding_repair(repo_root, repaired)
+        # Re-collect exactly once; a second encoding (or other acceptance)
+        # failure propagates rather than looping.
+        return collect_feature_summary(
+            repo_root,
+            mission_slug,
+            strict_metadata=strict_metadata,
+            mutate_matrix=mutate_matrix,
+        )
 
 
 def accept(
@@ -209,12 +291,6 @@ def accept(
         None,
         "--mission",
         help="Mission slug to accept",
-    ),
-    feature: str | None = typer.Option(
-        None,
-        "--feature",
-        hidden=True,
-        help="(deprecated) Use --mission",
     ),
     mode: str = typer.Option("auto", "--mode", case_sensitive=False, help="Acceptance mode: auto, pr, local, or checklist"),
     actor: str | None = typer.Option(None, "--actor", help="Name to record as the acceptance actor"),
@@ -224,6 +300,11 @@ def accept(
     no_commit: bool = typer.Option(False, "--no-commit", help="Report acceptance readiness without writing metadata or status changes"),
     diagnose: bool = typer.Option(False, "--diagnose", help="Diagnose acceptance blockers without writing metadata or matrix artifacts"),
     allow_fail: bool = typer.Option(False, "--allow-fail", help="Return checklist even when issues remain"),
+    normalize_encoding: bool = typer.Option(
+        False,
+        "--normalize-encoding/--no-normalize-encoding",
+        help="Repair acceptance-artifact encoding (Windows-1252/Latin-1 -> UTF-8) before validating.",
+    ),
 ) -> None:
     """Validate mission readiness before merging to main."""
 
@@ -249,7 +330,7 @@ def accept(
     # Resolve mission handle — supports slug, numeric prefix, mid8, or full ULID.
     # resolve_mission_handle() handles AmbiguousHandleError / MissionNotFoundError
     # and calls sys.exit(2) on failure; no try/except needed.
-    raw_handle = mission or feature
+    raw_handle = mission
     if raw_handle is None:
         _safe_emit_error_logged("No mission handle provided")
         if json_output:
@@ -258,7 +339,7 @@ def accept(
             tracker.error("detect", "--mission <slug> is required")
             console.print(tracker.render())
             console.print("[red]Error:[/red] --mission <slug> is required")
-        raise typer.Exit(1)
+        raise typer.Exit(2)
 
     resolved = resolve_mission_handle(raw_handle, repo_root, json_mode=json_output)
     mission_slug = resolved.mission_slug
@@ -277,12 +358,34 @@ def accept(
     if not json_output:
         tracker.start("verify")
     try:
-        summary = collect_feature_summary(
+        summary = _collect_summary_with_optional_repair(
             repo_root,
             mission_slug,
             strict_metadata=not lenient,
+            # --no-commit must still resolve the acceptance matrix (run negative
+            # invariants, refresh verdict); otherwise the verdict stays 'pending'
+            # and the gate can never pass in --no-commit mode. The matrix write
+            # is accept-owned and excluded from the dirty-tree gate (#1883), so
+            # mutating without committing is safe and converges. Only diagnose
+            # (read-only) leaves the matrix untouched.
             mutate_matrix=not diagnose,
+            # FR-005: opt-in repair of mojibake acceptance artifacts via the
+            # canonical normalize_feature_encoding before validating (default off).
+            normalize_encoding=normalize_encoding,
         )
+    except Pre30LayoutError as exc:
+        # #1057 / squad Blocker 1: a pre-3.0 lane-directory mission must hard-reject
+        # with the `spec-kitty upgrade` instruction and write NOTHING — never fall
+        # through to a vacuous all-done summary that auto-commits an unmigrated
+        # mission.
+        _safe_emit_error_logged(str(exc))
+        if json_output:
+            print(json.dumps({"error": str(exc)}))
+        else:
+            tracker.error("verify", str(exc))
+            console.print(tracker.render())
+            console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
     except AcceptanceError as exc:
         _safe_emit_error_logged(str(exc))
         if json_output:
@@ -336,17 +439,15 @@ def accept(
     acceptance_tests = list(test)
     actor_name = resolve_acceptance_actor(actor)
 
-    if commit_required:
-        try:
-            assert_not_protected_branch(repo_root, operation="record acceptance")
-        except Exception as exc:
-            _safe_emit_error_logged(str(exc))
-            if json_output:
-                print(json.dumps({"error": str(exc)}))
-            else:
-                console.print(f"[red]Error:[/red] {exc}")
-            raise typer.Exit(1)
+    # T015 / WP04 / FR-001: the protected-primary guard is no longer a hard
+    # reject here.  ``_commit_acceptance_meta`` routes every commit through
+    # ``commit_for_mission``, which materialises the coordination worktree on
+    # demand when the primary is protected (C-001 / FR-003).  A pre-flight
+    # raise-and-exit deadlock is therefore unnecessary and has been removed.
 
+    result: AcceptanceResult | None = None
+    _accept_exc: AcceptanceError | None = None
+    _residue_exc: Exception | None = None
     try:
         if commit_required and not json_output:
             tracker.start("commit")
@@ -366,18 +467,11 @@ def accept(
                 tests=acceptance_tests,
                 auto_commit=commit_required,
             )
-        if commit_required:
-            # The acceptance commit (inside perform_acceptance) only captures
-            # meta.json. Derived artifacts materialized during readiness checks
-            # (e.g. acceptance-matrix.json, status views) are written after the
-            # git-cleanliness snapshot and would otherwise be left dirty. Fold
-            # them into a follow-up commit so a successful accept leaves a clean
-            # working tree on every path (including accept_commit == None).
-            _commit_residual_acceptance_artifacts(repo_root, mission_slug)
         if commit_required and not json_output:
             detail = "commit created" if result.commit_created else "no changes"
             tracker.complete("commit", detail)
     except AcceptanceError as exc:
+        _accept_exc = exc
         _safe_emit_error_logged(str(exc))
         if json_output:
             print(json.dumps({"error": str(exc)}))
@@ -386,7 +480,33 @@ def accept(
                 tracker.error("commit", str(exc))
                 console.print(tracker.render())
             console.print(f"[red]Error:[/red] {exc}")
+    finally:
+        if commit_required:
+            # The acceptance commit (inside perform_acceptance) only captures
+            # meta.json. Derived artifacts materialized during readiness checks
+            # (e.g. acceptance-matrix.json, status views) are written after the
+            # git-cleanliness snapshot and would otherwise be left dirty. Fold
+            # them into a follow-up commit so all writing exit paths (including
+            # error paths and accept_commit == None) leave a clean working tree.
+            try:
+                _commit_residual_acceptance_artifacts(repo_root, mission_slug)
+            except Exception as residue_exc:
+                _residue_exc = residue_exc
+                _safe_emit_error_logged(f"Residual artifact commit failed: {residue_exc}")
+    if _accept_exc is not None:
         raise typer.Exit(1)
+    if _residue_exc is not None:
+        error_msg = f"Residual artifact commit failed: {_residue_exc}"
+        if json_output:
+            print(json.dumps({"error": error_msg}))
+        else:
+            if commit_required:
+                tracker.error("commit", error_msg)
+                console.print(tracker.render())
+            console.print(f"[red]Error:[/red] {error_msg}")
+        raise typer.Exit(1)
+
+    assert result is not None  # guaranteed: _accept_exc is None means perform_acceptance succeeded
 
     if json_output:
         print(json.dumps(result.to_dict(), indent=2))

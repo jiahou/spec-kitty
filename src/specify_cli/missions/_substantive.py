@@ -156,7 +156,7 @@ def _is_real_technical_context_value(raw: str) -> bool:
 def _has_substantive_technical_context(body: str) -> bool:
     """Return True iff Technical Context has Language/Version plus a peer field."""
     section = re.search(
-        r"##\s+Technical Context\s*\n(?P<body>.*?)(?=\n##\s+|\Z)",
+        r"##\s+Technical Context\s*\n(?P<body>(?:[^\n]|\n(?!##))*)",
         body,
         flags=re.DOTALL,
     )
@@ -175,8 +175,13 @@ def _has_substantive_technical_context(body: str) -> bool:
     if not _is_real_technical_context_value(lang_match.group("val")):
         return False
 
+    # FR-013 (#1896): Technical Context fields may be written as Markdown
+    # bullets (``- **Field**: value`` / ``* **Field**: value``). The peer-field
+    # scan must tolerate an optional leading bullet marker before the bolded
+    # label; a bullet-intolerant ``^\s*\*\*`` anchor rejected a fully-populated
+    # bulleted section as non-substantive.
     peer_fields = re.finditer(
-        r"^\s*\*\*(?P<label>[^*\n]+)\*\*[ \t]*:[ \t]*(?P<val>[^\n]*)",
+        r"^[ \t]*(?:[-*][ \t]+)?\*\*(?P<label>[^*\n]+)\*\*[ \t]*:[ \t]*(?P<val>[^\n]*)",
         sec_body,
         flags=re.MULTILINE,
     )
@@ -186,6 +191,47 @@ def _has_substantive_technical_context(body: str) -> bool:
         if _is_real_technical_context_value(field.group("val")):
             return True
     return False
+
+
+def describe_technical_context_gap(body: str) -> str | None:
+    """Return a human reason when Technical Context fails the substantive gate.
+
+    FR-013 (#1896): when ``_has_substantive_technical_context`` returns False
+    the caller's ``blocked_reason`` should *name the offending format* rather
+    than emit a generic verdict. This returns ``None`` when the section is
+    substantive (no gap), or a specific diagnostic string otherwise:
+
+    * the section is absent;
+    * ``Language/Version`` is missing or placeholder-only;
+    * peer fields exist (incl. bulleted ``- **Field**: value``) but every
+      value parsed as a template placeholder.
+    """
+    section = re.search(
+        r"##\s+Technical Context\s*\n(?P<body>(?:[^\n]|\n(?!##))*)",
+        body,
+        flags=re.DOTALL,
+    )
+    if section is None:
+        return "Technical Context section is missing from plan.md."
+    sec_body = _strip_placeholders(section.group("body"))
+    lang_match = re.search(
+        r"\*\*Language/Version\*\*[ \t]*:[ \t]*(?P<val>[^\n]*)",
+        sec_body,
+    )
+    if lang_match is None or not _is_real_technical_context_value(
+        lang_match.group("val")
+    ):
+        return (
+            "Technical Context **Language/Version** is missing or carries only "
+            "placeholder content."
+        )
+    if _has_substantive_technical_context(body):
+        return None
+    return (
+        "Technical Context has **Language/Version** but no peer field with "
+        "non-placeholder content (bulleted '- **Field**: value' fields are "
+        "accepted — populate at least one peer field)."
+    )
 
 
 def is_substantive(file_path: Path, kind: Kind) -> bool:
@@ -211,32 +257,102 @@ def is_substantive(file_path: Path, kind: Kind) -> bool:
     raise ValueError(f"Unknown kind: {kind!r}")
 
 
-def is_committed(file_path: Path, repo_root: Path) -> bool:
-    """Return True iff ``file_path`` is git-tracked AND present at HEAD.
+def _git_commit_check_context(file_path: Path, repo_root: Path) -> tuple[Path, str] | None:
+    """Return ``(git_cwd, tree_path)`` for committedness checks.
 
-    Both conditions must hold: a file freshly added to the index but not yet
-    committed will return False. A previously-committed file that has since
-    been deleted from the index also returns False.
+    Linked worktrees live under ``.worktrees/<name>/`` on disk, but branch tree
+    paths start at that worktree root.  A file at
+    ``.worktrees/<name>/kitty-specs/<slug>/spec.md`` must therefore be checked
+    as ``kitty-specs/<slug>/spec.md`` against the target ref.
     """
     try:
-        rel = file_path.resolve().relative_to(repo_root.resolve())
+        repo_abs = repo_root.resolve()
+        rel = file_path.resolve().relative_to(repo_abs)
     except ValueError:
-        return False
-    rel_str = str(rel)
+        return None
+
+    parts = rel.parts
+    if len(parts) > 2 and parts[0] == ".worktrees":
+        worktree_root = repo_abs / parts[0] / parts[1]
+        if worktree_root.is_dir():
+            return worktree_root, str(Path(*parts[2:]))
+
+    return repo_abs, str(rel)
+
+
+def _head_carries_path(git_cwd: Path, tree_path: str) -> bool:
+    """Return True iff ``tree_path`` is tracked AND present at ``HEAD``."""
     try:
         subprocess.run(
-            ["git", "-C", str(repo_root), "ls-files", "--error-unmatch", rel_str],
+            ["git", "-C", str(git_cwd), "ls-files", "--error-unmatch", tree_path],
             check=True,
             capture_output=True,
         )
         subprocess.run(
-            ["git", "-C", str(repo_root), "cat-file", "-e", f"HEAD:{rel_str}"],
+            ["git", "-C", str(git_cwd), "cat-file", "-e", f"HEAD:{tree_path}"],
             check=True,
             capture_output=True,
         )
+        return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
-    return True
 
 
-__all__ = ["Kind", "is_committed", "is_substantive"]
+def is_committed(
+    file_path: Path,
+    repo_root: Path,
+    *,
+    diagnostics: list[str] | None = None,
+) -> bool:
+    """Return True iff ``file_path`` is committed on the git surface it lives on.
+
+    Single-surface check (FR-011): a file is "committed" iff it is tracked AND
+    present at the ``HEAD`` of the git surface it physically resides on. The
+    surface is derived from ``file_path`` itself via
+    :func:`_git_commit_check_context` — a linked worktree (``.worktrees/<name>/``)
+    is checked against that worktree's branch tree, the primary checkout against
+    primary ``HEAD``.
+
+    This collapses the former 3-leg OR (coordination-ref / HEAD /
+    primary-target-branch). The OR was load-bearing only when a caller fed the
+    PRIMARY-checkout path while the spec lived solely on the coordination
+    branch — but the sole non-test caller (setup-plan) already feeds the
+    READ-resolved ``spec_file``: since #2106 (gate-read-surface-completion)
+    re-partitioned SPEC as a primary-kind, the caller now resolves SPEC to the
+    PRIMARY dir for ALL topologies — both the coord-topology case (the coord
+    worktree carries status events only, no planning artifacts) and the #1718
+    create-window. The #1848 coord-deleted case never
+    reaches this function — the read-path resolution upstream raises
+    ``CoordinationBranchDeleted`` (a ``StatusReadPathNotFound``) and the caller
+    exits before the commit check. So the read-resolved surface converges with
+    the retired OR on every reachable cell (proven via the parametrized
+    envelope + a live repro, NFR-003 behaviour-preserving).
+
+    Args:
+        file_path: The file to check for commit presence.
+        repo_root: The repository root used to derive ``file_path``'s git
+            surface (worktree-vs-primary) for the ``HEAD`` check.
+        diagnostics: Optional sink — when provided, one human-readable line
+            describing the surface checked is appended, annotated with
+            hit/miss.
+
+    Returns:
+        ``True`` iff ``file_path`` is tracked and present at ``HEAD`` of its own
+        git surface.
+    """
+    check_context = _git_commit_check_context(file_path, repo_root)
+    if check_context is None:
+        if diagnostics is not None:
+            diagnostics.append(f"file outside repo_root {repo_root}: not committed")
+        return False
+    git_cwd, tree_path = check_context
+
+    head_hit = _head_carries_path(git_cwd, tree_path)
+    if diagnostics is not None:
+        diagnostics.append(f"HEAD:{tree_path} (cwd={git_cwd}): {'hit' if head_hit else 'miss'}")
+    return head_hit
+
+
+# Kind: demoted — used only within this module; no cross-module src/
+# from-import callers (WP01 harden-dead-symbol-gate-01KW0RJR).
+__all__ = ["describe_technical_context_gap", "is_committed", "is_substantive"]

@@ -33,44 +33,43 @@ phantom deletion produced by a sparse-checkout filter interacting with
 backstop is unconditional and cannot be bypassed via any ``--force`` code path
 --- see Priivacy-ai/spec-kitty#588 for the cascade it defends against.
 
-Protected-branch exception policy
----------------------------------
+Protected-branch authorization policy (FR-008)
+----------------------------------------------
 
-A small allowlist of commit-message prefixes is permitted to land on protected
-branches because they correspond to non-spec-kitty-internal release workflows
-that legitimately mutate the protected branch:
+A commit may land on a protected branch ONLY when the caller asserts a
+protected-flow :class:`~specify_cli.core.commit_guard.GuardCapability` at the
+call site (``release_flow`` / ``upgrade_bookkeeping`` / ``merge_bookkeeping`` /
+``test_mode``). The decision is made solely by ``commit_guard.evaluate`` —
+authorization is asserted-at-the-surface, never derived from commit-message
+text, committed-file content, or ambient environment.
 
-- ``"chore: apply spec-kitty upgrade changes"`` — the ``spec-kitty upgrade`` flow
-  ships migration commits onto the user's main branch by design.
-- ``"chore(<mission>): record done transitions for merged WPs"`` — the
-  final ``spec-kitty merge`` bookkeeping commit after the mission branch has
-  already been merged into the operator-selected target branch.
-- ``"chore: release "`` — the release tagging flow.
-- ``"release: "`` — alternate release tagging style used by some downstream
-  configurations.
+WP03 DELETED the historical privilege channels that used to grant this implicitly:
 
-Completed Op records may also land on protected branches, but only when an
-internal caller explicitly passes ``allow_completed_op_on_protected_branch=True``
-and the changeset contains exactly one ``kitty-ops/<op-id>.jsonl`` file whose
-JSONL content includes a completed event for that same Op id. This is not a
-commit-message prefix exception and is not exposed through the public
-``safe-commit`` command. The path still flows through the staging preservation
-and backstop checks below.
+- the message-prefix allowlist (``release: ``/``chore: …`` etc.) — the upgrade,
+  release, and merge-bookkeeping flows now pass an explicit capability;
+- the two ``allow_*`` protected-branch bool parameters and the op-record JSONL
+  file-content exception — folded into ``GuardCapability.test_mode`` /
+  ``merge_bookkeeping``;
+- the ``SPEC_KITTY_TEST_MODE`` env privilege hatch.
+
+The ONE retained operator escape hatch,
+``SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS`` (for solo-fork operators who own
+``main``), is consumed by the protected-branch pre-checks AND by
+``safe_commit``'s ``ProtectionState`` input computation — the operator declares
+the branch unprotected for this repo. ``commit_guard.evaluate`` itself never
+reads the environment.
 
 Spec-kitty-internal exceptions (planning-artifact prefixes such as
-``"chore: planning artifacts for "``) were **removed** as part of #1348 (FR-013):
-they constituted a silent bypass that allowed the runtime to land arbitrary
-state on ``main`` while the symmetric WP-transition write was loudly refused.
-Any new exception requires a doctrine-level decision (DIRECTIVE_003).
+``"chore: planning artifacts for "``) were removed as part of #1348 (FR-013):
+they constituted a silent bypass. New protected-branch flows require a
+capability, not a message convention.
 """
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
+from specify_cli.core.constants import KITTY_SPECS_DIR, WORKTREES_DIR
 import contextlib
-import json
 import logging
-import os
 import subprocess
 import uuid
 from collections.abc import Sequence
@@ -78,6 +77,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from mission_runtime import CommitTarget
+from specify_cli.core.commit_guard import GuardCapability, GuardVerdict, ProtectionState
+from specify_cli.core.commit_guard import evaluate as evaluate_commit_guard
+from specify_cli.git.protection_policy import ProtectionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +91,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Adopt-on-next-touch: this family predates the shared
+# ``specify_cli.core.errors.StructuredError`` base (#1893). Reparent onto it
+# (overriding ``to_dict`` for the extra contextual fields) the next time this
+# class is materially edited.
 class SafeCommitError(RuntimeError):
     """Base class for structured safe_commit errors.
 
@@ -260,7 +268,7 @@ class SafeCommitRecoveryFailed(SafeCommitError):
 
 
 class ProtectedBranchRefused(SafeCommitError):
-    """``destination_ref`` is on the protected list (no documented exception)."""
+    """``destination_ref`` is protected and ``capability`` authorizes no flow."""
 
     error_code = "SAFE_COMMIT_PROTECTED_BRANCH"
 
@@ -274,8 +282,10 @@ class ProtectedBranchRefused(SafeCommitError):
         message = (
             f"safe_commit: refusing to commit to protected branch "
             f"{destination_ref!r} in {worktree_root}. "
-            f"Use the coordination worktree at .worktrees/<slug>-<mid8>-coord/, "
-            f"or land via the mission lane worktree."
+            f"Start a non-protected feature branch and commit there "
+            f"('spec-kitty mission create --start-branch <feature-branch>', or "
+            f"check out an existing feature branch). Planning artifacts must land "
+            f"on a feature branch, or land via the mission lane worktree."
         )
         super().__init__(
             message,
@@ -283,6 +293,33 @@ class ProtectedBranchRefused(SafeCommitError):
             worktree_root=worktree_root,
         )
         self.commit_message = commit_message
+
+
+class SafeCommitPathPolicyError(SafeCommitError):
+    """A requested path violates the safe_commit path policy.
+
+    FR-005 / Issue #1887: paths under ``.worktrees/`` must never be staged via
+    ``git add`` from the primary repo root. They are coordination-worktree
+    artefacts; committing them from the primary checkout leaks internal paths
+    into ``origin/main``. This error fires BEFORE staging, so the index is
+    never mutated.
+    """
+
+    error_code = "SAFE_COMMIT_PATH_POLICY"
+
+    def __init__(self, *, offending_path: str, worktree_root: Path) -> None:
+        message = (
+            f"safe_commit: refusing to stage path under .worktrees/: {offending_path}. "
+            "Planning artifacts must be committed from the coordination worktree, "
+            "not the primary repo root."
+        )
+        super().__init__(message, worktree_root=worktree_root)
+        self.offending_path = offending_path
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload["offending_path"] = self.offending_path
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +348,16 @@ class SafeCommitBackstopError(RuntimeError):
         self,
         unexpected: tuple[UnexpectedStagedPath, ...],
         requested: tuple[str, ...],
+        *,
+        worktree_root: Path | None = None,
+        destination_ref: str | None = None,
+        head_sha: str | None = None,
     ) -> None:
         self.unexpected = unexpected
         self.requested = requested
+        self.worktree_root = worktree_root
+        self.destination_ref = destination_ref
+        self.head_sha = head_sha
         message_lines = [
             "Commit aborted: staging area contains unexpected paths.",
             "",
@@ -326,7 +370,33 @@ class SafeCommitBackstopError(RuntimeError):
         for unexpected_path in unexpected:
             message_lines.append(f"  {unexpected_path.status_code} {unexpected_path.path}")
         message_lines.append("")
-        message_lines.append("This usually means the working tree is behind HEAD.")
+        # FR-012: name the diverged worktree/ref and the behind/ahead state
+        # instead of the bare "working tree is behind HEAD" guess.
+        has_phantom_deletions = any(
+            entry.status_code.startswith("D") for entry in unexpected
+        )
+        where = str(worktree_root) if worktree_root is not None else "this worktree"
+        ref_label = destination_ref if destination_ref is not None else "<unknown ref>"
+        head_label = head_sha[:12] if head_sha else "<unknown>"
+        message_lines.append(
+            f"Diverged worktree: {where} (checked out: {ref_label}, HEAD {head_label})."
+        )
+        if has_phantom_deletions:
+            message_lines.append(
+                "The index/working tree is BEHIND its own HEAD (the unexpected "
+                "staged deletions are files HEAD carries but the checkout lacks)."
+            )
+            message_lines.append(
+                f"Most likely cause: the branch ref {ref_label!r} was advanced "
+                "underneath this worktree (e.g. `git update-ref` during a merge "
+                "while the branch was checked out here, #1826)."
+            )
+        else:
+            message_lines.append(
+                "The index/working tree is AHEAD of (or sideways from) HEAD: "
+                "the unexpected entries are local additions/modifications that "
+                "were never requested for this commit."
+            )
         message_lines.append("Investigate before committing:")
         message_lines.append("  git diff --cached")
         message_lines.append("  git status")
@@ -346,24 +416,6 @@ class ProtectedBranchCommitError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Protected-branch policy
-# ---------------------------------------------------------------------------
-
-_DEFAULT_PROTECTED_BRANCHES = frozenset({"main", "master"})
-_MERGE_BOOKKEEPING_PREFIX = "chore("
-
-# Documented exceptions kept on purpose. See module docstring for rationale.
-# DO NOT add spec-kitty-internal entries here. New exceptions require a
-# doctrine-level decision (DIRECTIVE_003).
-_PROTECTED_BRANCH_COMMIT_EXCEPTIONS = (
-    "chore: apply spec-kitty upgrade changes",  # upgrade flow
-    _MERGE_BOOKKEEPING_PREFIX,  # merge bookkeeping; narrowed by _is_protected_branch_exception
-    "chore: release ",  # release flow
-    "release: ",  # alternate release flow
-)
-
-
-# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 
@@ -375,6 +427,20 @@ class CommitResult:
     sha: str
     destination_ref: str
     worktree_root: Path
+
+    def to_dict(self) -> dict[str, str]:
+        """Render a JSON-serializable mapping (#1891 / FR-013).
+
+        ``worktree_root`` is a :class:`~pathlib.Path`, which ``json.dumps`` cannot
+        serialize directly; rendering it as a string lets callers emit a
+        ``CommitResult`` in a ``--json`` payload without raising
+        ``Object of type CommitResult is not JSON serializable``.
+        """
+        return {
+            "sha": self.sha,
+            "destination_ref": self.destination_ref,
+            "worktree_root": str(self.worktree_root),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -412,133 +478,50 @@ def _current_branch(repo_path: Path) -> str | None:
     return branch
 
 
-def _remote_default_branch(repo_path: Path) -> str | None:
-    symbolic_ref = _run_git_text(repo_path, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
-    if symbolic_ref and "/" in symbolic_ref:
-        return symbolic_ref.rsplit("/", 1)[1]
-
-    remote_show = _run_git_text(repo_path, ["remote", "show", "origin"])
-    if remote_show:
-        for line in remote_show.splitlines():
-            if "HEAD branch:" in line:
-                return line.rsplit(":", 1)[1].strip() or None
-    return None
-
-
 def protected_branches(repo_path: Path) -> frozenset[str]:
-    """Return branch names that must not receive Spec Kitty status commits."""
-    branches = set(_DEFAULT_PROTECTED_BRANCHES)
-    if default_branch := _remote_default_branch(repo_path):
-        branches.add(default_branch)
-    return frozenset(branches)
+    """Return branch names that must not receive Spec Kitty status commits.
+
+    This function is a **public delegate** of :meth:`ProtectionPolicy.resolve`
+    (T002 / FR-010).  All resolution logic now lives in
+    :mod:`specify_cli.git.protection_policy`; this entry point is kept public
+    because :mod:`tests.git.protected_target_fixtures` and the FR-010 import
+    allowlist depend on it as the one sanctioned delegate.
+
+    For production code that needs the full policy (including the hatch state),
+    prefer :class:`ProtectionPolicy` directly.
+    """
+    return ProtectionPolicy.resolve(repo_path).protected_branches
 
 
 def assert_not_protected_branch(repo_path: Path, *, operation: str = "commit") -> None:
     """Fail loudly before a Spec Kitty status commit can pollute local main.
 
-    The guard is bypassed when either of:
-    - ``SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS`` is set to a truthy value
-      (``1``, ``true``, ``yes``) — opt-in for solo-fork operators who own ``main``.
-    - ``SPEC_KITTY_TEST_MODE=1`` is set — the test-mode marker the conftest sets
-      on its isolated environment. Test fixtures create projects on ``main`` and
-      exercise status commit commands directly; forcing every fixture to fork a lane
-      branch would multiply boilerplate without testing anything the production
-      guard cares about.
-    """
-    _ALLOWED_VALUES = ("1", "true", "yes")
-    if os.environ.get("SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS", "").lower() in _ALLOWED_VALUES:
-        return
-    if os.environ.get("SPEC_KITTY_TEST_MODE", "").lower() in _ALLOWED_VALUES:
-        return
+    The guard is bypassed only by the ONE documented operator escape hatch:
+    ``SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS`` set to a truthy value
+    (``1``, ``true``, ``yes``) — opt-in for solo-fork operators who own ``main``.
 
+    The hatch and the protection set are resolved together via
+    :meth:`ProtectionPolicy.resolve` (SF-1 / T002 / FR-009).  WP04's
+    ``accept``/``acceptance`` callsites reach protected-branch provenance through
+    this function without touching ``commit_helpers`` directly.
+
+    The former ``SPEC_KITTY_TEST_MODE`` privilege hatch was a deleted bypass
+    channel (WP03 / FR-008): tests now assert ``GuardCapability.TEST_MODE`` at
+    the call site instead of ambient env. Privilege is asserted-at-the-surface,
+    never derived from environment.
+    """
     repo_path = repo_path.resolve()
     if not _is_spec_kitty_project(repo_path):
         return
 
     branch = _current_branch(repo_path)
-    if branch and branch in protected_branches(repo_path):
-        raise ProtectedBranchCommitError(
-            f"Refusing to {operation} on protected branch '{branch}' in {repo_path}. "
-            "Run status commit operations from the mission lane branch/worktree."
-        )
-
-
-def _is_protected_branch_exception(commit_message: str) -> bool:
-    if commit_message.startswith(_MERGE_BOOKKEEPING_PREFIX):
-        first_line = commit_message.splitlines()[0]
-        return first_line.endswith("): record done transitions for merged WPs")
-    return commit_message.startswith(
-        tuple(
-            prefix
-            for prefix in _PROTECTED_BRANCH_COMMIT_EXCEPTIONS
-            if prefix != _MERGE_BOOKKEEPING_PREFIX
-        )
-    )
-
-
-def _test_mode_allows_protected_branch() -> bool:
-    _ALLOWED = {"1", "true", "yes"}
-    return (
-        os.environ.get("SPEC_KITTY_TEST_MODE", "").lower() in _ALLOWED
-        or os.environ.get("SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS", "").lower() in _ALLOWED
-    )
-
-
-def _is_completed_op_record_exception(
-    worktree_root: Path,
-    normalized_files: Sequence[str],
-) -> bool:
-    op_id, op_path = _completed_op_exception_target(normalized_files)
-    if op_id is None or op_path is None:
-        return False
-
-    record_path = worktree_root / op_path
-    try:
-        lines = record_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return False
-
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return False
-        if (
-            isinstance(event, dict)
-            and event.get("event") == "completed"
-            and event.get("invocation_id") == op_id
-        ):
-            return True
-    return False
-
-
-def _completed_op_exception_target(
-    normalized_files: Sequence[str],
-) -> tuple[str | None, Path | None]:
-    """Return the op id/path pair when ``normalized_files`` is an op record."""
-    if len(normalized_files) != 1:
-        return None, None
-
-    op_path = Path(normalized_files[0])
-    if op_path.is_absolute() or len(op_path.parts) != 2 or op_path.parts[0] != "kitty-ops":
-        return None, None
-
-    filename = op_path.parts[1]
-    if not filename.endswith(".jsonl"):
-        return None, None
-
-    op_id = filename.removesuffix(".jsonl")
-    if op_id in {"ops-index", "lifecycle", "propagation-errors"} or not _is_ulid(op_id):
-        return None, None
-    return op_id, op_path
-
-
-def _is_ulid(value: str) -> bool:
-    """Return whether ``value`` is a canonical 26-char Crockford ULID."""
-    ulid_alphabet = set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
-    return len(value) == 26 and all(char in ulid_alphabet for char in value)
+    if branch:
+        policy = ProtectionPolicy.resolve(repo_path)
+        if policy.is_protected(branch):
+            raise ProtectedBranchCommitError(
+                f"Refusing to {operation} on protected branch '{branch}' in {repo_path}. "
+                "Run status commit operations from the mission lane branch/worktree."
+            )
 
 
 def assert_staging_area_matches_expected(
@@ -578,6 +561,9 @@ def assert_staging_area_matches_expected(
         raise SafeCommitBackstopError(
             unexpected=(UnexpectedStagedPath(path="<probe-failed>", status_code="??"),),
             requested=tuple(expected_paths),
+            worktree_root=repo_path,
+            destination_ref=_current_branch(repo_path),
+            head_sha=_run_git_text(repo_path, ["rev-parse", "HEAD"]),
         )
 
     expected_set = {str(p).replace("\\", "/") for p in expected_paths}
@@ -600,6 +586,9 @@ def assert_staging_area_matches_expected(
         raise SafeCommitBackstopError(
             unexpected=tuple(unexpected),
             requested=tuple(expected_set),
+            worktree_root=repo_path,
+            destination_ref=_current_branch(repo_path),
+            head_sha=_run_git_text(repo_path, ["rev-parse", "HEAD"]),
         )
 
 
@@ -845,8 +834,8 @@ def _get_current_build_id(repo_root: Path) -> str:
         config_path = repo_root / ".kittify" / "config.yaml"
         identity = load_identity(config_path)
         if identity.build_id:
-            return identity.build_id
-        return generate_build_id()
+            return str(identity.build_id)
+        return str(generate_build_id())
     except Exception:  # noqa: BLE001
         return str(uuid.uuid4())
 
@@ -855,11 +844,11 @@ def safe_commit(  # noqa: C901 -- sequential validation gates; splitting harms r
     *,
     repo_root: Path,
     worktree_root: Path,
-    destination_ref: str,
+    destination_ref: str | None = None,
+    target: CommitTarget | None = None,
     message: str,
     paths: tuple[Path, ...],
-    allow_protected_branch_in_test_mode: bool = False,
-    allow_completed_op_on_protected_branch: bool = False,
+    capability: GuardCapability = GuardCapability.STANDARD,
 ) -> CommitResult:
     """Commit ``paths`` to ``destination_ref`` inside ``worktree_root``.
 
@@ -879,32 +868,45 @@ def safe_commit(  # noqa: C901 -- sequential validation gates; splitting harms r
        mismatch raises :class:`SafeCommitHeadMismatch`.
     5. ``destination_ref`` exists in the repo (``git rev-parse --verify``);
        missing raises :class:`SafeCommitDestinationNotFound`.
-    6. ``destination_ref`` is not protected (unless on the documented
-       exception list, see module docstring); protected raises
-       :class:`ProtectedBranchRefused`.
+    6. ``destination_ref`` is not protected unless ``capability`` authorizes a
+       protected-branch flow (decided by ``commit_guard.evaluate``); an
+       unauthorized protected destination raises :class:`ProtectedBranchRefused`.
     7. Stage ``paths`` via ``git -C <worktree_root> add -- <paths>``.
     8. Staging-area backstop: assert only the requested paths are staged.
     9. Commit and return the new SHA in :class:`CommitResult`.
 
-    All parameters are keyword-only. ``destination_ref`` is required;
-    ``mypy --strict`` will refuse any caller that omits it.
+    All parameters are keyword-only. Exactly one of ``target`` (preferred) or
+    ``destination_ref`` (a destination-string compat shim retained for callers
+    not yet converted to ``CommitTarget``) identifies the destination; passing
+    neither or both is a programming error.
+
+    Protection decision (ADR Step 7 / IC-02 / FR-008): step 6 below delegates
+    the "is this destination allowed?" decision SOLELY to
+    ``core.commit_guard.evaluate`` (C-GUARD-1). The legacy privilege channels
+    (the message-prefix allowlist, the two ``allow_*`` bools, the op-record
+    file-content exception, and the ``SPEC_KITTY_TEST_MODE`` env hatch) are
+    deleted. ``capability`` is now the ONLY authorization — asserted at the
+    call site and NEVER derived from message text, file content, or
+    environment (C-GUARD-2). The single retained operator escape hatch,
+    ``SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS``, is consumed by the
+    protected-branch pre-checks and by this function's ``ProtectionState``
+    input computation (step 6); ``evaluate`` itself never reads the
+    environment.
 
     Args:
         repo_root: Path to the primary git repository.
         worktree_root: Path to the worktree the commit lands in. May equal
             ``repo_root`` when the primary checkout is the worktree.
         destination_ref: Short branch name (e.g. ``"kitty/mission-foo-01ABCDEF"``).
-            Must NOT be fully-qualified.
+            Must NOT be fully-qualified. Compat shim — pass ``target`` in new code.
+        target: The single resolved :class:`CommitTarget`
+            (``mission_runtime.context``) the commit lands on. Preferred over
+            ``destination_ref``; its ``ref`` is the destination authority.
         message: The commit message.
         paths: Tuple of file paths to commit. Absolute paths are resolved
             relative to ``worktree_root`` when possible.
-        allow_protected_branch_in_test_mode: Explicit test-only escape hatch
-            for internal callers that intentionally exercise protected-branch
-            writes. Defaults to ``False`` so direct helper use fails closed.
-        allow_completed_op_on_protected_branch: Explicit internal policy path
-            for completed Op records. Only permits one
-            ``kitty-ops/<op-id>.jsonl`` path, and the commit still passes
-            through staging preservation and the backstop.
+        capability: Asserted-at-the-surface authorization passed to
+            ``commit_guard.evaluate``. Defaults to ``GuardCapability.STANDARD``.
 
     Returns:
         :class:`CommitResult` carrying the new commit SHA, the declared
@@ -916,14 +918,27 @@ def safe_commit(  # noqa: C901 -- sequential validation gates; splitting harms r
         SafeCommitNotAWorktree: ``worktree_root`` is not a git worktree of ``repo_root``.
         SafeCommitHeadMismatch: worktree HEAD does not match ``destination_ref``.
         SafeCommitDestinationNotFound: ``destination_ref`` does not exist in the repo.
-        ProtectedBranchRefused: ``destination_ref`` is protected and ``message``
-            does not match a documented exception.
+        ProtectedBranchRefused: ``destination_ref`` is protected and ``capability``
+            authorizes no protected-branch flow.
         SafeCommitBackstopError: the staging area contains paths outside
             ``paths`` at commit time (data-loss prevention).
         SafeCommitRecoveryFailed: caller staging could not be restored, or
             safe_commit could not capture recovery state before mutating.
         RuntimeError: a low-level ``git add`` or ``git commit`` failed.
     """
+    # 0. Compat shim: accept either ``target`` (preferred) or the legacy
+    #    ``destination_ref`` string. The CommitTarget's ``ref`` is the single
+    #    destination authority; ``destination_ref`` mirrors it below so callers
+    #    not yet migrated to CommitTarget keep working. (Retiring this shim
+    #    requires converting the remaining string callers — out of WP03 scope.)
+    if target is not None and destination_ref is not None and target.ref != destination_ref:
+        raise SafeCommitDestinationRefShape(destination_ref=destination_ref)
+    if target is None:
+        if destination_ref is None:
+            raise SafeCommitEmptyChangeset(destination_ref="<none>")
+        target = CommitTarget(ref=destination_ref)
+    destination_ref = target.ref
+
     # 1. Shape: short branch name only.
     if destination_ref.startswith("refs/heads/"):
         raise SafeCommitDestinationRefShape(destination_ref=destination_ref)
@@ -965,25 +980,48 @@ def safe_commit(  # noqa: C901 -- sequential validation gates; splitting harms r
                 candidate = candidate.resolve().relative_to(resolved_worktree_root)
         normalized_files.append(str(candidate))
 
-    # 6. Protected-branch check.
+    # 6a. Path policy: reject any path under .worktrees/ before staging.
+    # FR-005 / Issue #1887: .worktrees/ paths must never be staged from the
+    # primary repo root. Fires before any index mutation so the index is clean.
+    for _norm_path in normalized_files:
+        if Path(_norm_path).parts and Path(_norm_path).parts[0] == WORKTREES_DIR:
+            raise SafeCommitPathPolicyError(
+                offending_path=_norm_path,
+                worktree_root=worktree_root,
+            )
+
+    # 6. Protected-branch check. The protection DECISION is made SOLELY by the
+    #    SK policy module (``commit_guard.evaluate``) — the ONE decision
+    #    (C-GUARD-1). The legacy privilege channels (the message-prefix list,
+    #    the two ``allow_*`` bools, the op-record file-content exception, the
+    #    ``SPEC_KITTY_TEST_MODE`` env hatch) are deleted (WP03 / FR-008; the
+    #    last surviving test-mode pre-check reads went with the PR #1850
+    #    guard-bypass fix): the asserted-at-the-surface ``capability`` is now
+    #    the only authorization, never derived from message text, file
+    #    content, or environment.
+    #
+    #    The ONE retained operator escape hatch
+    #    (``SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS`` — solo-fork operators
+    #    who own ``main``) is now folded into ``ProtectionPolicy.is_protected``
+    #    (WP01 / T002): the policy is resolved at this boundary (FR-007) and the
+    #    hatch + set membership are decided together.  ``evaluate`` itself never
+    #    reads the environment — agent privilege stays capability-asserted (FR-008).
+    #
+    #    Both repo_root and worktree_root are checked (the worktree may be on a
+    #    different branch when run from inside a lane worktree).  Each resolves
+    #    its own ProtectionPolicy so the correct config is read for each root.
+    _policy_repo = ProtectionPolicy.resolve(repo_root)
+    _policy_wt = ProtectionPolicy.resolve(worktree_root)
     is_protected = (
-        destination_ref in protected_branches(repo_root)
-        or destination_ref in protected_branches(worktree_root)
+        _policy_repo.is_protected(destination_ref)
+        or _policy_wt.is_protected(destination_ref)
     )
-    completed_op_exception = (
-        allow_completed_op_on_protected_branch
-        and message.startswith("op(")
-        and _is_completed_op_record_exception(worktree_root, normalized_files)
+    guard_verdict: GuardVerdict = evaluate_commit_guard(
+        target,
+        ProtectionState(is_protected=is_protected),
+        capability,
     )
-    if (
-        is_protected
-        and not _is_protected_branch_exception(message)
-        and not (
-            allow_protected_branch_in_test_mode
-            and _test_mode_allows_protected_branch()
-        )
-        and not completed_op_exception
-    ):
+    if not guard_verdict.allowed:
         raise ProtectedBranchRefused(
             destination_ref=destination_ref,
             worktree_root=worktree_root,

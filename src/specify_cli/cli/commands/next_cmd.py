@@ -20,19 +20,24 @@ opened directly from the next command.
 
 from __future__ import annotations
 
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_mission
+from specify_cli.missions._read_path_resolver import (
+    _canonicalize_primary_read_handle,
+    candidate_feature_dir_for_mission,
+    primary_feature_dir_for_mission,
+    resolve_feature_dir_for_mission,
+)
 import contextlib
 import io
 import importlib
 import json
 import sys
+from pathlib import Path
 
 import typer
 from typing import Annotated
 
 from specify_cli.core.context_validation import require_main_repo
-from specify_cli.core.paths import locate_project_root
-from specify_cli.cli.selector_resolution import resolve_selector
+from specify_cli.core.paths import get_main_repo_root, locate_project_root
 from runtime.next._runtime_pkg_notice import maybe_emit_runtime_pkg_notice
 
 
@@ -64,10 +69,6 @@ def next_step(
         ),
     ] = None,
     mission: Annotated[str | None, typer.Option("--mission", help="Mission slug")] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
-    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON decision only")] = False,
     answer: Annotated[str | None, typer.Option("--answer", help="Answer to a pending decision")] = None,
     decision_id: Annotated[str | None, typer.Option("--decision-id", help="Decision ID (required if multiple pending)")] = None,
@@ -103,7 +104,21 @@ def next_step(
 
     _run_charter_preflight_for_next(_Path(str(repo_root)), advancing=result is not None, json_output=json_output)
 
-    mission_slug = _resolve_mission_slug(mission, feature)
+    from runtime.next.runtime_bridge import MissionNotFoundError as _MissionNotFoundError
+    from specify_cli.missions._read_path_resolver import (
+        StatusReadPathNotFound as _StatusReadPathNotFound,
+    )
+
+    try:
+        mission_slug = _resolve_mission_slug(mission, repo_root)
+    except _StatusReadPathNotFound as _exc:
+        # FR-001 / C-IC02: preserve the typed read-path error (code + checked
+        # paths + read-path remediation) instead of collapsing to MISSION_NOT_FOUND.
+        _emit_read_path_error(_exc, json_output)
+        raise typer.Exit(1) from _exc
+    except _MissionNotFoundError as _exc:
+        _emit_mission_not_found_error(_exc.handle, json_output)
+        raise typer.Exit(1) from _exc
     _validate_result_and_answer(result, answer, json_output)
     answered_id = _maybe_handle_answer(agent, mission_slug, answer, decision_id, repo_root, json_output)
 
@@ -165,8 +180,18 @@ def _pair_previous_lifecycle_record(
     from specify_cli.mission_metadata import resolve_mission_identity
 
     repo_root_path = Path(str(repo_root)) if not isinstance(repo_root, Path) else repo_root
+    # FR-004 (#2186): the lifecycle ``mission_id`` MUST be read from the PRIMARY
+    # checkout. ``resolve_feature_dir_for_mission`` is topology-aware and selects
+    # the STATUS-only ``-coord`` husk once one exists — which carries no meta.json
+    # (a wrong-leg read raises or, with a stale husk meta, returns the wrong id).
+    # Anchor identity on the topology-blind PRIMARY dir (handle folded first so a
+    # bare mid8 / human slug resolves the durable ``<slug>-<mid8>`` home; an
+    # ambiguous handle RAISES — no silent pick, C-003).
     try:
-        feature_dir = resolve_feature_dir_for_mission(repo_root_path, mission_slug)
+        feature_dir = primary_feature_dir_for_mission(
+            repo_root_path,
+            _canonicalize_primary_read_handle(repo_root_path, mission_slug),
+        )
     except Exception:
         return
 
@@ -174,7 +199,14 @@ def _pair_previous_lifecycle_record(
         identity = resolve_mission_identity(feature_dir)
     except (FileNotFoundError, ValueError, TypeError):
         return
-    mission_id = identity.mission_id or identity.mission_slug
+    # #2278: the lifecycle pairing key is a ``mission_id`` field — it MUST be a
+    # canonical ULID, never a slug (same fail-closed contract as #2138/FR-004).
+    # A legacy mission without a minted ``mission_id`` skips the observability
+    # pairing rather than persisting a slug into a ULID-typed field. The
+    # ``started`` write fails closed identically, so the two stay symmetric.
+    mission_id = identity.mission_id
+    if mission_id is None:
+        return
 
     records = read_lifecycle_records(repo_root_path)
     started = find_latest_unpaired_started(
@@ -231,8 +263,14 @@ def _write_issuance_lifecycle_record(
         return
 
     repo_root_path = Path(str(repo_root)) if not isinstance(repo_root, Path) else repo_root
+    # FR-004 (#2186): same PRIMARY anchoring as the completion pairing above — the
+    # ``started`` lifecycle record's ``mission_id`` must come from the PRIMARY
+    # meta.json, never the coord husk (which lacks it or carries a stale id).
     try:
-        feature_dir = resolve_feature_dir_for_mission(repo_root_path, mission_slug)
+        feature_dir = primary_feature_dir_for_mission(
+            repo_root_path,
+            _canonicalize_primary_read_handle(repo_root_path, mission_slug),
+        )
     except Exception:
         return
 
@@ -240,7 +278,13 @@ def _write_issuance_lifecycle_record(
         identity = resolve_mission_identity(feature_dir)
     except (FileNotFoundError, ValueError, TypeError):
         return
-    mission_id = identity.mission_id or identity.mission_slug
+    # #2278: symmetric with the completion-pairing site above — the ``started``
+    # record's ``mission_id`` field MUST be a canonical ULID, never a slug
+    # (#2138/FR-004 fail-closed contract). Skip the observability record for a
+    # legacy mission with no minted ``mission_id`` rather than persisting a slug.
+    mission_id = identity.mission_id
+    if mission_id is None:
+        return
 
     try:
         canonical_id = make_canonical_action_id(mission_state, action)
@@ -310,20 +354,42 @@ def _run_charter_preflight_for_next(repo_root, *, advancing: bool, json_output: 
         run_preflight_for_dashboard(repo_root)
 
 
-def _resolve_mission_slug(mission: str | None, feature: str | None) -> str:
+def _resolve_mission_slug(mission: str | None, repo_root: Path) -> str:
+    mission_norm = mission.strip() if isinstance(mission, str) else None
+    if not mission_norm:
+        raise typer.BadParameter("--mission <slug> is required")
+    mission_slug = mission_norm
+
+    raw_handle = mission_slug
+    # F-001: ``--mission`` accepts handles (bare mid8, full ULID, numeric
+    # prefix). Canonicalize at this boundary — the same pattern as the agent
+    # ``_find_mission_slug`` helpers — so every downstream consumer
+    # (``decide_next``, ``get_or_start_run`` keying ``.kittify/runtime/
+    # feature-runs.json``, its persisted ``mission_slug``, and the run-scoped
+    # event emitter) receives the canonical directory name. A raw mid8 here
+    # creates a split-brain duplicate run vs the full-slug invocation.
+    # Handles that resolve to no existing directory keep their raw form,
+    # preserving the historical not-found behaviour downstream; an ambiguous
+    # handle propagates MissionSelectorAmbiguous (C-CTX-4 — structured error,
+    # never a silent fallback).
+    from specify_cli.missions._read_path_resolver import StatusReadPathNotFound
+
     try:
-        resolved = resolve_selector(
-            canonical_value=mission,
-            canonical_flag="--mission",
-            alias_value=feature,
-            alias_flag="--feature",
-            suppress_env_var="SPEC_KITTY_SUPPRESS_FEATURE_DEPRECATION",
-            command_hint="--mission <slug>",
+        candidate = candidate_feature_dir_for_mission(
+            get_main_repo_root(repo_root), raw_handle
         )
-    except typer.BadParameter as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise typer.Exit(1) from exc
-    return resolved.canonical_value
+    except StatusReadPathNotFound:
+        # FR-001 / C-IC02: the read resolver produced a precise typed error
+        # (e.g. COORDINATION_BRANCH_DELETED / STATUS_READ_PATH_NOT_FOUND) with the
+        # real read-path remediation. Do NOT collapse it into a generic
+        # MISSION_NOT_FOUND ("run mission list") — that mis-routes the operator
+        # (the mission is not missing; its read path is broken). Re-raise the
+        # typed error so the command layer surfaces ``error_code`` + the checked
+        # candidate paths verbatim.
+        raise
+    if candidate.exists():
+        return candidate.name
+    return raw_handle
 
 
 def _print_error(message: str, json_output: bool) -> None:
@@ -331,6 +397,100 @@ def _print_error(message: str, json_output: bool) -> None:
         print(json.dumps({"error": message}))
     else:
         print(message, file=sys.stderr)
+
+
+def _emit_mission_not_found_error(
+    handle: str, json_output: bool, next_step: str | None = None
+) -> None:
+    """Emit a structured MISSION_NOT_FOUND error in the appropriate format.
+
+    Human mode writes to stderr; JSON mode writes a structured envelope to
+    stdout.  Both paths exit non-zero (FR-004 / WP03).
+
+    ``next_step`` carries the actionable operator remediation lifted from the
+    raised :class:`MissionNotFoundError`; it is surfaced in both the JSON
+    payload (alongside ``error_code``) and as a ``Next:`` line in human mode,
+    restoring the affordance the superseded ``QueryModeValidationError`` gave
+    (#1911). It also remains under the legacy ``remediation`` key for
+    backward compatibility.
+    """
+    remediation = next_step or "Run 'spec-kitty mission list' to see available missions."
+    if json_output:
+        from specify_cli import __version__
+
+        payload = {
+            "result": "error",
+            "error_code": "MISSION_NOT_FOUND",
+            "handle": handle,
+            "next_step": remediation,
+            "remediation": remediation,
+            "spec_kitty_version": __version__,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"Error: Mission not found: '{handle}'\n"
+            f"No mission matching '{handle}' exists in this repository.",
+            file=sys.stderr,
+        )
+        print(f"  Next: {remediation}", file=sys.stderr)
+
+
+def _read_path_signal(exc: Exception) -> tuple[str, list[str], str | None]:
+    """Extract ``(code, checked_paths, next_step)`` from a typed read-path error.
+
+    FR-001 / C-IC02: both the ``StatusReadPathNotFound`` family (raised by the
+    read resolver / ``_resolve_mission_slug``) and the ``ActionContextError``
+    boundary type (raised by ``query_current_state`` /
+    ``answer_decision_via_runtime``) carry the same underlying signal. The
+    boundary ``ActionContextError`` flattens the candidate paths into its message,
+    so its ``__cause__`` (the original ``StatusReadPathNotFound``) is the
+    structured source of ``coord_candidate`` / ``primary_candidate`` /
+    ``next_step``. This reads whichever shape is present without inventing a new
+    error type (C-001).
+    """
+    # The structured carrier is either the exception itself (StatusReadPathNotFound
+    # family) or its cause (the boundary ActionContextError wraps it).
+    carrier = exc if hasattr(exc, "coord_candidate") else exc.__cause__
+    code = getattr(exc, "code", None) or getattr(exc, "error_code", None) or "STATUS_READ_PATH_NOT_FOUND"
+    checked: list[str] = []
+    for attr in ("coord_candidate", "primary_candidate"):
+        candidate = getattr(carrier, attr, None)
+        if candidate is not None:
+            checked.append(str(candidate))
+    next_step = getattr(carrier, "next_step", None) or str(exc)
+    return code, checked, next_step
+
+
+def _emit_read_path_error(exc: Exception, json_output: bool) -> None:
+    """Surface a typed read-path error verbatim (FR-001 / FR-002 / C-IC02).
+
+    Mirrors the ``QueryModeValidationError`` branch (a typed ``error_code`` +
+    actionable ``next_step`` reach the JSON envelope) instead of collapsing the
+    error into ``MISSION_NOT_FOUND`` / "run mission list". The remediation is the
+    real read-path repair the resolver produced, never a mission-list hint.
+    """
+    code, checked_paths, next_step = _read_path_signal(exc)
+    remediation = next_step or str(exc)
+    if json_output:
+        from specify_cli import __version__
+
+        payload: dict[str, object] = {
+            "result": "error",
+            "error_code": code,
+            "error": str(exc),
+            "checked_paths": checked_paths,
+            "next_step": remediation,
+            "remediation": remediation,
+            "spec_kitty_version": __version__,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Error: {exc}", file=sys.stderr)
+        if checked_paths:
+            print(f"  Checked: {', '.join(checked_paths)}", file=sys.stderr)
+        if remediation:
+            print(f"  Next: {remediation}", file=sys.stderr)
 
 
 def _validate_result_and_answer(result: str | None, answer: str | None, json_output: bool) -> None:
@@ -357,11 +517,19 @@ def _maybe_handle_answer(
         _print_error("Error: --agent is required when --answer is provided", json_output)
         raise typer.Exit(1)
 
+    from mission_runtime import ActionContextError
+
     stderr_buffer = io.StringIO() if json_output else None
     redirect = contextlib.redirect_stderr(stderr_buffer) if stderr_buffer is not None else contextlib.nullcontext()
     try:
         with redirect:
             return _handle_answer(agent, mission_slug, answer, decision_id, repo_root)
+    except ActionContextError as exc:
+        # FR-001 / C-IC02: the decision-answer path must preserve the typed
+        # read-path code IDENTICALLY to the query path — not flatten it into a
+        # generic ``error`` string. Surface code + checked paths + remediation.
+        _emit_read_path_error(exc, json_output)
+        raise typer.Exit(1) from exc
     except typer.Exit as exc:
         if json_output:
             message = (stderr_buffer.getvalue().strip() if stderr_buffer is not None else "") or str(exc) or "Answer handling failed"
@@ -385,11 +553,41 @@ def _run_query_mode(
 ) -> None:
     runtime_bridge = _runtime_bridge_module()
     QueryModeValidationError = runtime_bridge.QueryModeValidationError
+    # Import MissionNotFoundError from the canonical module so tests that
+    # install a fake ``specify_cli.next.runtime_bridge`` shim still work.
+    from mission_runtime import ActionContextError
+    from runtime.next.runtime_bridge import MissionNotFoundError
 
     try:
         decision = runtime_bridge.query_current_state(agent, mission_slug, repo_root)
+    except ActionContextError as exc:
+        # FR-001 / C-IC02: the resolver produced a precise typed read-path error
+        # (e.g. COORDINATION_BRANCH_DELETED). Surface its code + checked paths +
+        # read-path remediation verbatim — never collapse to MISSION_NOT_FOUND.
+        _emit_read_path_error(exc, json_output)
+        raise typer.Exit(1) from exc
+    except MissionNotFoundError as exc:
+        _emit_mission_not_found_error(
+            exc.handle, json_output, next_step=getattr(exc, "next_step", None)
+        )
+        raise typer.Exit(1) from exc
     except QueryModeValidationError as exc:
-        _print_error(f"Error: {exc}" if not json_output else str(exc), json_output)
+        # C-ERR-1 / FR-003: emit a structured payload (error_code + next_step)
+        # rather than a silent unknown stub when a handle is unresolvable.
+        if json_output:
+            payload = {
+                "error": str(exc),
+                "error_code": getattr(exc, "error_code", "QUERY_MODE_VALIDATION_FAILED"),
+            }
+            next_step = getattr(exc, "next_step", None)
+            if next_step is not None:
+                payload["next_step"] = next_step
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+            next_step = getattr(exc, "next_step", None)
+            if next_step:
+                print(f"  Next: {next_step}", file=sys.stderr)
         raise typer.Exit(1) from exc
     _print_decision(decision, json_output, answered_id, answer)
 
@@ -448,7 +646,15 @@ def _handle_answer(
         runtime_bridge = _runtime_bridge_module()
         from specify_cli.mission import get_mission_type
 
-        feature_dir = resolve_feature_dir_for_mission(repo_root_path, mission_slug)
+        # FR-004 (#2186): the mission TYPE drives ``get_or_start_run``. Reading it
+        # off the topology-aware resolver lands on the STATUS-only coord husk (no
+        # meta.json) → ``get_mission_type`` returns the default ``software-dev``,
+        # starting the run with the WRONG type for a non-default mission. Anchor on
+        # the PRIMARY dir so the type is read from the real meta.json.
+        feature_dir = primary_feature_dir_for_mission(
+            repo_root_path,
+            _canonicalize_primary_read_handle(repo_root_path, mission_slug),
+        )
         mission_type = get_mission_type(feature_dir)
         run_ref = runtime_bridge.get_or_start_run(mission_slug, repo_root_path, mission_type)
 

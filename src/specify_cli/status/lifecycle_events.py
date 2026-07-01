@@ -35,7 +35,6 @@ with the typed contracts.
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
 import contextlib
 import json
 import logging
@@ -45,7 +44,29 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Iterable, Mapping
 
+from specify_cli.workspace.root_resolver import WorkspaceRootNotFound, resolve_canonical_root
+
+from .models import Lane as _Lane
+
 logger = logging.getLogger(__name__)
+
+
+class MissionNotCompletedError(RuntimeError):
+    """Raised when a post-mission lifecycle event is emitted before completion.
+
+    Post-mission facts (``MissionReopened`` / ``FollowUpRecorded``) are only
+    valid once a mission has reached completion (#1926). This is the producer
+    side of the invariant the sibling events-package reducer enforces on the
+    consumer side. The emit helpers raise this fail-closed *before* writing any
+    event, so a rejected emit leaves the log untouched.
+    """
+
+    def __init__(self, action: str, mission_slug: str) -> None:
+        self.action = action
+        self.mission_slug = mission_slug
+        super().__init__(
+            f"cannot {action}: mission {mission_slug!r} has not completed/merged"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +84,17 @@ TASKS_COMPLETED = "TasksCompleted"
 WP_CREATED = "WPCreated"
 REVIEWER_SELF_APPROVAL = "ReviewerSelfApproval"
 
+# Post-mission lifecycle events (WP01 / FR-001). These record facts about a
+# mission *after* it has merged/closed: a re-open returning it to an actionable
+# state, and a follow-up commit/PR attributed to it. They are LOCAL-ONLY this
+# mission — intentionally kept off the SaaS strict-validation path
+# (``_validate_lifecycle_payload(strict=True)``): the external ``spec_kitty_events``
+# package does not yet know these types, and propagating them to SaaS requires an
+# external contract bump (follow-up, out of scope). The local event log remains
+# authoritative. See research.md C-SAAS.
+MISSION_REOPENED = "MissionReopened"
+FOLLOW_UP_RECORDED = "FollowUpRecorded"
+
 LIFECYCLE_EVENT_TYPES = frozenset({
     PROJECT_INITIALIZED,
     MISSION_CREATED,
@@ -74,6 +106,8 @@ LIFECYCLE_EVENT_TYPES = frozenset({
     TASKS_COMPLETED,
     WP_CREATED,
     REVIEWER_SELF_APPROVAL,
+    MISSION_REOPENED,
+    FOLLOW_UP_RECORDED,
 })
 
 PROJECT_EVENTS_FILENAME = "canonical-events.jsonl"
@@ -104,9 +138,22 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _iso_str_to_datetime(iso: str | None) -> datetime | None:
+    """Parse an ISO-8601 string to a timezone-aware datetime, or return None.
+
+    Used at payload-construction boundaries where callers pass ``str | None``
+    but the ``spec_kitty_events`` 6.0.0 Pydantic models expect ``datetime | None``.
+    ``datetime.fromisoformat`` handles the full RFC 3339 / ISO 8601 subset that
+    Python's own ``datetime.isoformat()`` produces, so round-trips are lossless.
+    """
+    if iso is None:
+        return None
+    return datetime.fromisoformat(iso)
+
+
 def _generate_event_id() -> str:
     try:
-        from ulid import ULID  # type: ignore[import-not-found]
+        from ulid import ULID
 
         return str(ULID())
     except Exception:  # pragma: no cover — fallback for stripped envs
@@ -181,17 +228,18 @@ def _build_envelope(
 
 
 def _repo_root_for_lifecycle_log(log_path: Path | None) -> Path | None:
+    """Resolve the canonical repo root for *log_path* via ``resolve_canonical_root``.
+
+    Routes to the existing public pure resolver (D-12 / FR-001) — CWD-invariant
+    across primary checkout, coord worktree, and submodule topologies.  Returns
+    ``None`` when the log path is absent or not inside any git repo.
+    """
     if log_path is None:
         return None
-    resolved = log_path.resolve()
-    if resolved.name == PROJECT_EVENTS_FILENAME and resolved.parent.name == ".kittify":
-        return resolved.parent.parent
-    if (
-        resolved.name == MISSION_EVENTS_FILENAME
-        and resolved.parent.parent.name == KITTY_SPECS_DIR
-    ):
-        return resolved.parent.parent.parent
-    return None
+    try:
+        return resolve_canonical_root(log_path.parent)
+    except WorkspaceRootNotFound:
+        return None
 
 
 def _validate_lifecycle_payload(event_type: str, payload: Mapping[str, Any]) -> None:
@@ -468,7 +516,7 @@ def emit_project_initialized(
         project_slug=project_slug,
         actor=actor,
         runtime_version=runtime_version,
-        initialized_at=initialized_at or _now_iso(),
+        initialized_at=_iso_str_to_datetime(initialized_at) or datetime.now(UTC),
     ).model_dump(mode="json", exclude_none=False)
     return append_lifecycle_event(
         log_path,
@@ -681,7 +729,7 @@ def emit_wp_created_local(
         wp_path=wp_path,
         depends_on=list(depends_on or []),
         actor=actor,
-        created_at=created_at or _now_iso(),
+        created_at=_iso_str_to_datetime(created_at) or datetime.now(UTC),
     )
     payload: dict[str, Any] = payload_model.model_dump(
         mode="json", exclude_none=False
@@ -742,6 +790,146 @@ def emit_reviewer_self_approval(
     )
 
 
+def _require_mission_completed(
+    feature_dir: Path, *, action: str, mission_slug: str
+) -> None:
+    """Fail-closed guard: raise unless the mission has reached completion (#1926).
+
+    Lazy-imports :func:`is_mission_completed` to avoid a circular import
+    (``lifecycle`` imports event-type constants from this module).
+    """
+    from specify_cli.status.lifecycle import is_mission_completed  # noqa: PLC0415
+
+    if not is_mission_completed(feature_dir):
+        raise MissionNotCompletedError(action, mission_slug)
+
+
+def emit_mission_reopened(
+    feature_dir: Path,
+    *,
+    mission_id: str,
+    mission_slug: str,
+    reason: str,
+    reopened_by: str,
+    cleared_merge: Mapping[str, Any] | None = None,
+    reopened_at: str | None = None,
+    project_uuid: str | None = None,
+    project_slug: str | None = None,
+) -> dict[str, Any] | None:
+    """Record that a merged/closed mission was returned to an actionable state.
+
+    Appended *each* time (every re-open is a distinct fact — NOT deduped, per
+    research.md R-A2). ``derive_mission_lifecycle`` treats a ``MissionReopened``
+    that postdates the last merge/completion marker as the authority that makes
+    the mission actionable again (FR-002). Attribution is via ``mission_id``
+    (ULID, NFR-004) — never a slug-derived guess.
+
+    ``cleared_merge`` is an optional snapshot of the ``merged_*`` fields removed
+    from ``meta.json`` by the IC-02 re-open command, retained for audit /
+    reversibility.
+
+    This is a LOCAL-ONLY event (see ``MISSION_REOPENED`` registration note): it
+    is intentionally kept off the SaaS strict-validation model map.
+
+    Fail-closed (#1926): a mission can only be re-opened once it has *reached
+    completion* (merged, or all WPs terminal). Re-opening a mission that never
+    completed is rejected with :class:`MissionNotCompletedError` before any
+    metadata or event is written. The completion check happens here — the
+    canonical producer — so no emit path can bypass it.
+    """
+    _require_mission_completed(feature_dir, action="re-open", mission_slug=mission_slug)
+    payload: dict[str, Any] = {
+        "mission_id": mission_id,
+        "mission_slug": mission_slug,
+        "reason": reason,
+        "reopened_by": reopened_by,
+        "reopened_at": reopened_at or _now_iso(),
+        "cleared_merge": dict(cleared_merge) if cleared_merge is not None else None,
+    }
+    log_path = mission_event_log_path(feature_dir)
+    return append_lifecycle_event(
+        log_path,
+        MISSION_REOPENED,
+        payload,
+        aggregate_id=mission_id,
+        aggregate_type="Mission",
+        project_uuid=project_uuid,
+        project_slug=project_slug,
+        # No dedup_keys: append-each.
+    )
+
+
+def emit_follow_up_recorded(
+    feature_dir: Path,
+    *,
+    mission_id: str,
+    mission_slug: str,
+    follow_up_type: str,
+    commit_sha: str | None = None,
+    pr_number: int | None = None,
+    recorded_by: str,
+    recorded_at: str | None = None,
+    project_uuid: str | None = None,
+    project_slug: str | None = None,
+) -> dict[str, Any] | None:
+    """Record a follow-up commit or PR against an already-completed mission.
+
+    Fail-closed (#1926): a follow-up is a *post-mission* fact and is only valid
+    once the mission has reached completion (merged, or all WPs terminal).
+    Recording a follow-up against a mission that never completed is rejected with
+    :class:`MissionNotCompletedError` before any event is written. The check
+    lives here — the canonical producer — so no emit path can bypass it.
+
+    **Idempotent** on its dedup key ``(mission_id, commit_sha | pr_number)`` —
+    re-recording the identical ``--commit``/``--pr`` reference is a no-op,
+    consistent with the existing ``has_lifecycle_event()`` dedup pattern. A
+    commit and the PR that contains it are recorded as distinct facts (no
+    resolved-commit-of-PR lookup — research.md / data-model.md).
+
+    ``follow_up_type`` is ``"commit"`` (requires ``commit_sha``) or ``"pr"``
+    (requires ``pr_number``). Attribution is via ``mission_id`` (NFR-004).
+
+    This is a LOCAL-ONLY event (see ``FOLLOW_UP_RECORDED`` registration note).
+    """
+    if follow_up_type == "commit":
+        if not commit_sha:
+            raise ValueError("commit_sha is required when follow_up_type == 'commit'")
+        dedup_keys: dict[str, Any] = {"mission_id": mission_id, "commit_sha": commit_sha}
+    elif follow_up_type == "pr":
+        if pr_number is None:
+            raise ValueError("pr_number is required when follow_up_type == 'pr'")
+        dedup_keys = {"mission_id": mission_id, "pr_number": pr_number}
+    else:
+        raise ValueError(
+            f"follow_up_type must be 'commit' or 'pr', got {follow_up_type!r}"
+        )
+
+    _require_mission_completed(
+        feature_dir, action="record follow-up", mission_slug=mission_slug
+    )
+
+    payload: dict[str, Any] = {
+        "mission_id": mission_id,
+        "mission_slug": mission_slug,
+        "follow_up_type": follow_up_type,
+        "commit_sha": commit_sha,
+        "pr_number": pr_number,
+        "recorded_by": recorded_by,
+        "recorded_at": recorded_at or _now_iso(),
+    }
+    log_path = mission_event_log_path(feature_dir)
+    return append_lifecycle_event(
+        log_path,
+        FOLLOW_UP_RECORDED,
+        payload,
+        aggregate_id=mission_id,
+        aggregate_type="Mission",
+        project_uuid=project_uuid,
+        project_slug=project_slug,
+        dedup_keys=dedup_keys,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics / merge guard helpers
 # ---------------------------------------------------------------------------
@@ -778,7 +966,7 @@ def _is_bootstrap_status_event(obj: Mapping[str, Any]) -> bool:
     if to_lane != "planned":
         return False
     from_lane = obj.get("from_lane")
-    if from_lane == "genesis":
+    if from_lane == _Lane.GENESIS:
         return True
     # Legacy forced bootstrap seed (pre-FSM): planned -> planned with force=True.
     return bool(obj.get("force")) and from_lane in (None, "planned")
@@ -827,6 +1015,8 @@ __all__ = [
     "TASKS_COMPLETED",
     "WP_CREATED",
     "REVIEWER_SELF_APPROVAL",
+    "MISSION_REOPENED",
+    "FOLLOW_UP_RECORDED",
     "LIFECYCLE_EVENT_TYPES",
     "PROJECT_EVENTS_FILENAME",
     "MISSION_EVENTS_FILENAME",
@@ -839,6 +1029,8 @@ __all__ = [
     "emit_artifact_phase",
     "emit_wp_created_local",
     "emit_reviewer_self_approval",
+    "emit_mission_reopened",
+    "emit_follow_up_recorded",
     "read_lifecycle_events",
     "has_non_bootstrap_status_history",
     "repo_root_for_lifecycle_log",

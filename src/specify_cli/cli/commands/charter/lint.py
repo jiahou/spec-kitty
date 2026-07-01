@@ -1,7 +1,7 @@
 """``spec-kitty charter lint`` command (WP06 per-subcommand split)."""
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import typer
 
@@ -12,6 +12,9 @@ from specify_cli.cli.commands.charter._common import _emit_error
 
 # Test-patch shim — see ``synthesize.py``.
 import specify_cli.cli.commands.charter as _charter_pkg
+
+if TYPE_CHECKING:
+    from charter.drg import OrgDRGFragment
 
 __all__ = ["charter_lint"]
 
@@ -78,12 +81,6 @@ def _print_charter_lint_banner(
 @charter_app.command("lint")
 def charter_lint(
     mission: str | None = typer.Option(None, "--mission", help="Scope lint to a specific mission slug"),
-    feature: str | None = typer.Option(
-        None,
-        "--feature",
-        hidden=True,
-        help="(deprecated) Use --mission",
-    ),
     orphans: bool = typer.Option(False, "--orphans", help="Run only orphan checks"),
     contradictions: bool = typer.Option(False, "--contradictions", help="Run only contradiction checks"),
     stale: bool = typer.Option(False, "--stale", help="Run only staleness checks"),
@@ -101,8 +98,7 @@ def charter_lint(
         _emit_error(console, json_output=output_json, message=str(e))
         raise typer.Exit(code=1) from e
 
-    # Resolve canonical --mission, accepting hidden --feature as a deprecated alias.
-    scope = mission if mission is not None else feature
+    scope = mission
 
     # Resolve which checks to run
     explicit = {k for k, v in [("orphans", orphans), ("contradictions", contradictions), ("staleness", stale)] if v}
@@ -121,7 +117,7 @@ def charter_lint(
     # — programmatic consumers read provenance from the merged DRG via
     # ``charter.drg.merge_three_layers`` directly.
     org_layer_summary: list[str] = []
-    org_fragments: list = []
+    org_fragments: list[OrgDRGFragment] = []
     try:
         from charter.drg import OrgDRGFragment, load_org_drg
 

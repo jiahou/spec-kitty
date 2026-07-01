@@ -10,14 +10,17 @@ import typer
 from rich.panel import Panel
 
 from specify_cli.cli import StepTracker
-from specify_cli.cli.selector_resolution import resolve_selector
 from specify_cli.cli.helpers import console, get_project_root_or_exit, show_banner
 from specify_cli.core import MISSION_CHOICES
 from specify_cli.core.project_resolver import resolve_template_path
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_slug
+from specify_cli.missions._read_path_resolver import (
+    resolve_feature_dir_for_slug,
+    resolve_planning_read_dir,
+)
 from specify_cli.mission import get_mission_type
 from specify_cli.plan_validation import PlanValidationError, validate_plan_filled
 from specify_cli.task_utils import TaskCliError, find_repo_root
+from mission_runtime import MissionArtifactKind
 
 
 def research(
@@ -25,12 +28,6 @@ def research(
         None,
         "--mission",
         help="Mission slug to target",
-    ),
-    feature: str | None = typer.Option(
-        None,
-        "--feature",
-        hidden=True,
-        help="(deprecated) Use --mission",
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite existing research artifacts"),
 ) -> None:
@@ -59,31 +56,55 @@ def research(
     tracker.complete("project", str(project_root))
 
     tracker.start("feature")
-    try:
-        mission_slug = resolve_selector(
-            canonical_value=mission,
-            canonical_flag="--mission",
-            alias_value=feature,
-            alias_flag="--feature",
-            suppress_env_var="SPEC_KITTY_SUPPRESS_FEATURE_DEPRECATION",
-            command_hint="--mission <slug>",
-        ).canonical_value
-    except typer.BadParameter as exc:
-        tracker.error("feature", str(exc))
-        console.print(tracker.render())
-        console.print(f"[red]Error:[/red] {exc}")
-        raise typer.Exit(1)
+    mission_norm = mission.strip() if isinstance(mission, str) else None
+    if not mission_norm:
+        raise typer.BadParameter("--mission <slug> is required")
+    mission_slug = mission_norm
 
     feature_dir = resolve_feature_dir_for_slug(repo_root, mission_slug)
-    feature_dir.mkdir(parents=True, exist_ok=True)
+    # F-001: re-key to the canonical directory name. `--mission` accepts
+    # handles (bare mid8, numeric prefix); the resolver canonicalizes the
+    # DIRECTORY only, while `trigger_feature_dossier_sync_if_enabled` keys the
+    # SaaS namespace (NamespaceRef.from_context + OfflineBodyUploadQueue) by
+    # this slug — a raw handle splits the namespace vs the full-slug
+    # invocation. Unresolvable slugs compose `kitty-specs/<raw>` so the
+    # re-key is an identity re-read for the scaffold-new-mission path.
+    mission_slug = feature_dir.name
 
-    # Get mission from feature's meta.json (not project-level default)
-    mission_type = get_mission_type(feature_dir)
+    # gate-read-surface-completion closeout (#2107 residual / FR-004 / FR-009):
+    # `resolve_feature_dir_for_slug` is the COORD-aware resolver — under
+    # coordination topology it returns the materialized `-coord` husk. The
+    # planning artifacts this command READS (plan.md) and WRITES (research.md,
+    # data-model.md, the research CSV stubs) are all PRIMARY-partition kinds
+    # (`MissionArtifactKind.{FINALIZED_EXECUTION_PLAN,RESEARCH,DATA_MODEL}`) that
+    # live with their mission on the primary `target_branch` for EVERY topology
+    # since #2106. Resolving them off the coord husk made `research` validate the
+    # ABSENT `coord/plan.md` and block (the #2107 driver shape), and scaffold the
+    # research artifacts onto coord (re-introducing the split #2106 eliminated).
+    # Route both the read and the scaffold WRITE through the kind-aware seam so
+    # they converge on the primary surface. For a flattened/single-branch mission
+    # the seam returns the same `target_branch` dir (NFR-001 — behavior-neutral).
+    # The dossier sync below keeps `feature_dir` (its current STATUS-namespace
+    # surface) untouched.
+    planning_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.RESEARCH
+    )
+    planning_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get mission from feature's meta.json (not project-level default).
+    # meta.json is a PRIMARY-partition kind, so it co-locates on `planning_dir`.
+    mission_type = get_mission_type(planning_dir)
     mission_display = MISSION_CHOICES.get(mission_type, mission_type)
-    tracker.complete("feature", f"{feature_dir} ({mission_display})")
+    tracker.complete("feature", f"{planning_dir} ({mission_display})")
 
-    # Validate that plan.md has been filled out before proceeding
-    plan_path = feature_dir / "plan.md"
+    # Validate that plan.md has been filled out before proceeding. plan.md is a
+    # PRIMARY-partition kind (FINALIZED_EXECUTION_PLAN) — read it via the seam so
+    # a coord-topology mission validates the authored primary plan, not an absent
+    # `coord/plan.md`.
+    plan_read_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.FINALIZED_EXECUTION_PLAN
+    )
+    plan_path = plan_read_dir / "plan.md"
     try:
         validate_plan_filled(plan_path, mission_slug=mission_slug, strict=True)
     except PlanValidationError as exc:
@@ -102,7 +123,7 @@ def research(
 
     def _copy_asset(step_key: str, label: str, relative_path: Path, template_name: Path) -> None:
         tracker.start(step_key)
-        dest_path = feature_dir / relative_path
+        dest_path = planning_dir / relative_path
         template_path = resolve_template_path(project_root, mission_type, template_name)
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,7 +154,7 @@ def research(
     ]
     csv_errors: list[str] = []
     for dest_rel, template_rel in csv_targets:
-        dest_path = feature_dir / dest_rel
+        dest_path = planning_dir / dest_rel
         template_path = resolve_template_path(project_root, mission_type, template_rel)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -175,7 +196,7 @@ def research(
         pass
 
     relative_paths = [
-        str(path.relative_to(feature_dir)) if path.is_relative_to(feature_dir) else str(path)
+        str(path.relative_to(planning_dir)) if path.is_relative_to(planning_dir) else str(path)
         for path in created_paths
     ]
     summary_lines = "\n".join(f"- [cyan]{rel}[/cyan]" for rel in sorted(set(relative_paths)))

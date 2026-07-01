@@ -17,7 +17,6 @@ Back-compat reader (T024, FR-023):
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
 import json
 import logging
 import os
@@ -25,6 +24,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+from specify_cli.core.constants import KITTY_SPECS_DIR
+from specify_cli.core.paths import assert_safe_path_segment
+from specify_cli.core.utils import ensure_within_any
 from specify_cli.events import sanitize_event_for_log
 
 from .models import StatusEvent
@@ -117,17 +119,86 @@ class _SlugResolver:
         self._cache: dict[str, str | None] = {}
 
     def _find_mission_specs_root(self) -> Path | None:
-        """Walk up from feature_dir to find the kitty-specs root."""
+        """Resolve the kitty-specs root that owns this feature dir's siblings.
+
+        This is a **feature-dir-relative** lookup, NOT a canonical-repo-root
+        resolution: ``_SlugResolver`` reads *sibling* missions' ``meta.json`` from
+        the same ``kitty-specs/`` directory that contains ``self._feature_dir``.
+        Anchoring on ``feature_dir`` (rather than ``resolve_canonical_root``) is
+        both correct for that purpose and CWD-invariant (pure path arithmetic on
+        the given feature dir). It also stays robust when the feature dir is not
+        inside a git repo (offline repair, orphaned events, bare-dir fixtures) —
+        where the canonical-root resolver would jump to an unrelated repo root and
+        miss the co-located ``meta.json`` (post-merge regression fix; the genuine
+        lock-anchor sites — emit/wpl/lifecycle — remain on ``resolve_canonical_root``).
+        """
         candidate = self._feature_dir.parent
-        # feature_dir is typically kitty-specs/<slug>/ — so parent is kitty-specs/
         if candidate.name == KITTY_SPECS_DIR:
             return candidate
-        # In case we're already inside a deeper structure, try two levels up
         two_up = candidate.parent
         if two_up.name == KITTY_SPECS_DIR:
             return two_up
-        # Otherwise, fall back to the parent (best effort)
         return candidate
+
+    @staticmethod
+    def _is_safe_slug(mission_slug: str) -> bool:
+        """Return True when *mission_slug* is a safe single path segment.
+
+        The slug is UNTRUSTED — it flows straight out of a ``status.events.jsonl``
+        event record (``mission_slug`` / ``feature_slug``). Delegates to the
+        canonical ``assert_safe_path_segment`` guard (the same one the sibling
+        ``aggregate._validate_mission_slug`` uses) so a traversal slug such as
+        ``"../../../../tmp/evil"`` can never build a ``meta_path`` outside the
+        specs root. On rejection this logs a warning and returns False so the
+        caller can fail closed (return None) rather than raise.
+        """
+        try:
+            assert_safe_path_segment(mission_slug)
+        except ValueError as exc:
+            logger.warning(
+                "Refusing to resolve unsafe mission_slug %r (traversal guard); mission_id will be None: %s",
+                mission_slug,
+                exc,
+            )
+            return False
+        return True
+
+    def _is_contained(self, mission_slug: str, meta_path: Path) -> bool:
+        """Return True when *meta_path* resolves inside the specs root.
+
+        The segment grammar (``_is_safe_slug``) rejects ``..`` and separators, but
+        a grammar-valid slug can still name a **symlink directory** under the specs
+        root whose target lives elsewhere — the composed ``meta_path`` would then
+        ``resolve()`` outside the root and read an attacker-controlled file. The
+        canonical ``ensure_within_any`` seam (C-002) catches this by validating the
+        *resolved* path against the trusted root.
+
+        ``roots`` is **keyword-only**: the positional form would raise ``TypeError``
+        and the containment would silently never run. The logical (un-resolved)
+        ``_mission_specs_root`` is passed deliberately — ``ensure_within_any``
+        resolves both sides with ``resolve(strict=False)``, so a legitimate slug
+        under a *symlinked* specs root still validates (NFR-003, no macOS false
+        reject) while a symlink escaping the root is rejected.
+
+        Fail-closed (C-004): on ``ValueError`` return False (the caller returns
+        ``None``), logging at most one WARNING per distinct slug — the caller caches
+        the result so a repeated bad slug is neither re-checked nor re-warned
+        (NFR-004).
+        """
+        root = self._mission_specs_root
+        if root is None:  # pragma: no cover - guarded by caller
+            return False
+        try:
+            ensure_within_any(meta_path, roots=[root])
+        except ValueError as exc:
+            logger.warning(
+                "Refusing to resolve mission_slug %r: composed meta path escapes the "
+                "specs root (symlink/containment guard); mission_id will be None: %s",
+                mission_slug,
+                exc,
+            )
+            return False
+        return True
 
     def resolve(self, mission_slug: str) -> str | None:
         """Return the mission_id for *mission_slug*, or None if unresolvable.
@@ -139,19 +210,44 @@ class _SlugResolver:
         if mission_slug in self._cache:
             return self._cache[mission_slug]
 
+        if not self._is_safe_slug(mission_slug):
+            # Fail-closed: a hostile/corrupt slug (e.g. "../../etc") must never
+            # build a path that escapes the specs root. Cache the None result so
+            # the same bad slug is not re-validated on subsequent events.
+            self._cache[mission_slug] = None
+            return None
+
         mission_id: str | None = None
         if self._mission_specs_root is not None:
             meta_path = self._mission_specs_root / mission_slug / "meta.json"
+            if not self._is_contained(mission_slug, meta_path):
+                # Fail-closed: the slug passed the segment grammar but the composed
+                # path still escapes the specs root — e.g. ``mission_slug`` names a
+                # *symlink directory* under the root whose target lives elsewhere
+                # (FR-002, IC-01). The grammar gate cannot see this; resolved-path
+                # containment can. Cache None so the same bad slug is not re-checked
+                # nor re-warned (NFR-004).
+                self._cache[mission_slug] = None
+                return None
             if meta_path.exists():
                 try:
                     data = json.loads(meta_path.read_text(encoding="utf-8"))
-                    mission_id = data.get("mission_id") or None
                 except (json.JSONDecodeError, OSError) as exc:
                     logger.warning(
                         "Could not read meta.json for slug %r: %s",
                         mission_slug,
                         exc,
                     )
+                else:
+                    if isinstance(data, dict):
+                        mission_id = data.get("mission_id") or None
+                    else:
+                        logger.warning(
+                            "meta.json for slug %r is not an object (got %s); "
+                            "mission_id will be None",
+                            mission_slug,
+                            type(data).__name__,
+                        )
             else:
                 logger.warning(
                     "No meta.json found for mission_slug %r (orphaned event); mission_id will be None for these events",
@@ -338,6 +434,10 @@ def read_events_raw(feature_dir: Path) -> list[dict[str, Any]]:
     return results
 
 
+# Registration point: any new non-lane lifecycle event that uses the "type"
+# envelope shape MUST be added here, or both read_events and
+# `doctor mission-state --fix` will fail loudly on that mission with
+# "missing required to_lane" (the SNAPSHOT_DRIFT symptom from issue #1782).
 _RETROSPECTIVE_LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset({
     "RetrospectiveCaptured",
     "RetrospectiveCaptureFailed",
@@ -345,7 +445,19 @@ _RETROSPECTIVE_LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset({
 })
 
 
-def _should_skip_status_event(obj: dict[str, Any]) -> bool:
+def is_retrospective_lifecycle_event(obj: dict[str, Any]) -> bool:
+    """Return True for retrospective lifecycle rows using the ``type`` envelope.
+
+    These rows are written to status.events.jsonl by design (see
+    contracts/retrospective-events.contract.md) and read back by
+    retrospective consumers; they are descriptive lifecycle events, not
+    lane transitions, and must be skipped in place — never removed.
+    """
+    event_type = obj.get("type")
+    return isinstance(event_type, str) and event_type in _RETROSPECTIVE_LIFECYCLE_EVENT_TYPES
+
+
+def is_non_lane_event(obj: dict[str, Any]) -> bool:
     """Return True for non-lane events that intentionally share the JSONL file."""
     event_name = obj.get("event_name")
     if isinstance(event_name, str) and event_name.startswith("retrospective."):
@@ -354,8 +466,7 @@ def _should_skip_status_event(obj: dict[str, Any]) -> bool:
     # WP03: Skip the three new canonical retrospective lifecycle events which use
     # a "type" field (not "event_name") per contracts/retrospective-events.contract.md.
     # These are descriptive lifecycle events, not lane transitions.
-    event_type = obj.get("type")
-    if isinstance(event_type, str) and event_type in _RETROSPECTIVE_LIFECYCLE_EVENT_TYPES:
+    if is_retrospective_lifecycle_event(obj):
         return True
 
     # Why: Skip mission-level events (DecisionPointOpened,
@@ -402,7 +513,7 @@ def read_events_from_text(feature_dir: Path, content: str) -> list[StatusEvent]:
             raise StoreError(
                 f"Invalid event structure on line {line_number}: expected JSON object"
             )
-        if _should_skip_status_event(obj):
+        if is_non_lane_event(obj):
             continue
 
         try:

@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -147,25 +148,49 @@ class TestLoadLegacyMission:
 
 class TestLoadCoordMission:
     def test_topology_is_coordination_when_coord_worktree_exists(self, tmp_path: Path) -> None:
-        """When the coord worktree exists on disk, topology should be 'coordination'."""
+        """When the coord worktree exists on disk, topology should be 'coordination'.
+
+        WP03 R3 authority ("name proposes, authority disposes"): topology is
+        disposed by the git worktree REGISTRY, not by path shape. A coord
+        feature dir created with a bare ``mkdir`` is an unregistered husk that
+        now classifies as ``legacy`` (and a declared-but-absent coord branch
+        raises ``CoordinationBranchDeleted``). To exercise the genuine
+        COORDINATION (R1) path the fixture must materialize a REAL registered
+        coord worktree on a REAL coordination branch — mirroring the canonical
+        R1 fixture in ``tests/specify_cli/coordination/
+        test_worktree_topology_decision_table.py::test_r1_*``.
+        """
+        repo = _make_git_repo(tmp_path)
         slug = "test-feature"
         mission_id = "01TESTKITTY12345678901234"
         mid8 = mission_id[:8]
+        coord_branch = f"kitty/mission-{slug}-{mid8}"
 
         # Create primary mission dir with coord-branch declaration
-        primary_mission_dir = _make_mission_dir(tmp_path, slug)
-        _write_meta(primary_mission_dir, mission_id=mission_id, coordination_branch=f"kitty/mission-{slug}-{mid8}")
+        primary_mission_dir = _make_mission_dir(repo, slug)
+        _write_meta(primary_mission_dir, mission_id=mission_id, coordination_branch=coord_branch)
 
-        # Create the coord worktree directory (simulates worktree materialisation)
-        # The coord worktree path is: .worktrees/<slug>-<mid8>-coord/kitty-specs/<slug>-<mid8>/
+        # Materialize a REAL, registered coord worktree on the coord branch so
+        # the registry-based topology authority disposes COORDINATION.
+        # Path: .worktrees/<slug>-<mid8>-coord/kitty-specs/<slug>-<mid8>/
         coord_dir_name = f"{slug}-{mid8}"
-        coord_worktree_root = tmp_path / ".worktrees" / f"{coord_dir_name}-coord"
+        coord_worktree_root = repo / ".worktrees" / f"{coord_dir_name}-coord"
+        subprocess.run(
+            [
+                "git", "-C", str(repo), "worktree", "add", "-q",
+                "-b", coord_branch, str(coord_worktree_root),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         coord_mission_dir = coord_worktree_root / "kitty-specs" / coord_dir_name
         coord_mission_dir.mkdir(parents=True)
+        _write_meta(coord_mission_dir, mission_id=mission_id, coordination_branch=coord_branch)
 
         from specify_cli.status.aggregate import MissionStatus
 
-        ms = MissionStatus.load(repo_root=tmp_path, mission_slug=slug)
+        ms = MissionStatus.load(repo_root=repo, mission_slug=slug)
 
         assert ms.topology == "coordination"
         assert ms.read_dir == coord_mission_dir
@@ -221,32 +246,52 @@ class TestLoadCoordUnavailableFailsClosed:
         assert ms.read_dir == primary_mission_dir
         assert ms.mid8 == mid8
 
-    def test_fails_closed_when_coord_worktree_materialized_but_missing_mission_dir(self, tmp_path: Path) -> None:
-        """Materialized coord worktree without mission dir is stale/empty hazard."""
-        slug = "stale-feature"
+    def test_coord_worktree_materialized_but_missing_mission_dir_resolves_primary(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """WP04 Option B (#1716 / FR-003): coord-empty → aggregate inherits PRIMARY.
+
+        Previously this hard-failed with ``CoordAuthorityUnavailable``. Under the
+        operator-decided Option B the canonical surface returns the primary
+        checkout + emits a loud warning, and the aggregate inherits that PRIMARY
+        with NO aggregate code change (``_resolve_read_dir`` delegates to the
+        surface). The fallback is observable (the surface logs at
+        ``logging.WARNING``); the inverted assertion proves coord-empty no longer
+        reaches the aggregate's ``CoordAuthorityUnavailable`` seam.
+        """
         mission_id = "01STALEKITTY1234567890AB"
         mid8 = mission_id[:8]
+        # Canonical post-WP03 dir name carries the mid8 suffix; load by the same
+        # handle so the aggregate resolves the coord-empty topology (not legacy).
+        full_slug = f"stale-feature-{mid8}"
 
-        primary_dir = _make_mission_dir(tmp_path, slug)
+        primary_dir = _make_mission_dir(tmp_path, full_slug)
         _write_meta(
             primary_dir,
             mission_id=mission_id,
-            coordination_branch=f"kitty/mission-{slug}-{mid8}",
+            coordination_branch=f"kitty/mission-{full_slug}",
         )
         _write_events_file(primary_dir, [
-            _make_event(slug, "WP01", "planned", "claimed"),
+            _make_event(full_slug, "WP01", "planned", "claimed"),
         ])
-        # Root exists, but kitty-specs/<slug>-<mid8>/ is absent.
-        (tmp_path / ".worktrees" / f"{slug}-{mid8}-coord").mkdir(parents=True)
+        # Root exists, but kitty-specs/<slug>-<mid8>/ is absent (coord-empty).
+        (tmp_path / ".worktrees" / f"{full_slug}-coord").mkdir(parents=True)
 
-        from specify_cli.status.aggregate import CoordAuthorityUnavailable, MissionStatus
+        from specify_cli.status.aggregate import MissionStatus
 
-        with pytest.raises(CoordAuthorityUnavailable) as exc_info:
-            MissionStatus.load(repo_root=tmp_path, mission_slug=slug)
+        with caplog.at_level(
+            logging.WARNING, logger="specify_cli.coordination.surface_resolver"
+        ):
+            ms = MissionStatus.load(repo_root=tmp_path, mission_slug=full_slug)
 
-        exc = exc_info.value
-        assert exc.mission_slug == slug
-        assert "coordination worktree unavailable" in str(exc).lower()
+        # Option B: the aggregate inherits the PRIMARY checkout (no hard-fail).
+        assert ms.read_dir.resolve() == primary_dir.resolve()
+        # The fallback is loud (NFR-003): the surface emitted a WARNING.
+        assert any(
+            r.name == "specify_cli.coordination.surface_resolver"
+            and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), "coord-empty Option B must surface a logging.WARNING (no silent fallback)"
 
     def test_corrupt_meta_fails_closed_instead_of_legacy_fallback(self, tmp_path: Path) -> None:
         """Existing but corrupt meta.json cannot degrade to a primary-checkout read."""
@@ -918,7 +963,31 @@ class TestSaveReturnType:
     def test_save_supports_identity_bearing_legacy_mission(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Legacy missions with mission_id but no coord branch commit on current branch."""
+        """Legacy mission (mission_id, no coord branch) commits on the legacy lane.
+
+        WP05 / FR-004 before→after rationale (the prompt flagged this as one of
+        the "two tests the write-target flip touches"). Live investigation while
+        implementing WP05 established that the ``destination_ref == "legacy-lane"``
+        here is NOT produced by the seam WP05 adopts. ``MissionStatus.save`` →
+        ``BookkeepingTransaction.acquire`` detects the legacy topology (no
+        ``coordination_branch``) and **overrides** the caller-supplied
+        ``destination_ref`` with ``_resolve_legacy_lane_destination`` — which
+        reads ``git symbolic-ref HEAD`` of the operator's current worktree
+        (``transaction.py``). That override is a ``BookkeepingTransaction``
+        internal, explicitly OUT of WP05's scope (C-004: "BookkeepingTransaction
+        internals are NOT changed"), and it dominates the receipt regardless of
+        what ``_identity_for_request`` computes.
+
+        The FR-004 write-target flip WP05 lands is in
+        ``coordination/status_transition.py::_identity_for_request`` (routed
+        through ``resolve_placement_only(...).ref``); its CWD-invariant
+        ``target_branch`` behaviour is proven directly in
+        ``tests/specify_cli/coordination/test_status_transition_adoption.py``
+        (``test_write_target_flat_arm_yields_target_branch_not_head``) and in the
+        WP01 net oracle. This legacy aggregate path therefore correctly STILL
+        commits to ``legacy-lane`` post-WP05 — the value is the transaction's
+        legacy-lane resolution, not the adopted ``_identity_for_request`` target.
+        """
         base_slug = "save-legacy"
         mission_id = "01LEGACY45678901234567890"
         mid8 = mission_id[:8]
@@ -940,6 +1009,9 @@ class TestSaveReturnType:
         ms = MissionStatus.load(repo_root=repo, mission_slug=slug)
         receipt = ms.save(operation="test-save-legacy")
 
+        # Unchanged post-WP05: the legacy-topology BookkeepingTransaction override
+        # (C-004 internal, NOT the adopted _identity_for_request seam) resolves the
+        # destination to the operator's current lane branch.
         assert receipt.destination_ref == "legacy-lane"
         committed = _git(repo, "show", f"legacy-lane:kitty-specs/{slug}/status.events.jsonl")
         assert "WP02" in committed
@@ -1006,7 +1078,9 @@ class TestMissionSlugAllowlistGuard:
         [
             "feature/with-slash",
             "feature with space",
-            "feature.with.dot",
+            # "feature.with.dot" is intentionally accepted by the canonical
+            # assert_safe_path_segment (interior dots are allowed per WP01
+            # grammar decision — D-1 interior-dot reconciliation).
             "feature$injection",
             "..",
             "",

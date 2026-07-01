@@ -8,14 +8,17 @@ on:
       - 2.x
     paths:
       - 'src/**'
+      - 'docs/**'
       - '.kittify/doctrine/overlays/**'
       - 'tests/**'
       - 'pyproject.toml'
+      - '.kittify/metadata.yaml'
       - 'uv.lock'
       - '.kittify/release/shared-package-compatibility.json'
       - 'CHANGELOG.md'
       - 'RELEASE_CHECKLIST.md'
       - 'scripts/release/**'
+      - '.github/workflows/scripts/**'
       - 'ruff.toml'
       - '.github/workflows/ci-quality.yml'
       - '.github/workflows/release-readiness.yml'
@@ -27,14 +30,17 @@ on:
       - 2.x
     paths:
       - 'src/**'
+      - 'docs/**'
       - '.kittify/doctrine/overlays/**'
       - 'tests/**'
       - 'pyproject.toml'
+      - '.kittify/metadata.yaml'
       - 'uv.lock'
       - '.kittify/release/shared-package-compatibility.json'
       - 'CHANGELOG.md'
       - 'RELEASE_CHECKLIST.md'
       - 'scripts/release/**'
+      - '.github/workflows/scripts/**'
       - 'ruff.toml'
       - '.github/workflows/ci-quality.yml'
       - '.github/workflows/release-readiness.yml'
@@ -103,6 +109,7 @@ jobs:
           filters: |
             sync:
               - 'src/specify_cli/sync/**'
+              - 'src/specify_cli/core/loopback_http.py'
               - 'tests/sync/**'
             merge:
               - 'src/specify_cli/merge/**'
@@ -122,11 +129,13 @@ jobs:
               - 'src/specify_cli/release/**'
               - 'tests/release/**'
               - 'pyproject.toml'
+              - '.kittify/metadata.yaml'
               - 'uv.lock'
               - '.kittify/release/shared-package-compatibility.json'
               - 'CHANGELOG.md'
               - 'RELEASE_CHECKLIST.md'
               - 'scripts/release/**'
+              - '.github/workflows/scripts/**'
               - '.github/workflows/release-readiness.yml'
               - '.github/workflows/check-spec-kitty-events-alignment.yml'
             status:
@@ -141,6 +150,8 @@ jobs:
             next:
               - 'src/specify_cli/next/**'
               - 'src/specify_cli/runtime/**'
+              - 'src/runtime/next/**'
+              - 'src/mission_runtime/**'
               - 'tests/next/**'
               - 'tests/specify_cli/next/**'
               - 'tests/runtime/**'
@@ -161,24 +172,35 @@ jobs:
             orchestrator_api:
               - 'src/specify_cli/orchestrator_api/**'
             core_misc:
+              - '.github/workflows/ci-quality.yml'
               - 'src/kernel/**'
               - 'src/doctrine/**'
               - 'src/specify_cli/core/**'
+              - 'src/specify_cli/coordination/**'
+              - 'src/specify_cli/delivery/**'
+              - 'src/specify_cli/event_journal/**'
               - 'src/specify_cli/doctrine_synthesizer/**'
               - 'src/specify_cli/saas/**'
+              - 'src/specify_cli/status/**'
+              - 'src/specify_cli/tool_surface/**'
+              - 'docs/**'
+              - 'tests/architectural/**'
+              - 'tests/specify_cli/tool_surface/**'
               - 'tests/kernel/**'
+              - 'tests/delivery/**'
+              - 'tests/event_journal/**'
               - 'tests/doctrine/**'
               - 'tests/doctrine_synthesizer/**'
               - 'tests/policy/**'
               - 'tests/core/**'
               - 'tests/contract/**'
               - 'tests/init/**'
-              - 'tests/e2e/**'
               - 'tests/integration/**'
               - 'tests/dossier/**'
               - 'tests/git_ops/**'
               - 'tests/tasks/**'
             e2e:
+              - '.github/workflows/ci-quality.yml'
               - 'tests/e2e/**'
               - 'tests/cross_cutting/**'
             charter:
@@ -390,10 +412,10 @@ jobs:
             exit 0
           fi
 
-          mapfile -d '' CHANGED_ARCH_DOC_MD < <(git diff --name-only -z --diff-filter=ACM "$FROM_SHA" "$TO_SHA" -- 'docs/*.md' 'docs/**/*.md' 'architecture/*.md' 'architecture/**/*.md')
+          mapfile -d '' CHANGED_ARCH_DOC_MD < <(git diff --name-only -z --diff-filter=ACM "$FROM_SHA" "$TO_SHA" -- 'docs/*.md' 'docs/**/*.md')
 
           if [ "${#CHANGED_ARCH_DOC_MD[@]}" -eq 0 ]; then
-            echo "No changed markdown files under docs/ or architecture/. Skipping docs consistency tests."
+            echo "No changed markdown files under docs/. Skipping docs consistency tests."
             exit 0
           fi
 
@@ -471,7 +493,7 @@ jobs:
         id: tid251
         if: always()
         run: |
-          # ADR architecture/adrs/2026-05-28-1-... (Gap 3 / Gap 5): tests must not
+          # ADR docs/adr/3.x/2026-05-28-1-... (Gap 3 / Gap 5): tests must not
           # reimplement the charter hash algorithm (hashlib.sha256) or catch
           # click.exceptions.* directly. Unlike the advisory full-ruff report above, this
           # banned-API check is ENFORCED — an unannotated banned call FAILS the build (no
@@ -738,12 +760,18 @@ jobs:
           mkdir -p out/reports/xunit-reports
           mkdir -p out/reports/coverage
 
+      # PENDING-CI: T019 flip — collection-equivalence verified locally
+      # (serial == parallel nodeids); requires CI green x3 (run-twice/thrice
+      # ratchet) before trusting this flip. Safe after WP04 HOME isolation.
+      # See mission test-suite-acceleration.
       - name: "[ENFORCED] Run fast doctrine tests with coverage"
         run: |
           uv run python -m pytest \
             -v \
             tests/doctrine/ \
             -m "fast and not windows_ci" \
+            -n auto --dist loadfile \
+            --durations=50 \
             --cov=src/doctrine \
             --cov-report=term-missing \
             --cov-report=xml:out/reports/coverage/coverage-fast-doctrine.xml \
@@ -770,11 +798,35 @@ jobs:
           python-version: '3.12'
       - run: uv sync --frozen --all-extras
       - run: mkdir -p out/reports/coverage
-      - name: "Run fast tests — sync"
+      # PENDING-CI: T019 flip — collection-equivalence verified locally
+      # (serial == parallel nodeids); requires CI green x3 (run-twice/thrice
+      # ratchet) before trusting this flip. Safe after WP04 HOME isolation.
+      # C-SERIAL (T021): the daemon/real-port orphan-sweep suite is excluded
+      # from this parallel pool and runs serially (-n0) in the step below —
+      # HOME isolation does not protect OS-global port binds (9400-9449).
+      # See mission test-suite-acceleration.
+      - name: "Run fast tests — sync (parallel, orphan-sweep excluded)"
         run: |
           uv run python -m pytest tests/sync/ -m "fast and not windows_ci" -q --tb=short \
+            --ignore=tests/sync/test_orphan_sweep.py \
+            -n auto --dist loadfile \
+            --durations=50 \
             --cov=src/specify_cli/sync \
             --cov-report=xml:out/reports/coverage/coverage-fast-sync.xml
+      # PENDING-CI (T021): daemon/real-port serial pass. orphan-sweep binds the
+      # reserved daemon port range (9400-9449); OS-global binds are not
+      # protected by per-worker HOME isolation, so this MUST run serial (-n0)
+      # and outside the parallel sync selector (C-SERIAL, FR-005). Requires CI
+      # green x3 before trusting. See mission test-suite-acceleration.
+      - name: "Run fast tests — sync orphan-sweep (serial, real ports)"
+        run: |
+          uv run python -m pytest tests/sync/test_orphan_sweep.py -q --tb=short \
+            -m "not windows_ci" \
+            -n0 \
+            --cov=src/specify_cli/sync \
+            --cov-append \
+            --cov-report=xml:out/reports/coverage/coverage-fast-sync-orphan-sweep.xml \
+            || test $? -eq 5
       - name: "Upload fast-sync coverage"
         if: always()
         uses: actions/upload-artifact@v7
@@ -908,12 +960,23 @@ jobs:
           mkdir -p out/reports/xunit-reports
           mkdir -p out/reports/coverage
 
+      # PENDING-CI (T022): status re-route via INVERSION. The naive `-m fast`
+      # selector pulled in 85 tests that are ALSO git_repo/integration (real
+      # handlers/adapter-registry/reset_handlers paths) which made the status
+      # shard *slower*, not faster. Inverting to `fast and not (git_repo or
+      # integration)` drops exactly those 85 (2536 -> 2451 locally) so the fast
+      # shard is genuinely fast; the dropped 85 are still covered by the
+      # integration-tests-status job (trigger widened to status OR sync below).
+      # NOT flipped to -n auto here on purpose — the reset_handlers adapter
+      # registry tests need a loadfile audit first (see T022 guidance).
+      # NEEDS CI CONFIRMATION: collection-count gate verified locally only.
+      # See mission test-suite-acceleration.
       - name: "[ENFORCED] Run fast status tests with coverage"
         run: |
           uv run python -m pytest \
             -v \
             tests/status/ tests/specify_cli/status/ \
-            -m "fast and not windows_ci" \
+            -m "fast and not windows_ci and not (git_repo or integration)" \
             --cov=src/specify_cli/status \
             --cov-report=term-missing \
             --cov-report=xml:out/reports/coverage/coverage-fast-status.xml \
@@ -972,9 +1035,10 @@ jobs:
       - run: mkdir -p out/reports/coverage
       - name: "Run fast tests — next"
         run: |
-          uv run python -m pytest tests/next/ tests/specify_cli/next/ \
+          uv run python -m pytest tests/next/ tests/specify_cli/next/ tests/runtime/ \
             -m "fast and not windows_ci" -q --tb=short \
             --cov=src/specify_cli/next \
+            --cov=src/runtime/next \
             --cov-report=xml:out/reports/coverage/coverage-fast-next.xml
       - name: "Upload fast-next coverage"
         if: always()
@@ -1115,9 +1179,15 @@ jobs:
           python-version: '3.12'
       - run: uv sync --frozen --all-extras
       - run: mkdir -p out/reports/coverage
+      # PENDING-CI: T019 flip — collection-equivalence verified locally
+      # (serial == parallel nodeids); requires CI green x3 (run-twice/thrice
+      # ratchet) before trusting this flip. Safe after WP04 HOME isolation.
+      # See mission test-suite-acceleration.
       - name: "Run fast tests — cli"
         run: |
           uv run python -m pytest tests/cli/ tests/specify_cli/cli/ -m "fast and not windows_ci" -q --tb=short \
+            -n auto --dist loadfile \
+            --durations=50 \
             --cov=src/specify_cli/cli \
             --cov-report=xml:out/reports/coverage/coverage-fast-cli.xml \
             || test $? -eq 5
@@ -1169,7 +1239,11 @@ jobs:
             --ignore=tests/runtime \
             --ignore=tests/charter \
             --ignore=tests/agent \
+            --ignore=tests/e2e \
+            --ignore=tests/cross_cutting \
             -m "fast and not windows_ci" -q --tb=short \
+            -n auto --dist loadfile \
+            --durations=50 \
             --cov=src/specify_cli \
             --cov-report=xml:out/reports/coverage/coverage-fast-core-misc.xml
       - name: "Upload fast-core-misc coverage"
@@ -1180,19 +1254,103 @@ jobs:
           path: out/reports/
 
   # ---------------------------------------------------------------------------
-  # integration-tests-core-misc: architectural + git_repo tests for execution
-  # context parity. Runs after fast-tests-core-misc passes.
+  # integration-tests-core-misc: catch-all architectural/git_repo/integration
+  # tests split by directory family so one slow bucket cannot dominate PR CI.
   # Triggered by core_misc or execution_context path filters. Execution-context
   # only changes run the parity gate instead of the full catch-all integration
   # suite so status/runtime edits do not inherit unrelated core-misc debt.
   # ---------------------------------------------------------------------------
   integration-tests-core-misc:
+    name: integration-tests-core-misc (${{ matrix.shard }})
     runs-on: ubuntu-latest
     needs: [changes, fast-tests-core-misc]
     if: >-
       always() &&
       (needs.changes.outputs.core_misc == 'true' || needs.changes.outputs.execution_context == 'true') &&
-      needs.fast-tests-core-misc.result != 'failure'
+      needs.fast-tests-core-misc.result != 'failure' &&
+      (
+        github.event_name != 'pull_request' ||
+        (
+          github.event.pull_request.draft == false &&
+          !startsWith(github.event.pull_request.title, 'WIP') &&
+          !startsWith(github.event.pull_request.title, '[WIP]')
+        ) ||
+        contains(github.event.pull_request.labels.*.name, 'ci:full') ||
+        contains(github.event.pull_request.labels.*.name, 'ready-for-ci')
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: architectural
+            paths: >-
+              tests/adversarial
+              tests/architectural
+              tests/architecture
+              tests/lint
+            ignore_args: ''
+            marker_extra: ''
+          - shard: integration
+            paths: tests/integration
+            ignore_args: ''
+            marker_extra: ''
+          # PENDING-CI: T017 slow-test de-dup — `and not slow` drops the single
+          # migration perf @slow test (test_migration_completes_in_under_10s...)
+          # from THIS heavy shard so it runs only in the dedicated `slow-tests`
+          # job (no double-run, ~28s/push saved). Scoped to specify-cli-heavy
+          # ONLY — NEVER --ignore=tests/specify_cli (that orphans 3 NFR guards).
+          # Collection-count gate verified locally. Requires CI green x3.
+          # See mission test-suite-acceleration.
+          - shard: specify-cli-heavy
+            paths: >-
+              tests/specify_cli/migration
+              tests/specify_cli/invocation
+              tests/specify_cli/test_charter_activate_cli.py
+            ignore_args: ''
+            marker_extra: ' and not slow'
+          - shard: specify-cli-rest
+            paths: tests/specify_cli
+            ignore_args: >-
+              --ignore=tests/specify_cli/migration
+              --ignore=tests/specify_cli/invocation
+              --ignore=tests/specify_cli/test_charter_activate_cli.py
+              --ignore=tests/specify_cli/status
+              --ignore=tests/specify_cli/next
+            marker_extra: ''
+          - shard: auth-audit-git
+            paths: >-
+              tests/auth
+              tests/audit
+              tests/git_ops
+              tests/git
+              tests/cli_gate
+            ignore_args: ''
+            marker_extra: ''
+          - shard: misc
+            paths: >-
+              tests/calibration
+              tests/concurrency
+              tests/contract
+              tests/core
+              tests/cross_branch
+              tests/docs
+              tests/doctor
+              tests/init
+              tests/migration
+              tests/mission_runtime
+              tests/packaging
+              tests/policy
+              tests/readiness
+              tests/regression
+              tests/regressions
+              tests/research
+              tests/retrospective
+              tests/saas
+              tests/stress
+              tests/tasks
+              tests/unit
+            ignore_args: ''
+            marker_extra: ''
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.1.0
@@ -1203,44 +1361,37 @@ jobs:
       - name: "Run integration tests — core misc"
         run: |
           if [ "${{ needs.changes.outputs.core_misc }}" != "true" ] && [ "${{ needs.changes.outputs.execution_context }}" = "true" ]; then
+            if [ "${{ matrix.shard }}" != "architectural" ]; then
+              echo "Skipping ${{ matrix.shard }} for execution-context-only change."
+              exit 0
+            fi
+
             uv run python -m pytest \
               tests/architectural/test_execution_context_parity.py \
               -q --tb=short \
+              -n auto --dist loadfile \
+              --durations=50 \
               --cov=src/specify_cli \
-              --cov-report=xml:out/reports/coverage/coverage-integration-core-misc.xml
+              --cov-report=xml:out/reports/coverage/coverage-integration-core-misc-${{ matrix.shard }}.xml
             exit $?
           fi
 
           uv run python -m pytest \
-            --ignore=tests/doctrine \
-            --ignore=tests/kernel \
-            --ignore=tests/status \
-            --ignore=tests/specify_cli/status \
-            --ignore=tests/sync \
-            --ignore=tests/merge \
-            --ignore=tests/missions \
-            --ignore=tests/post_merge \
-            --ignore=tests/release \
-            --ignore=tests/review \
-            --ignore=tests/next \
-            --ignore=tests/specify_cli/next \
-            --ignore=tests/lanes \
-            --ignore=tests/test_dashboard \
-            --ignore=tests/upgrade \
-            --ignore=tests/cli \
-            --ignore=tests/runtime \
-            --ignore=tests/charter \
-            --ignore=tests/agent \
-            -m 'not windows_ci and (git_repo or integration or architectural)' \
+            ${{ matrix.paths }} \
+            ${{ matrix.ignore_args }} \
+            -m 'not windows_ci and (git_repo or integration or architectural)${{ matrix.marker_extra }}' \
             -q --tb=short \
+            -n auto --dist loadfile \
+            --durations=50 \
             --cov=src/specify_cli \
-            --cov-report=xml:out/reports/coverage/coverage-integration-core-misc.xml
+            --cov-report=xml:out/reports/coverage/coverage-integration-core-misc-${{ matrix.shard }}.xml
       - name: "Upload integration-core-misc coverage"
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: integration-test-core-misc-reports
+          name: integration-test-core-misc-${{ matrix.shard }}-reports
           path: out/reports/
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # fast-tests-charter: charter package, depends on doctrine.
@@ -1260,6 +1411,10 @@ jobs:
           python-version: '3.12'
       - run: uv sync --frozen --all-extras
       - run: mkdir -p out/reports/coverage
+      # PENDING-CI: T018 flip — collection-equivalence verified locally
+      # (serial == parallel nodeids); requires CI green x3 (run-twice/thrice
+      # ratchet) before trusting this flip. Safe because WP01 converted the
+      # charter timing floors. See mission test-suite-acceleration.
       - name: "Run fast tests — charter"
         run: |
           uv run python -m pytest \
@@ -1268,6 +1423,8 @@ jobs:
             tests/specify_cli/charter_lint \
             tests/specify_cli/charter_preflight \
             -m "fast and not windows_ci" -q --tb=short \
+            -n auto --dist loadfile \
+            --durations=50 \
             --cov=src/charter \
             --cov=src/specify_cli/charter_runtime \
             --cov=src/specify_cli/charter_freshness \
@@ -1299,10 +1456,16 @@ jobs:
           python-version: '3.12'
       - run: uv sync --frozen --all-extras
       - run: mkdir -p out/reports/coverage
+      # PENDING-CI: T020 flip — collection-equivalence verified locally
+      # (serial == parallel nodeids); requires CI green x3 (run-twice/thrice
+      # ratchet) before trusting this flip. Safe because WP04 isolates the
+      # real-home queue per xdist worker. See mission test-suite-acceleration.
       - name: "Run fast tests — agent"
         run: |
           uv run python -m pytest tests/agent \
             -m "fast and not windows_ci" -q --tb=short \
+            -n auto --dist loadfile \
+            --durations=50 \
             --cov=src/specify_cli/agent_utils \
             --cov-fail-under=10 \
             --cov-report=xml:out/reports/coverage/coverage-fast-agent.xml
@@ -1565,12 +1728,17 @@ jobs:
           name: integration-test-release-reports
           path: out/reports/
 
+  # PENDING-CI (T022): trigger widened to (status OR sync) to match the
+  # fast-tests-status scope (which already triggers on status OR sync). This
+  # ensures the 85 fast+git_repo/integration tests dropped from the inverted
+  # fast shard are always run here. NEEDS CI CONFIRMATION.
+  # See mission test-suite-acceleration.
   integration-tests-status:
     runs-on: ubuntu-latest
     needs: [changes, fast-tests-status]
     if: >-
       always() &&
-      needs.changes.outputs.status == 'true' &&
+      (needs.changes.outputs.status == 'true' || needs.changes.outputs.sync == 'true') &&
       needs.fast-tests-status.result == 'success'
 
     steps:
@@ -1653,10 +1821,11 @@ jobs:
       - run: mkdir -p out/reports/coverage
       - name: "Run integration tests — next"
         run: |
-          uv run python -m pytest tests/next/ tests/specify_cli/next/ \
+          uv run python -m pytest tests/next/ tests/specify_cli/next/ tests/runtime/ \
             -m 'not windows_ci and (git_repo or integration)' \
             -q --tb=short \
             --cov=src/specify_cli/next \
+            --cov=src/runtime/next \
             --cov-report=xml:out/reports/coverage/coverage-integration-next.xml
       - name: "Upload integration-next coverage"
         if: always()
@@ -1828,6 +1997,7 @@ jobs:
             -m "slow and not windows_ci" \
             --ignore=tests/e2e \
             --ignore=tests/cross_cutting \
+            --durations=50 \
             --cov=src/specify_cli --cov=src/charter --cov=src/doctrine \
             --cov-report=xml:out/reports/coverage/coverage-slow.xml \
             --junitxml=out/reports/xunit-reports/xunit-result-slow-${{ github.run_id }}.xml \
@@ -1883,33 +2053,79 @@ jobs:
             --tb=short
 
   # ---------------------------------------------------------------------------
+  # quarantine-visibility: runs `-m quarantine` for real (SPEC_KITTY_RUN_QUARANTINE=1)
+  # so irreducible environmental flakes stay VISIBLE — never silently retried to
+  # green. Per docs/guides/testing-flakiness.md this job is intentionally
+  # NON-BLOCKING: it MUST NOT be added to the `quality-gate` aggregation below
+  # or to branch-protection required checks, so a quarantined flake can never turn
+  # main red or block an unrelated PR. Tolerates pytest exit code 5 (no tests
+  # currently quarantined) so an empty quarantine set is green, not red.
+  # ---------------------------------------------------------------------------
+  quarantine-visibility:
+    name: quarantine visibility (non-blocking)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: >-
+      always() &&
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'pull_request'
+      )
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[test]
+      - name: Run quarantined tests (visible, never blocks merge)
+        env:
+          SPEC_KITTY_RUN_QUARANTINE: "1"
+          PWHEADLESS: "1"
+        run: |
+          set +e
+          python -m pytest tests/ -m quarantine -p no:cacheprovider -q --tb=short
+          ec=$?
+          set -e
+          if [ "$ec" -eq 5 ]; then
+            echo "::notice::No tests are currently quarantined (-m quarantine collected nothing)."
+            exit 0
+          fi
+          exit "$ec"
+
+  # ---------------------------------------------------------------------------
   # e2e-cross-cutting: push/manual, plus PRs that change e2e/cross-cutting
   # fixtures. Runs tests/e2e/ and tests/cross_cutting/ in parallel with slow-tests.
   # ---------------------------------------------------------------------------
   e2e-cross-cutting:
     runs-on: ubuntu-latest
-    needs:
-      - changes
-      - fast-tests-doctrine
-      - fast-tests-sync
-      - fast-tests-merge
-      - fast-tests-missions
-      - fast-tests-post-merge
-      - fast-tests-release
-      - fast-tests-status
-      - fast-tests-review
-      - fast-tests-next
-      - fast-tests-lanes
-      - fast-tests-dashboard
-      - fast-tests-upgrade
-      - fast-tests-cli
-      - fast-tests-core-misc
-      - fast-tests-charter
-      - fast-tests-agent
+    needs: [changes]
     if: |
       always() && (
         github.event_name == 'push' ||
-        (github.event_name == 'pull_request' && needs.changes.outputs.e2e == 'true') ||
+        (
+          github.event_name == 'pull_request' &&
+          (
+            needs.changes.outputs.e2e == 'true' ||
+            needs.changes.outputs.core_misc == 'true' ||
+            needs.changes.outputs.execution_context == 'true'
+          ) &&
+          (
+            (
+              github.event.pull_request.draft == false &&
+              !startsWith(github.event.pull_request.title, 'WIP') &&
+              !startsWith(github.event.pull_request.title, '[WIP]')
+            ) ||
+            contains(github.event.pull_request.labels.*.name, 'ci:full') ||
+            contains(github.event.pull_request.labels.*.name, 'ready-for-ci')
+          )
+        ) ||
         (github.event_name == 'workflow_dispatch' && (inputs.run_extended || inputs.run_all))
       )
     timeout-minutes: 40
@@ -1937,6 +2153,7 @@ jobs:
             -v \
             tests/e2e/ tests/cross_cutting/ \
             -m "not distribution and not windows_ci" \
+            --durations=50 \
             --cov=src/specify_cli --cov=src/charter --cov=src/doctrine \
             --cov-report=xml:out/reports/coverage/coverage-e2e.xml \
             --junitxml=out/reports/xunit-reports/xunit-result-e2e-${{ github.run_id }}.xml
@@ -2022,6 +2239,8 @@ jobs:
             'src/specify_cli/dashboard/scanner.py'
             'src/specify_cli/merge/*'
             'src/specify_cli/next/*'
+            'src/runtime/next/*'
+            'src/mission_runtime/*'
           )
 
           coverage_reports=()
@@ -2300,6 +2519,110 @@ jobs:
 
           echo "report_paths=$report_paths" >> "$GITHUB_OUTPUT"
 
+      - name: "[ENFORCED] Normalize coverage XML paths for Sonar multi-package src layout"
+        if: steps.sonar_token.outputs.enabled == 'true'
+        run: |
+          # Problem: each CI test job runs with --cov=src/<package> which produces a
+          # coverage XML whose <sources> block lists the per-package absolute path, e.g.:
+          #   <source>/github/workspace/src/specify_cli</source>
+          #   <source>/github/workspace/src/mission_runtime</source>
+          # …and bare filenames like filename="__init__.py".
+          # SonarCloud tries to resolve every bare filename against ALL <source> entries
+          # simultaneously, finds __init__.py under multiple sources, and logs:
+          #   ERROR Cannot resolve the file path '__init__.py' of the coverage report,
+          #         ambiguity, the file exists in several 'source'.
+          # Fix: rewrite each XML so there is exactly ONE <source> (the common src/
+          # ancestor) and every filename is prefixed with its package sub-path, e.g.:
+          #   src/specify_cli/__init__.py, src/mission_runtime/__init__.py
+          # SonarCloud can then match each path to exactly one file in sonar.sources=src.
+          python3 - << 'PYEOF'
+          import os, sys, glob, xml.etree.ElementTree as ET
+
+          ET.register_namespace('', '')  # keep xmlns clean if present
+
+          artifact_dirs = ['out/reports/artifacts/current', 'out/reports/artifacts/fallback']
+          xml_files = []
+          for d in artifact_dirs:
+              xml_files.extend(glob.glob(os.path.join(d, '**', 'coverage-*.xml'), recursive=True))
+
+          if not xml_files:
+              print('No coverage XML files found to normalize.')
+              sys.exit(0)
+
+          normalized = 0
+          for xml_path in xml_files:
+              try:
+                  tree = ET.parse(xml_path)
+                  root = tree.getroot()
+              except ET.ParseError as e:
+                  print(f'  SKIP (parse error): {xml_path}: {e}')
+                  continue
+
+              sources_el = root.find('sources')
+              if sources_el is None:
+                  continue
+
+              raw_sources = [s.text.strip() for s in sources_el.findall('source') if s.text and s.text.strip()]
+              if len(raw_sources) <= 1:
+                  # Single source — check if it already has unambiguous paths or is an
+                  # absolute path that needs making relative.
+                  if not raw_sources:
+                      continue
+                  src = raw_sources[0]
+                  # If it's already a relative path ending in 'src' or similar, skip.
+                  if not os.path.isabs(src):
+                      continue
+                  # Single absolute source: just make it relative (strip CWD prefix).
+                  cwd = os.getcwd()
+                  rel = os.path.relpath(src, cwd)
+                  sources_el.clear()
+                  new_src = ET.SubElement(sources_el, 'source')
+                  new_src.text = rel
+                  # Filenames already include the package sub-path when there's one source,
+                  # so no filename prefixing is needed.
+                  tree.write(xml_path, encoding='unicode', xml_declaration=True)
+                  normalized += 1
+                  print(f'  Relativized single source: {xml_path}  ({src} -> {rel})')
+                  continue
+
+              # Multiple sources: find common ancestor (the src/ parent directory).
+              common = os.path.commonpath(raw_sources)
+              cwd = os.getcwd()
+              common_rel = os.path.relpath(common, cwd)  # e.g. 'src'
+
+              # Build prefix map: source_path -> relative_prefix (e.g. 'specify_cli')
+              prefix_map = {}
+              for src in raw_sources:
+                  rel_prefix = os.path.relpath(src, common)
+                  prefix_map[src] = rel_prefix
+
+              # Rewrite <source> block to single canonical entry.
+              sources_el.clear()
+              new_src = ET.SubElement(sources_el, 'source')
+              new_src.text = common_rel  # e.g. 'src'
+
+              # Prefix every <class filename=...> with the correct sub-path.
+              # We must determine which source each file belongs to by checking existence.
+              changed = 0
+              for cls in root.findall('packages/package/classes/class'):
+                  fname = cls.get('filename', '')
+                  if not fname or os.path.isabs(fname):
+                      continue
+                  for src_path, prefix in prefix_map.items():
+                      candidate = os.path.join(src_path, fname)
+                      if os.path.exists(candidate):
+                          new_fname = fname if prefix == '.' else os.path.join(prefix, fname)
+                          cls.set('filename', new_fname)
+                          changed += 1
+                          break
+
+              tree.write(xml_path, encoding='unicode', xml_declaration=True)
+              normalized += 1
+              print(f'  Normalized: {xml_path}  ({len(raw_sources)} sources -> {common_rel!r}, {changed} filenames prefixed)')
+
+          print(f'Normalization complete: {normalized}/{len(xml_files)} files updated.')
+          PYEOF
+
       - name: "[ENFORCED] Materialize effective Sonar config"
         if: steps.sonar_token.outputs.enabled == 'true'
         run: |
@@ -2507,6 +2830,13 @@ jobs:
       REPO_OWNER: ${{ github.repository_owner }}
       HAS_SAAS_READ_TOKEN: ${{ secrets.SPEC_KITTY_SAAS_READ_TOKEN != '' }}
       IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      # Private SaaS evidence is only reachable from the canonical repo. Token
+      # presence alone is not enough of a signal: the canonical repo must fail
+      # loud when the secret is misconfigured, while fork PRs and fork-owned
+      # runs (which can never have the secret) degrade to a skip-with-warning.
+      # The repo name is hardcoded (not vars.*) for in-file auditability and
+      # must track any rename/transfer. See issue #1849.
+      IS_CANONICAL_REPO: ${{ github.repository == 'Priivacy-ai/spec-kitty' }}
     steps:
       - name: Check out trusted validation scripts
         uses: actions/checkout@v6
@@ -2544,9 +2874,9 @@ jobs:
           mkdir -p /tmp/spec-kitty-release-contracts
 
           if [ "${HAS_SAAS_READ_TOKEN}" != "true" ]; then
-            if [ "${IS_FORK_PR}" = "true" ]; then
+            if [ "${IS_FORK_PR}" = "true" ] || [ "${IS_CANONICAL_REPO}" != "true" ]; then
               echo "saas_fetched=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::SPEC_KITTY_SAAS_READ_TOKEN is unavailable for fork PRs; skipping private SaaS consumer compatibility evidence."
+              echo "::warning::SPEC_KITTY_SAAS_READ_TOKEN is unavailable for fork PRs or non-canonical repository runs; skipping private SaaS consumer compatibility evidence."
               exit 0
             fi
 
@@ -2613,6 +2943,7 @@ jobs:
       - fast-tests-charter
       - fast-tests-agent
       - integration-tests-doctrine
+      - integration-tests-charter
       - integration-tests-sync
       - integration-tests-merge
       - integration-tests-missions
@@ -2627,6 +2958,7 @@ jobs:
       - integration-tests-cli
       - integration-tests-agent
       - integration-tests-core-misc
+      - e2e-cross-cutting
       - restart-daemon-nfr-timing
       - build-wheel
       - clean-install-verification
@@ -2676,6 +3008,7 @@ jobs:
             "${{ needs.integration-tests-cli.result }}" \
             "${{ needs.integration-tests-agent.result }}" \
             "${{ needs.integration-tests-core-misc.result }}" \
+            "${{ needs.e2e-cross-cutting.result }}" \
             "${{ needs.restart-daemon-nfr-timing.result }}" \
             "${{ needs.build-wheel.result }}" \
             "${{ needs.clean-install-verification.result }}" \

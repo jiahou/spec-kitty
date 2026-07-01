@@ -15,7 +15,7 @@ from tests.lane_test_utils import write_single_lane_manifest
 
 import pytest
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
 runner = CliRunner()
 
@@ -95,10 +95,16 @@ def _patch_merge_environment(
             return 1, "", "fatal: not a valid object name"
         return 0, "", ""
 
-    monkeypatch.setattr(
-        "specify_cli.cli.commands.merge.run_command",
-        fake_run_command,
-    )
+    # WP10 (#2057): the merge flow's git probes are now split across seams —
+    # target validation reads ``run_command`` from ``merge.preflight`` /
+    # ``merge.resolve`` and the lane executor from ``merge.executor``. Patch all
+    # the surfaces this flow traverses so the fake git stays in effect.
+    for _target in (
+        "specify_cli.merge.executor.run_command",
+        "specify_cli.merge.preflight.run_command",
+        "specify_cli.merge.resolve.run_command",
+    ):
+        monkeypatch.setattr(_target, fake_run_command)
 
 
 def test_merge_without_feature_on_feature_branch_reads_meta_target(monkeypatch, tmp_path: Path) -> None:
@@ -183,7 +189,7 @@ def test_explicit_feature_flag_reads_meta_target(monkeypatch, tmp_path: Path) ->
 
     result = runner.invoke(
         cli_app,
-        ["merge", "--dry-run", "--json", "--feature", slug],
+        ["merge", "--dry-run", "--json", "--mission", slug],
     )
 
     assert result.exit_code == 0
@@ -207,7 +213,7 @@ def test_explicit_feature_flag_missing_meta_falls_back_to_primary(monkeypatch, t
 
     result = runner.invoke(
         cli_app,
-        ["merge", "--dry-run", "--json", "--feature", slug],
+        ["merge", "--dry-run", "--json", "--mission", slug],
     )
 
     assert result.exit_code == 0

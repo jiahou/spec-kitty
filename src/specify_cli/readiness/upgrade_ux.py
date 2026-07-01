@@ -26,29 +26,39 @@ call ``_render_nag_if_needed`` directly and is unchanged.
 from __future__ import annotations
 
 import os
-import subprocess  # noqa: S404 — required to invoke the existing `spec-kitty upgrade` binary
+import re
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 if TYPE_CHECKING:
     import typer
 
+    from specify_cli.compat._adapters.uv_receipt import UvReceiptResult
+    from specify_cli.compat._detect.runtime import InstalledCliRuntime
     from specify_cli.compat.cache import NagCacheRecord
+    from specify_cli.compat.install_events import UvToolInstallationVerified, VerificationConfidence
+    from specify_cli.compat.remediation import RemediationCommand
 
 
 class _CliStatusLike(Protocol):
-    installed_version: str
-    latest_version: str | None
-    latest_source: str
+    @property
+    def installed_version(self) -> str: ...
+
+    @property
+    def latest_version(self) -> str | None: ...
+
+    @property
+    def latest_source(self) -> str: ...
 
 
 class _PlanResultLike(Protocol):
-    cli_status: _CliStatusLike
+    @property
+    def cli_status(self) -> _CliStatusLike: ...
 
 
 class _NagCacheLike(Protocol):
@@ -60,6 +70,7 @@ ENV_UPGRADE_NEVER_ASK = "SPEC_KITTY_UPGRADE_NEVER_ASK"
 ENV_UPGRADE_DISABLED = "SPEC_KITTY_UPGRADE_DISABLED"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_VERSION_RE = re.compile(r"^[A-Za-z0-9.\-+]{1,64}$")
 
 
 def _truthy(raw: str | None) -> bool:
@@ -204,118 +215,171 @@ def is_currently_snoozed(
 
 
 # ---------------------------------------------------------------------------
+# Post-upgrade verification helpers (T025)
+# ---------------------------------------------------------------------------
+
+# Module-level event inspection hook — populated by _emit_install_verified_event().
+# Tests may clear this list and inspect it to verify event emission.
+_emitted_install_events: list[object] = []
+
+
+def _check_entrypoint_present(receipt: UvReceiptResult) -> bool:
+    """Return True if the spec-kitty entrypoint was found post-upgrade.
+
+    Uses ``bin_dir`` as a proxy: UvReceiptReader populates ``bin_dir``
+    only when the spec-kitty entrypoint is present in the receipt.
+    """
+    return receipt.bin_dir is not None
+
+
+def _derive_confidence(exit_code: int | None, entrypoint_match: bool) -> VerificationConfidence:
+    """Derive VerificationConfidence from exit code and entrypoint presence.
+
+    Rules (spec FR-014):
+    - HIGH:   exit_code == 0 AND entrypoint_match == True
+    - MEDIUM: exit_code == 0 AND entrypoint_match == False
+    - LOW:    exit_code != 0
+    """
+    from specify_cli.compat.install_events import VerificationConfidence as _VC
+
+    if exit_code == 0 and entrypoint_match:
+        return _VC.HIGH
+    if exit_code == 0:
+        return _VC.MEDIUM
+    return _VC.LOW
+
+
+def _derive_package_binding(receipt: UvReceiptResult) -> str:
+    """Return package name + specifier from the first receipt requirement, or 'unknown'."""
+    if not receipt.requirements:
+        return "unknown"
+    req = receipt.requirements[0]
+    specifier = req.specifier or ""
+    binding = req.name + specifier
+    return binding if binding else "unknown"
+
+
+def _emit_install_verified_event(event: UvToolInstallationVerified) -> None:
+    """Best-effort emit: append to module-level list for test inspection.
+
+    NFR-007: swallows all errors; never logs or transmits receipt_path.
+    """
+    import contextlib
+
+    with contextlib.suppress(Exception):
+        _emitted_install_events.append(event)
+
+
+# ---------------------------------------------------------------------------
+# History record append helper (T026)
+# ---------------------------------------------------------------------------
+
+
+def _append_upgrade_attempt_record(
+    completed: subprocess.CompletedProcess[bytes],
+    runtime: InstalledCliRuntime,
+    *,
+    target_version: str | None,
+) -> None:
+    """Best-effort append to UpgradeAttemptStore.  Swallows all errors (NFR-008)."""
+    try:
+        import ulid
+        from specify_cli.compat.history import (
+            UpgradeAttemptOutcome,
+            UpgradeAttemptRecord,
+            UpgradeAttemptStore,
+        )
+
+        outcome = (
+            UpgradeAttemptOutcome.SUCCESS
+            if completed.returncode == 0
+            else UpgradeAttemptOutcome.FAILURE
+        )
+        record = UpgradeAttemptRecord(
+            attempt_id=str(ulid.ULID()),
+            timestamp=datetime.now(UTC),
+            install_method=runtime.install_method,
+            intent="upgrade",
+            outcome=outcome,
+            exit_code=completed.returncode,
+            target_version=target_version,
+        )
+        UpgradeAttemptStore().append(record)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Auto-upgrade subprocess (the only side-effecting helper in this module)
 # ---------------------------------------------------------------------------
 
 
-def _default_upgrade_runner(method: object) -> int:
+def _default_upgrade_runner(
+    cmd: RemediationCommand,
+    runtime: InstalledCliRuntime,
+    *,
+    target_version: str | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     """Invoke the owning installer's upgrade command via subprocess.
 
-    Returns the process exit code.  Never raises; on OSError / timeout
-    returns a non-zero sentinel so the caller can treat it as "failed".
+    Returns a CompletedProcess.  Never raises; on OSError / timeout
+    returns a CompletedProcess with returncode=1 so the caller can treat
+    it as "failed".
 
     Auto-upgrade safety:
 
-    - Uses installer-specific commands so tool-env upgrades mutate the
-      installer-owned CLI environment, not the current project.
+    - Consumes ``cmd.argv`` and ``cmd.env`` from the pre-built RemediationCommand
+      so installer-specific behaviour (--python, UV_TOOL_DIR, etc.) is fully
+      determined by the remediation planner.
     - Hard 5-minute timeout (upgrades that take longer are pathological
       and should be observed by the user, not auto-driven).
     - ``check=False`` — caller inspects the return code.
+
+    Post-completion side-effects (both best-effort / fail-safe):
+    - UV_TOOL installs: emits ``UvToolInstallationVerified`` event (FR-014).
+    - All install methods: appends ``UpgradeAttemptRecord`` to history store (FR-012).
     """
-    from specify_cli.compat._detect.install_method import InstallMethod  # noqa: PLC0415
+    from specify_cli.compat._detect.install_method import InstallMethod
 
-    if not isinstance(method, InstallMethod):
-        return 1
+    if cmd.argv is None:
+        return subprocess.CompletedProcess(args=[], returncode=1)
 
-    uv_tool_argv = ["uv", "tool", "upgrade"]
-    uv_tool_argv.extend(_uv_tool_python_args())
-    uv_tool_argv.append("spec-kitty-cli")
-    argv_by_method = {
-        InstallMethod.PIPX: ["pipx", "upgrade", "spec-kitty-cli"],
-        InstallMethod.UV_TOOL: uv_tool_argv,
-        InstallMethod.BREW: ["brew", "upgrade", "spec-kitty-cli"],
-        InstallMethod.PIP_USER: [sys.executable, "-m", "pip", "install", "--user", "--upgrade", "spec-kitty-cli"],
-        InstallMethod.PIP_SYSTEM: [sys.executable, "-m", "pip", "install", "--upgrade", "spec-kitty-cli"],
-    }
-    argv = argv_by_method.get(method)
-    if argv is None:
-        return 1
-    env = _uv_tool_upgrade_env(method)
+    argv = list(cmd.argv)
+    merged_env: dict[str, str] | None = {**os.environ, **cmd.env} if cmd.env else None
 
     try:
-        completed = subprocess.run(  # noqa: S603,S607 — fixed argv; PATH lookup is intentional
+        completed: subprocess.CompletedProcess[bytes] = subprocess.run(
             argv,
             check=False,
-            env=env,
+            env=merged_env,
             timeout=300,
         )
-        return completed.returncode
     except (OSError, subprocess.TimeoutExpired):
-        return 1
+        completed = subprocess.CompletedProcess(args=argv, returncode=1)
 
+    # T025: Emit UvToolInstallationVerified (UV_TOOL only, best-effort, NFR-007)
+    if runtime.install_method == InstallMethod.UV_TOOL:
+        try:
+            from specify_cli.compat._adapters.uv_receipt import UvReceiptReader
+            from specify_cli.compat.install_events import UvToolInstallationVerified
 
-def _uv_tool_upgrade_env(method: object) -> dict[str, str] | None:
-    from specify_cli.compat._detect.install_method import InstallMethod  # noqa: PLC0415
+            post_receipt = UvReceiptReader.read_for_executable(sys.executable)
+            entrypoint_match = _check_entrypoint_present(post_receipt)
+            confidence = _derive_confidence(completed.returncode, entrypoint_match)
+            event = UvToolInstallationVerified(
+                receipt_path=post_receipt.receipt_path,
+                entrypoint_match=entrypoint_match,
+                package_binding=_derive_package_binding(post_receipt),
+                confidence=confidence,
+            )
+            _emit_install_verified_event(event)
+        except Exception:
+            pass
 
-    if method != InstallMethod.UV_TOOL:
-        return None
-    tool_dir = _active_uv_tool_dir()
-    if tool_dir is None or _same_path(tool_dir, Path.home() / ".local" / "share" / "uv" / "tools"):
-        return None
-    env = dict(os.environ)
-    env["UV_TOOL_DIR"] = str(tool_dir)
-    return env
+    # T026: Append UpgradeAttemptRecord (all install methods, best-effort)
+    _append_upgrade_attempt_record(completed, runtime, target_version=target_version)
 
-
-def _uv_tool_python_args() -> list[str]:
-    receipt = _active_uv_tool_receipt()
-    if receipt is None:
-        return []
-    tool = receipt.get("tool", {})
-    if not isinstance(tool, dict):
-        return []
-    python = tool.get("python")
-    if not isinstance(python, str) or not python.strip():
-        return []
-    return ["--python", python]
-
-
-def _active_uv_tool_receipt() -> dict[str, object] | None:
-    try:
-        executable_parent = Path(sys.executable).parent
-        if executable_parent.name.lower() not in {"bin", "scripts"}:
-            return None
-        receipt_path = executable_parent.parent / "uv-receipt.toml"
-        if not receipt_path.exists():
-            return None
-        import tomllib  # noqa: PLC0415
-
-        receipt = tomllib.loads(receipt_path.read_text(encoding="utf-8"))
-        if isinstance(receipt, dict):
-            return receipt
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-
-def _active_uv_tool_dir() -> Path | None:
-    try:
-        executable_parent = Path(sys.executable).parent
-        if executable_parent.name.lower() not in {"bin", "scripts"}:
-            return None
-        tool_env = executable_parent.parent
-        if not (tool_env / "uv-receipt.toml").exists():
-            return None
-        return tool_env.parent
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _same_path(left: Path, right: Path) -> bool:
-    try:
-        return left.resolve() == right.resolve()
-    except Exception:  # noqa: BLE001
-        return left == right
+    return completed
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +454,7 @@ def _default_prompt() -> UpgradeChoice:
     response as "Upgrade now".
     """
     # Local imports to keep module-load cost low.
-    from rich.console import Console  # noqa: PLC0415
+    from rich.console import Console
 
     out = Console(stderr=True)
     out.print()
@@ -415,7 +479,7 @@ def _default_prompt() -> UpgradeChoice:
 
 def _print_unsafe_installer_guidance(method_name: str) -> None:
     """Emit guidance for installers that are not auto-upgrade-safe."""
-    from rich.console import Console  # noqa: PLC0415
+    from rich.console import Console
 
     out = Console(stderr=True)
     out.print(
@@ -503,10 +567,30 @@ def _run_auto_upgrade_if_safe(
     *,
     safe: bool,
     method: object,
+    latest_version: str | None,
     upgrade_runner: Callable[[], int] | None,
 ) -> tuple[bool, int | None, bool]:
     if safe:
-        runner_exit = _default_upgrade_runner(method) if upgrade_runner is None else upgrade_runner()
+        if upgrade_runner is None:
+            from dataclasses import replace as _replace
+
+            from specify_cli.compat._detect.install_method import InstallMethod
+            from specify_cli.compat._detect.runtime import detect_runtime as _detect_runtime
+            from specify_cli.compat.remediation import RemediationIntent, plan_remediation
+
+            raw_runtime = _detect_runtime()
+            # Override install_method with what installer_detector() returned —
+            # in tests the injected detector may differ from detect_runtime().
+            # Receipt-derived fields (python, tool_dir, etc.) come from detect_runtime().
+            runtime = (
+                _replace(raw_runtime, install_method=method, safe_for_auto_upgrade=True)
+                if isinstance(method, InstallMethod)
+                else raw_runtime
+            )
+            cmd = plan_remediation(runtime, RemediationIntent.UPGRADE, latest_version)
+            runner_exit = _default_upgrade_runner(cmd, runtime, target_version=latest_version).returncode
+        else:
+            runner_exit = upgrade_runner()
         return True, runner_exit, False
     _print_unsafe_installer_guidance(str(method))
     return False, None, True
@@ -518,11 +602,13 @@ def _handle_always_preference(
     kwargs: dict[str, object],
     safe: bool,
     method: object,
+    current_latest: str | None,
     upgrade_runner: Callable[[], int] | None,
 ) -> UpgradeUxOutcome:
     attempted, exit_code, guidance_only = _run_auto_upgrade_if_safe(
         safe=safe,
         method=method,
+        latest_version=current_latest,
         upgrade_runner=upgrade_runner,
     )
     if exit_code == 0:
@@ -555,6 +641,7 @@ def _handle_prompt_choice(
         auto_upgrade_attempted, exit_code, guidance_only = _run_auto_upgrade_if_safe(
             safe=safe,
             method=method,
+            latest_version=current_latest,
             upgrade_runner=upgrade_runner,
         )
     return _persist_and_return(
@@ -564,7 +651,7 @@ def _handle_prompt_choice(
     )
 
 
-def run_upgrade_ux(  # noqa: C901,PLR0911,PLR0912,PLR0913,PLR0915 — orchestrator with many short-circuit branches
+def run_upgrade_ux(
     ctx: typer.Context | None,
     *,
     suppressed: bool,
@@ -610,20 +697,22 @@ def run_upgrade_ux(  # noqa: C901,PLR0911,PLR0912,PLR0913,PLR0915 — orchestrat
         prompt = _default_prompt
     try:
         # Deferred imports.
-        from specify_cli.compat import (  # noqa: PLC0415
+        from specify_cli.compat import (
             Decision,
             Invocation,
             NagCache,
         )
-        from specify_cli.compat import plan as compat_plan  # noqa: PLC0415
-        from specify_cli.compat._detect.install_method import (  # noqa: PLC0415
+        from specify_cli.compat import plan as compat_plan
+        from specify_cli.compat._detect.install_method import (
             InstallMethod,
-            detect_install_method,
             is_safe_for_auto_upgrade,
         )
+        from specify_cli.compat._detect.runtime import detect_runtime
 
         if installer_detector is None:
-            installer_detector = detect_install_method
+            def _default_installer_detector() -> object:
+                return detect_runtime().install_method
+            installer_detector = _default_installer_detector
 
         # Kill switch (env-only; not persisted).
         if _truthy(env.get(ENV_UPGRADE_DISABLED)):
@@ -680,6 +769,7 @@ def run_upgrade_ux(  # noqa: C901,PLR0911,PLR0912,PLR0913,PLR0915 — orchestrat
                 kwargs=kwargs,
                 safe=safe,
                 method=method,
+                current_latest=current_latest,
                 upgrade_runner=upgrade_runner,
             )
 
@@ -695,7 +785,7 @@ def run_upgrade_ux(  # noqa: C901,PLR0911,PLR0912,PLR0913,PLR0915 — orchestrat
             method=method,
             upgrade_runner=upgrade_runner,
         )
-    except Exception:  # noqa: BLE001 — UX path must never raise out of the CLI.
+    except Exception:
         return _inactive_outcome()
 
 
@@ -705,24 +795,52 @@ def _persist(cache: _NagCacheLike, kwargs: dict[str, object]) -> None:
     Swallows any exception — cache mutation failure must not block the CLI.
     """
     try:
-        from specify_cli.compat import NagCacheRecord  # noqa: PLC0415
+        from specify_cli.compat import NagCacheRecord
 
-        # Defensive copy: ensure literal type for snooze_step.
-        record = NagCacheRecord(**kwargs)
+        cli_version_key = kwargs["cli_version_key"]
+        latest_source = kwargs["latest_source"]
+        fetched_at = kwargs["fetched_at"]
+        if (
+            not isinstance(cli_version_key, str)
+            or not isinstance(latest_source, str)
+            or latest_source not in ("pypi", "none")
+            or not isinstance(fetched_at, datetime)
+        ):
+            return
+        canonical_source = cast(Literal["pypi", "none"], latest_source)
+        snooze_raw = kwargs.get("snooze_step")
+        if snooze_raw == "24h":
+            snooze_step: Literal["24h", "48h", "7d"] | None = "24h"
+        elif snooze_raw == "48h":
+            snooze_step = "48h"
+        elif snooze_raw == "7d":
+            snooze_step = "7d"
+        else:
+            snooze_step = None
+        record = NagCacheRecord(
+            cli_version_key=cli_version_key,
+            latest_version=_optional_str_value(kwargs.get("latest_version")),
+            latest_source=canonical_source,
+            fetched_at=fetched_at,
+            last_shown_at=_optional_datetime_value(kwargs.get("last_shown_at")),
+            remote_version_seen=_optional_str_value(kwargs.get("remote_version_seen")),
+            snooze_step=snooze_step,
+            snoozed_until=_optional_datetime_value(kwargs.get("snoozed_until")),
+            always_upgrade=bool(kwargs.get("always_upgrade", False)),
+            never_ask=bool(kwargs.get("never_ask", False)),
+        )
         cache.write(record)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
 __all__ = [
-    "ENV_UPGRADE_AUTO",
+    # ENV_UPGRADE_AUTO, ENV_UPGRADE_NEVER_ASK: demoted — env-var constants
+    # consumed only within this module (WP01 harden-dead-symbol-gate-01KW0RJR).
     "ENV_UPGRADE_DISABLED",
-    "ENV_UPGRADE_NEVER_ASK",
-    "EffectivePreference",
-    "PromptCallback",
+    # EffectivePreference, PromptCallback, UpgradeUxOutcome, advance_snooze:
+    # demoted — no cross-module src/ from-import callers (WP01).
     "UpgradeChoice",
-    "UpgradeUxOutcome",
-    "advance_snooze",
     "apply_choice",
     "is_currently_snoozed",
     "needs_reset",

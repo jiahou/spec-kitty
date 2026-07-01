@@ -24,6 +24,8 @@ import pytest
 
 from specify_cli.skills.command_installer import (
     CANONICAL_COMMANDS,
+    CLI_WRAPPER_COMMANDS,
+    PROMPT_BACKED_COMMANDS,
     SUPPORTED_AGENTS,
     InstallReport,
     InstallerError,
@@ -40,8 +42,7 @@ from specify_cli.skills.manifest_store import ManifestEntry, SkillsManifest
 # Helpers
 # ---------------------------------------------------------------------------
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 _TEMPLATE_REPO_ROOT = (
     Path(__file__).parent.parent.parent.parent
 )  # tests/specify_cli/skills/../../.. → repo root
@@ -703,8 +704,13 @@ class TestConstants:
         assert set(SUPPORTED_AGENTS) == {"codex", "vibe", "pi", "letta"}
 
     def test_canonical_commands_count(self) -> None:
-        # Was 12 before 3.2.0a5; checklist retired (FR-003 / FR-004 / #815).
-        assert len(CANONICAL_COMMANDS) == 11
+        assert len(CANONICAL_COMMANDS) == 15
+
+    def test_canonical_commands_match_consumer_registry(self) -> None:
+        from specify_cli.shims.registry import CONSUMER_SKILLS
+
+        assert set(CANONICAL_COMMANDS) == set(CONSUMER_SKILLS)
+        assert set(PROMPT_BACKED_COMMANDS).isdisjoint(CLI_WRAPPER_COMMANDS)
 
     def test_canonical_commands_excludes_checklist(self) -> None:
         # /spec-kitty.checklist was retired in 3.2.0a5 (#815, supersedes #635).

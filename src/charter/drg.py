@@ -36,11 +36,10 @@ satisfy both surfaces:
   to the Mission B 8-kind plural universe (C-009 binding).
 * ``merge_three_layers`` bridges fragment nodes onto the built-in DRG by
   minting URNs of the form ``<singular_kind>:<id>`` (e.g. ``directive:sox-controls``).
-* Provenance is threaded by attaching a ``provenance`` sidecar attribute to
-  each merged node/edge. Because the built-in models are frozen
-  ``BaseModel`` instances, the merge returns a ``DRGGraph`` whose node /
-  edge objects carry a ``provenance`` attribute monkey-set after
-  construction; consumers read it with ``getattr(node, 'provenance', None)``.
+* Provenance is threaded via the declared ``provenance`` field on the DRG
+  models (FR-013, D2-revised). The merge returns a ``DRGGraph`` whose node /
+  edge objects carry their ``provenance`` set through ``model_copy``;
+  consumers read it directly with ``node.provenance``.
 
 This matches data-model.md §2's stated provenance semantics
 (``source: built-in | org:<pack> | project``) while honouring the
@@ -135,11 +134,7 @@ def load_org_drg(repo_root: Path) -> list[OrgDRGFragment]:
     registry = load_pack_registry(repo_root)
     fragments: list[OrgDRGFragment] = []
     for layer_index, pack in enumerate(registry.packs, start=1):
-        configured_path = pack.local_path
-        if not configured_path.is_absolute():
-            configured_path = (repo_root / configured_path).resolve()
-        # Delegate all per-pack schema parsing to the doctrine layer.
-        fragments.append(load_org_pack(pack.name, configured_path, layer_index))
+        fragments.append(load_org_pack(pack.name, pack.effective_root(repo_root), layer_index))
     return fragments
 
 
@@ -392,7 +387,7 @@ def filter_graph_by_activation(
 # Layer boundary note: ``src/charter/`` cannot import from
 # ``specify_cli.doctrine.*`` (the dependency rule is
 # ``kernel <- doctrine <- charter <- specify_cli`` per
-# ``architecture/2.x/00_landscape/README.md``). Runtime callers that need to
+# ``docs/architecture/00_landscape/README.md``). Runtime callers that need to
 # both filter the graph and load org-charter policies must invoke
 # :func:`filter_graph_by_activation` here and
 # ``specify_cli.doctrine.org_charter.load_org_charter_policies`` from their

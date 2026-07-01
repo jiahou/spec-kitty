@@ -16,7 +16,6 @@ from typing import Annotated, Any
 import typer
 from rich.console import Console
 
-from specify_cli.cli.selector_resolution import resolve_selector
 from specify_cli.core.paths import locate_project_root
 
 console = Console()
@@ -26,10 +25,6 @@ def materialize(
     mission: Annotated[
         str | None,
         typer.Option("--mission", help="Mission slug to materialise (all if omitted)"),
-    ] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
     ] = None,
     json_output: Annotated[
         bool,
@@ -65,20 +60,13 @@ def materialize(
     derived_dir = repo_root / ".kittify" / "derived"
     derived_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve feature directories to process
-    mission_slug = None
-    if mission is not None or feature is not None:
-        mission_slug = resolve_selector(
-            canonical_value=mission,
-            canonical_flag="--mission",
-            alias_value=feature,
-            alias_flag="--feature",
-            suppress_env_var="SPEC_KITTY_SUPPRESS_FEATURE_DEPRECATION",
-            command_hint="--mission <slug>",
-        ).canonical_value
+    # Resolve feature directories to process. Normalize whitespace to preserve
+    # the prior resolve_selector() behavior (` 034-foo ` must resolve the same as
+    # `034-foo`); whitespace-only/empty means "all missions".
+    mission_slug = mission.strip() if mission else mission
 
     if mission_slug:
-        from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_slug
+        from specify_cli.missions._read_path_resolver import resolve_feature_dir_for_slug
 
         feature_dirs = [resolve_feature_dir_for_slug(repo_root, mission_slug)]
         if not feature_dirs[0].exists():

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import KITTIFY_DIR, KITTY_SPECS_DIR, WORKTREES_DIR
+from .git_preflight import GitPreflightError
 from .vcs import get_vcs
 from specify_cli.ownership.models import ExecutionMode
 from specify_cli.ownership.workspace_strategy import create_planning_workspace
@@ -239,6 +240,111 @@ def create_wp_workspace(
     return workspace_path
 
 
+def _existing_worktree_is_valid(worktree_path: Path) -> bool:
+    """Return True when an existing path is a usable git worktree.
+
+    Prefers the VCS abstraction's ``is_repo`` check and falls back to a simple
+    ``.git`` marker probe when the abstraction is unavailable or errors. A valid
+    git worktree has ``.git`` as a file (pointing to the main repo) or directory
+    (standalone repo).
+    """
+    is_valid_workspace = False
+    try:
+        vcs = get_vcs(worktree_path)
+        is_valid_workspace = vcs.is_repo(worktree_path)
+    except Exception:
+        logger.debug("VCS check failed for %s, falling back to .git marker", worktree_path, exc_info=True)
+
+    if not is_valid_workspace:
+        git_marker = worktree_path / ".git"
+        is_valid_workspace = git_marker.exists()
+    return is_valid_workspace
+
+
+def _create_workspace_with_fallback(
+    repo_root: Path, worktree_path: Path, branch_name: str
+) -> None:
+    """Create the worktree via the VCS abstraction, falling back to direct git.
+
+    Get VCS implementation and create the workspace (full checkout, no sparse
+    exclusions). Deterministic preflight failures re-raise without attempting
+    the legacy direct-git fallback (it would hit the same blocking condition);
+    non-deterministic ones raise ``RuntimeError`` or trigger the git fallback.
+    """
+    try:
+        vcs = get_vcs(repo_root)
+        result = vcs.create_workspace(
+            workspace_path=worktree_path,
+            workspace_name=branch_name,
+            repo_root=repo_root,
+        )
+
+        if not result.success:
+            # Always construct the typed error first so we can branch on
+            # ``exc.is_deterministic`` — the canonical API (NFR-007).
+            # Deterministic failures (untrusted repo, missing repo,
+            # worktree-enumeration) cannot be recovered by the legacy
+            # direct-git fallback; non-deterministic ones raise RuntimeError.
+            exc = GitPreflightError(
+                f"Failed to create workspace: {result.error}",
+                error_code=result.error_code or "",
+            )
+            if exc.is_deterministic:
+                raise exc
+            raise RuntimeError(f"Failed to create workspace: {result.error}")
+
+    except GitPreflightError:
+        # Deterministic preflight failure — re-raise without attempting the
+        # legacy direct-git fallback (it would hit the same blocking condition).
+        raise
+    except Exception as e:
+        # If VCS abstraction fails, fall back to direct git command with warning
+        warnings.warn(
+            f"VCS abstraction failed ({type(e).__name__}: {e}); falling back to direct git commands. See: VCS abstraction layer documentation",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        try:
+            subprocess.run(
+                ["git", "worktree", "add", str(worktree_path), "-b", branch_name],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.CalledProcessError as git_error:
+            raise RuntimeError(f"Failed to create workspace: {git_error.stderr}") from git_error
+
+
+def _compose_worktree_feature_dir(worktree_path: Path, branch_name: str) -> Path:
+    """Compose the feature-directory path inside a lane worktree (C-PLACEMENT / FR-002).
+
+    Single canonical seam for the ``worktree_path / kitty-specs / <dir>``
+    placement join.  ``branch_name`` MUST come from the ``mission_dir_name``
+    naming seam (``specify_cli.lanes.branch_naming.mission_dir_name``) —
+    **never** re-derived inline.  The on-disk placement path is therefore
+    determined once, here, and is byte-identical across the reuse arm and
+    the create arm (NFR-004 / idempotency).
+
+    This seam is aligned with the factory placement projection
+    (``mission_runtime.resolution.resolve_placement_only``) as the write-side
+    canonical authority (D-12): read and write both resolve placement from the
+    same naming seam rather than from ad-hoc inline joins.
+
+    Args:
+        worktree_path: The root of the lane worktree
+            (``repo_root / .worktrees / <branch_name>``).
+        branch_name: The worktree directory name produced by
+            ``mission_dir_name(mission_slug, mid8=...)``.
+
+    Returns:
+        The ``kitty-specs/<branch_name>`` directory path inside the worktree.
+    """
+    return worktree_path / str(KITTY_SPECS_DIR) / branch_name
+
+
 def create_feature_worktree(
     repo_root: Path,
     mission_slug: str,
@@ -282,10 +388,16 @@ def create_feature_worktree(
             "`spec-kitty migrate backfill-identity` first."
         )
 
-    from specify_cli.lanes.branch_naming import mid8, strip_numeric_prefix
+    from specify_cli.lanes.branch_naming import mission_dir_name, resolve_mid8
 
-    human_slug = strip_numeric_prefix(mission_slug)
-    branch_name = f"{human_slug}-{mid8(mission_id)}"
+    # resolve_mid8 derives the mid8 from the declared mission_id (authoritative,
+    # FR-004/NFR-003); mission_dir_name composes <human-slug>-<mid8> canonically,
+    # stripping any NNN- prefix.  The mid8 derivation MOVES here — it is not
+    # removed — so the compose is byte-identical to the prior inline f-string.
+    branch_name = mission_dir_name(
+        mission_slug,
+        mid8=resolve_mid8("", mission_id=mission_id),
+    )
 
     # Create worktree at .worktrees/<human-slug>-<mid8>
     worktree_path = repo_root / WORKTREES_DIR / branch_name
@@ -295,74 +407,20 @@ def create_feature_worktree(
 
     # Check if worktree already exists
     if worktree_path.exists():
-        # Check if it's a valid workspace using VCS abstraction
-        is_valid_workspace = False
-        try:
-            vcs = get_vcs(worktree_path)
-            is_valid_workspace = vcs.is_repo(worktree_path)
-        except Exception:
-            logger.debug("VCS check failed for %s, falling back to .git marker", worktree_path, exc_info=True)
-
-        # If VCS says no (or failed), fall back to simple git check
-        # A valid git worktree has .git as a file (pointing to main repo)
-        # or as a directory (standalone repo)
-        if not is_valid_workspace:
-            git_marker = worktree_path / ".git"
-            is_valid_workspace = git_marker.exists()
-
-        if is_valid_workspace:
-            feature_dir = worktree_path / KITTY_SPECS_DIR / branch_name
+        if _existing_worktree_is_valid(worktree_path):
+            feature_dir = _compose_worktree_feature_dir(worktree_path, branch_name)
             return (worktree_path, feature_dir)
-
         raise FileExistsError(f"Worktree path already exists: {worktree_path}")
 
-    # Get VCS implementation and create workspace (full checkout, no sparse exclusions)
-    try:
-        vcs = get_vcs(repo_root)
-        result = vcs.create_workspace(
-            workspace_path=worktree_path,
-            workspace_name=branch_name,
-            repo_root=repo_root,
-        )
-
-        if not result.success:
-            raise RuntimeError(f"Failed to create workspace: {result.error}")
-
-    except Exception as e:
-        deterministic_preflight_markers = (
-            "Git repository check failed:",
-            "Git rejected repository ownership trust",
-            "Git worktree discovery failed:",
-        )
-        if any(marker in str(e) for marker in deterministic_preflight_markers):
-            raise
-
-        # If VCS abstraction fails, fall back to direct git command with warning
-        warnings.warn(
-            f"VCS abstraction failed ({type(e).__name__}: {e}); falling back to direct git commands. See: VCS abstraction layer documentation",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        try:
-            subprocess.run(
-                ["git", "worktree", "add", str(worktree_path), "-b", branch_name],
-                cwd=repo_root,
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except subprocess.CalledProcessError as git_error:
-            raise RuntimeError(f"Failed to create workspace: {git_error.stderr}") from git_error
+    _create_workspace_with_fallback(repo_root, worktree_path, branch_name)
 
     # FR-016 (WP07): write ``.spec-kitty/`` to the per-worktree exclude file so
     # git never surfaces spec-kitty's own runtime-state directory as drift in
     # the lane worktree. Invoked once, immediately after the worktree exists.
     _ensure_spec_kitty_exclude(worktree_path)
 
-    # Create feature directory structure
-    feature_dir = worktree_path / KITTY_SPECS_DIR / branch_name
+    # Create feature directory structure (FR-002 / C-PLACEMENT)
+    feature_dir = _compose_worktree_feature_dir(worktree_path, branch_name)
     feature_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup feature directory (symlinks, subdirectories, etc.)

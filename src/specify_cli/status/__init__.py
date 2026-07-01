@@ -32,6 +32,7 @@ from .reducer import (
     reduce,
 )
 from .store import (
+    is_retrospective_lifecycle_event,
     EVENTS_FILENAME,
     EventPersistenceError,
     StoreError,
@@ -70,16 +71,19 @@ from .emit import (
 )
 from .wp_metadata import (
     WPMetadata,
+    _Builder,
     read_wp_frontmatter,
 )
 from .lane_reader import (
     CanonicalStatusNotFoundError,
+    LEGACY_UNINITIALIZED_SENTINEL,
     get_all_wp_lanes,
     get_wp_lane,
     has_event_log,
 )
 from .views import (
     generate_status_view,
+    git_operation_in_progress,
     materialize_if_stale,
     write_derived_views,
 )
@@ -93,17 +97,20 @@ from .progress import (
     generate_progress_json,
 )
 from .adapters import (
+    fire_dossier_sync,
     fire_saas_fanout,
     register_dossier_sync_handler,
     register_lifecycle_saas_fanout_handler,
     register_saas_fanout_handler,
 )
 from .bootstrap import (
+    BootstrapResult,
     bootstrap_canonical_state,
 )
 from .event_log_merge import (
     EventLogMergeError,
     merge_event_log_files,
+    merge_event_log_texts,
 )
 from .identity_audit import (
     IdentityState,
@@ -128,6 +135,7 @@ from .lifecycle import (
     MissionLifecycleResult,
     derive_mission_lifecycle,
     generate_lifecycle_json,
+    is_mission_completed,
 )
 from .validate import (
     ValidationResult,
@@ -152,14 +160,20 @@ from .lifecycle_events import (
     SPECIFY_STARTED,
     TASKS_COMPLETED,
     TASKS_STARTED,
+    MissionNotCompletedError,
     build_saas_lifecycle_queue_event,
     emit_artifact_phase,
+    emit_follow_up_recorded,
     emit_mission_created_local,
+    emit_mission_reopened,
     emit_project_initialized,
     emit_reviewer_self_approval,
     emit_wp_created_local,
     has_non_bootstrap_status_history,
     repo_root_for_lifecycle_log,
+)
+from .views import (
+    format_post_mission_events,
 )
 from .work_package_lifecycle import (
     WorkPackageClaimConflict,
@@ -170,13 +184,21 @@ from .work_package_lifecycle import (
 from .doctor import (
     run_doctor,
 )
+from .doctor_husks import (
+    WORKTREES_DIRNAME,
+    RegisteredWorktreePaths,
+    WorkspaceHuskRegistrationError,
+    fix_workspace_husks,
+    registered_worktree_paths,
+    scan_workspace_husks,
+)
 
 
 def uninitialized_status_error(mission_slug: str, wp_id: str, feature_dir: Path) -> str:
     """Return the cycle-aware missing-status message without eager dependency-graph imports."""
     from .uninitialized_hint import uninitialized_status_error as _uninitialized_status_error
 
-    return _uninitialized_status_error(mission_slug, wp_id, feature_dir)
+    return str(_uninitialized_status_error(mission_slug, wp_id, feature_dir))
 
 # The canonical status artifacts (event log + snapshot). On coordination-topology
 # missions these are owned by the transactional status emitter on the coordination
@@ -205,22 +227,28 @@ __all__ = [
     "SPECIFY_STARTED",
     "TASKS_COMPLETED",
     "TASKS_STARTED",
+    "MissionNotCompletedError",
     "TransitionRequest",
     "WorkPackageClaimConflict",
     "WorkPackageStartRejected",
     "build_saas_lifecycle_queue_event",
     "emit_artifact_phase",
+    "emit_follow_up_recorded",
     "emit_mission_created_local",
+    "emit_mission_reopened",
     "emit_project_initialized",
     "emit_reviewer_self_approval",
     "emit_wp_created_local",
+    "format_post_mission_events",
     "has_non_bootstrap_status_history",
+    "is_retrospective_lifecycle_event",
     "materialize_snapshot",
     "repo_root_for_lifecycle_log",
     "run_doctor",
     "start_implementation_status",
     "start_review_status",
     "CanonicalStatusNotFoundError",
+    "LEGACY_UNINITIALIZED_SENTINEL",
     "DEFAULT_LANE_WEIGHTS",
     "DERIVED_LIFECYCLE_FILENAME",
     "InvalidTransitionError",
@@ -239,6 +267,7 @@ __all__ = [
     "derive_mission_lifecycle",
     "generate_lifecycle_json",
     "generate_progress_json",
+    "is_mission_completed",
     "materialize_if_stale",
     "CANONICAL_LANES",
     "DoneEvidence",
@@ -259,7 +288,12 @@ __all__ = [
     "ULID_PATTERN",
     "ValidationResult",
     "VerificationResult",
+    "WORKTREES_DIRNAME",
+    "RegisteredWorktreePaths",
+    "WorkspaceHuskRegistrationError",
     "WPMetadata",
+    "_Builder",
+    "BootstrapResult",
     "audit_repo",
     "append_event",
     "bootstrap_canonical_state",
@@ -267,8 +301,10 @@ __all__ = [
     "feature_status_lock",
     "find_ambiguous_selectors",
     "find_duplicate_prefixes",
+    "fix_workspace_husks",
     "is_dossier_snapshot",
     "merge_event_log_files",
+    "merge_event_log_texts",
     "register_dossier_sync_handler",
     "register_lifecycle_saas_fanout_handler",
     "register_saas_fanout_handler",
@@ -282,10 +318,12 @@ __all__ = [
     "generate_status_view",
     "get_all_wp_lanes",
     "get_wp_lane",
+    "git_operation_in_progress",
     "has_event_log",
     "is_terminal",
     "materialize",
     "materialize_to_json",
+    "fire_dossier_sync",
     "fire_saas_fanout",
     "read_events",
     "read_events_from_text",
@@ -300,5 +338,7 @@ __all__ = [
     "validate_transition",
     "validate_transition_legality",
     "wp_state_for",
+    "registered_worktree_paths",
+    "scan_workspace_husks",
     "write_derived_views",
 ]

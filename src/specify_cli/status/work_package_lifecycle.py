@@ -7,7 +7,6 @@ creation stays with the caller; durable lane transitions live here.
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,11 +52,15 @@ class WorkPackageStartResult:
 
 
 def _repo_root_for_lock(feature_dir: Path, repo_root: Path | None) -> Path:
-    if repo_root is not None:
-        return repo_root
-    if feature_dir.parent.name == KITTY_SPECS_DIR:
-        return feature_dir.parent.parent
-    return feature_dir
+    """Resolve the repo root used for per-feature status locking.
+
+    Thin shim — delegates to the single shared implementation in
+    :func:`specify_cli.workspace.root_resolver.resolve_status_lock_root`
+    (WP02 / SC-002 consolidation).
+    """
+    from specify_cli.workspace.root_resolver import resolve_status_lock_root
+
+    return resolve_status_lock_root(feature_dir, repo_root)
 
 
 def _actor_key(actor: object | None) -> str | None:

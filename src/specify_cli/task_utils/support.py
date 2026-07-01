@@ -3,16 +3,15 @@
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from specify_cli.core.paths import get_main_repo_root, locate_project_root
-from specify_cli.legacy_detector import is_legacy_format
+from specify_cli.mission_metadata import load_meta as _load_meta_canonical
 
 # Canonical lane tuple — imported from the leaf module to avoid pulling in the
 # full status orchestration package during cold command imports.
@@ -300,13 +299,17 @@ def locate_work_package(repo_root: Path, feature: str, wp_id: str) -> WorkPackag
     Legacy format: WP files in tasks/{lane}/ subdirectories
     New format: WP files in flat tasks/ directory with lane in frontmatter
     """
+    from mission_runtime import MissionArtifactKind
     from specify_cli.core.paths import get_main_repo_root
-    from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_slug
+    from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
 
-    # Always use main repo's kitty-specs - it's the source of truth
-    # This fixes the bug where worktree's stale kitty-specs/ would be used
+    # Always use main repo's kitty-specs - it's the source of truth.
+    # Route through the seam (WORK_PACKAGE_TASK) so tasks/ reads resolve to the
+    # primary checkout under coord topology (coord husk carries STATUS only).
     main_root = get_main_repo_root(repo_root)
-    feature_path = resolve_feature_dir_for_slug(main_root, feature)
+    feature_path = resolve_planning_read_dir(
+        main_root, feature, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
 
     tasks_root = feature_path / "tasks"
     if not tasks_root.exists():
@@ -317,27 +320,17 @@ def locate_work_package(repo_root: Path, feature: str, wp_id: str) -> WorkPackag
     # Does NOT match: WP04b.md, WP04b-something.md
     wp_pattern = re.compile(rf"^{re.escape(wp_id)}(?:[-_.]|\.md$)")
 
-    use_legacy = is_legacy_format(feature_path)
     candidates = []
 
-    if use_legacy:
-        # Legacy format: search lane subdirectories
-        for lane_dir in tasks_root.iterdir():
-            if not lane_dir.is_dir():
-                continue
-            lane = lane_dir.name
-            for path in lane_dir.rglob("*.md"):
-                if wp_pattern.match(path.name):
-                    candidates.append((lane, path, lane_dir))
-    else:
-        # New format: search flat tasks/ directory
-        for path in tasks_root.glob("*.md"):
-            if path.name.lower() == "readme.md":
-                continue
-            if wp_pattern.match(path.name):
-                # Get lane from frontmatter
-                lane = get_lane_from_frontmatter(path, warn_on_missing=False)
-                candidates.append((lane, path, tasks_root))
+    # Flat-layout only: search flat tasks/ directory (lane from frontmatter).
+    # The boundary guard (WP02) prevents pre-3.0 projects from reaching here.
+    for path in tasks_root.glob("*.md"):
+        if path.name.lower() == "readme.md":
+            continue
+        if wp_pattern.match(path.name):
+            # Get lane from frontmatter
+            lane = get_lane_from_frontmatter(path, warn_on_missing=False)
+            candidates.append((lane, path, tasks_root))
 
     if not candidates:
         raise TaskCliError(f"Work package '{wp_id}' not found under kitty-specs/{feature}/tasks.")
@@ -361,10 +354,44 @@ def locate_work_package(repo_root: Path, feature: str, wp_id: str) -> WorkPackag
 
 
 def load_meta(meta_path: Path) -> dict[str, Any]:
-    if not meta_path.exists():
-        raise TaskCliError(f"Meta file not found at {meta_path}")
-    data = json.loads(meta_path.read_text(encoding="utf-8-sig"))
-    return cast(dict[str, Any], data) if isinstance(data, dict) else {}
+    """Load ``meta.json`` from *meta_path* (path-signature adapter; NOT canonical).
+
+    The CANONICAL meta-reader authority is
+    :func:`specify_cli.mission_metadata.load_meta` (imported here as
+    ``_load_meta_canonical``).  This function is a thin **adapter** retained only
+    for its distinct calling convention -- it takes the ``meta.json`` *file path*
+    (not the parent dir) and translates the canonical
+    :class:`FileNotFoundError` into a :class:`TaskCliError` for the task CLI.  It
+    delegates entirely to the canonical reader and adds no parallel contract
+    (FR-009 / SC-004: the canonical authority is unambiguous -- this is an
+    adapter, not a fork).
+
+    Preserves the original contract: missing → :class:`TaskCliError`,
+    malformed JSON → :class:`ValueError` (behavior-neutral; original raised
+    ``json.JSONDecodeError``, which ``ValueError`` wraps via the canonical reader).
+    BOM-tolerant (``utf-8-sig`` encoding).
+
+    Args:
+        meta_path: Path to the ``meta.json`` file (not the parent directory).
+
+    Raises:
+        TaskCliError: When ``meta_path`` does not exist.
+        ValueError: When ``meta_path`` contains malformed JSON or a non-object
+            top level.
+    """
+    try:
+        result = _load_meta_canonical(
+            meta_path.parent,
+            allow_missing=False,
+            on_malformed="raise",
+            encoding="utf-8-sig",
+        )
+    except FileNotFoundError as exc:
+        raise TaskCliError(f"Meta file not found at {meta_path}") from exc
+    # allow_missing=False raises on missing; on_malformed="raise" raises on bad
+    # JSON — so result is always a dict here.  ``or {}`` narrows ``| None`` for
+    # the type checker without an assert that ``-O`` would strip.
+    return result or {}
 
 
 def get_lane_from_frontmatter(wp_path: Path, warn_on_missing: bool = True) -> str:  # noqa: ARG001
@@ -411,7 +438,8 @@ __all__ = [
     "find_repo_root",
     "get_lane_from_frontmatter",
     "git_status_lines",
-    "is_legacy_format",
+    # Path-signature adapter over the canonical mission_metadata.load_meta
+    # (FR-009 / SC-004) -- not a parallel authority; see its docstring.
     "load_meta",
     "locate_work_package",
     "match_frontmatter_line",

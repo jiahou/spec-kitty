@@ -11,8 +11,9 @@ Usage:
 
 from __future__ import annotations
 
-from specify_cli.missions.feature_dir_resolver import candidate_feature_dir_for_mission
+from specify_cli.missions._read_path_resolver import candidate_feature_dir_for_mission
 import logging
+import os
 import threading
 import json
 import urllib.parse
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 _emitter: EventEmitter | None = None
 _lock = threading.Lock()
 logger = logging.getLogger(__name__)
+READ_ONLY_IDENTITY_ENV = "SPEC_KITTY_SYNC_READONLY_IDENTITY"
 
 
 def _resolve_repo_root() -> Path | None:
@@ -154,41 +156,80 @@ def _publish_event_via_sync_daemon(event: dict[str, Any], repo_root: Path | None
         logger.debug("Sync daemon publish skipped: %s", exc)
 
 
-def get_emitter() -> EventEmitter:
+def _read_only_identity_requested(value: bool | None) -> bool:
+    if value is not None:
+        return value
+    return os.environ.get(READ_ONLY_IDENTITY_ENV) == "1"
+
+
+def _seed_emitter_identity(
+    emitter: EventEmitter,
+    repo_root: Path,
+) -> None:
+    """Seed emitter identity and git resolver.
+
+    Identity is always resolved WITHOUT persisting (#2263, FR-001/FR-002/FR-003):
+    status-event emission is a read/emit path and must never dirty
+    ``.kittify/config.yaml``. Identity is resolved in-memory via ``resolve_identity``;
+    persisting a minted identity is the job of write-authorized boundaries (``init``).
+    """
+    try:
+        from specify_cli.identity.project import resolve_identity
+
+        identity = resolve_identity(repo_root)
+    except Exception as exc:
+        logger.warning("Could not resolve identity: %s", exc)
+        return
+
+    emitter._identity = identity
+    try:
+        from .git_metadata import GitMetadataResolver
+
+        emitter._git_resolver = GitMetadataResolver(
+            repo_root=repo_root,
+            repo_slug_override=identity.repo_slug,
+        )
+    except Exception as exc:
+        logger.debug("Could not pre-seed git resolver: %s", exc)
+
+
+def get_emitter(*, read_only_identity: bool | None = None) -> EventEmitter:
     """Get the singleton EventEmitter instance.
 
     Thread-safe via double-checked locking pattern.
     Lazily initializes on first access.
 
-    Also ensures project identity exists before creating the emitter,
-    logging a warning (but not failing) if identity can't be resolved.
+    Emitter initialization is side-effect-free (#2263, FR-001/FR-003): incomplete
+    project identity is resolved in-memory via ``resolve_identity`` — never persisted
+    to ``.kittify/config.yaml`` — so status-event emission, a read/emit path, leaves
+    the working tree clean. WP01's deterministic ``build_id`` derivation keeps the
+    resolved project_uuid/build_id provenance stable across calls. The
+    ``read_only_identity`` flag / ``SPEC_KITTY_SYNC_READONLY_IDENTITY`` env still
+    gates whether an already-initialized emitter is re-seeded on subsequent calls,
+    but no longer selects a writing branch. Persisting a minted identity is the job
+    of write-authorized boundaries (``init``).
     """
     global _emitter
+    use_read_only_identity = _read_only_identity_requested(read_only_identity)
+    repo_root = _resolve_repo_root()
     if _emitter is None:
         with _lock:
             if _emitter is None:
-                repo_root = _resolve_repo_root()
-
-                # Ensure identity exists before creating emitter
-                try:
-                    from specify_cli.identity.project import ensure_identity
-
-                    if repo_root is not None:
-                        ensure_identity(repo_root)
-                    else:
-                        logger.debug("Non-project context; identity will be empty")
-                except Exception as e:
-                    logger.warning(f"Could not ensure identity: {e}")
-
                 from .emitter import EventEmitter
 
                 _emitter = EventEmitter()
+                if repo_root is not None:
+                    _seed_emitter_identity(_emitter, repo_root)
+                else:
+                    logger.debug("Non-project context; identity will be empty")
                 try:
                     from .runtime import get_runtime
 
                     get_runtime().attach_emitter(_emitter)
                 except Exception as exc:
                     logger.warning("Could not attach emitter to sync runtime: %s", exc)
+    elif not use_read_only_identity and repo_root is not None:
+        _seed_emitter_identity(_emitter, repo_root)
     return _emitter
 
 

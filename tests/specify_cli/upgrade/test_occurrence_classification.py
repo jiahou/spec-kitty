@@ -21,8 +21,7 @@ from specify_cli.upgrade.skill_update import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
-pytestmark = [pytest.mark.unit]
-
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 # The software-dev command templates were migrated from
 # ``src/specify_cli/missions/<type>/command-templates/`` to the canonical doctrine
 # mission-steps structure. The implement step's bulk-edit safety / occurrence
@@ -41,17 +40,18 @@ IMPLEMENT_TEMPLATE_PATH = (
 
 @pytest.fixture()
 def sample_file(tmp_path: Path) -> Path:
-    """Create a simple text file for replacement tests."""
-    p = tmp_path / "sample.txt"
+    """Create a simple skill-root text file for replacement tests."""
+    p = tmp_path / ".claude" / "skills" / "demo-skill" / "sample.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("hello world\nfoo bar baz\n", encoding="utf-8")
     return p
 
 
 @pytest.fixture()
 def kittify_file(tmp_path: Path) -> Path:
-    """Create a file inside a .kittify directory."""
-    d = tmp_path / ".kittify"
-    d.mkdir()
+    """Create a skill-root file inside a .kittify directory."""
+    d = tmp_path / ".claude" / "skills" / "demo-skill" / ".kittify"
+    d.mkdir(parents=True)
     p = d / "config.yaml"
     p.write_text("old_term: value\n", encoding="utf-8")
     return p
@@ -89,9 +89,18 @@ class TestApplyTextReplacementsNoFilter:
         assert "qux bar baz" in content
 
     def test_handles_missing_file(self, tmp_path: Path) -> None:
-        missing = tmp_path / "does_not_exist.txt"
+        missing = tmp_path / ".claude" / "skills" / "demo-skill" / "does_not_exist.txt"
         result = apply_text_replacements(missing, [("a", "b")])
         assert result is False
+
+    def test_rejects_non_skill_root_path(self, tmp_path: Path) -> None:
+        other = tmp_path / "outside.txt"
+        other.write_text("hello world\n", encoding="utf-8")
+
+        result = apply_text_replacements(other, [("hello", "goodbye")])
+
+        assert result is False
+        assert other.read_text(encoding="utf-8") == "hello world\n"
 
 
 class TestApplyTextReplacementsWithFilter:
@@ -130,7 +139,7 @@ class TestApplyTextReplacementsWithFilter:
 
     def test_filter_skips_before_reading(self, tmp_path: Path) -> None:
         """If the filter rejects, the file is never opened (even if missing)."""
-        missing = tmp_path / "no_such_file.txt"
+        missing = tmp_path / ".claude" / "skills" / "demo-skill" / "no_such_file.txt"
         result = apply_text_replacements(
             missing,
             [("a", "b")],

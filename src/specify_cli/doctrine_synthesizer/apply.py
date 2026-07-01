@@ -25,7 +25,8 @@ Source-of-truth:
 from __future__ import annotations
 
 from specify_cli.core.constants import KITTY_SPECS_DIR
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_mission
+from specify_cli.lanes.branch_naming import resolve_mid8
+from specify_cli.missions._read_path_resolver import resolve_feature_dir_for_mission
 import json
 import logging
 from pathlib import Path
@@ -742,7 +743,7 @@ def _apply_one(
             feature_dir=feature_dir,
             mission_slug=mission_slug,
             mission_id=mission_id,
-            mid8=mission_id[:8],
+            mid8=resolve_mid8(mission_slug, mission_id=mission_id),
             actor=actor,
             event_name="retrospective.proposal.applied",
             payload=ProposalAppliedPayload(
@@ -828,7 +829,7 @@ def _emit_conflict_rejections(
             feature_dir=feature_dir,
             mission_slug=mission_slug,
             mission_id=mission_id,
-            mid8=mission_id[:8],
+            mid8=resolve_mid8(mission_slug, mission_id=mission_id),
             actor=actor,
             event_name="retrospective.proposal.rejected",
             payload=ProposalRejectedPayload(

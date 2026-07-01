@@ -28,7 +28,11 @@ from specify_cli.context.store import save_context
 from specify_cli.lanes.branch_naming import lane_branch_name
 from specify_cli.lanes.persistence import require_lanes_json
 from specify_cli.mission_metadata import mission_identity_fields
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_mission
+from mission_runtime import MissionArtifactKind
+from specify_cli.missions._read_path_resolver import (
+    resolve_feature_dir_for_mission,
+    resolve_planning_read_dir,
+)
 from specify_cli.status import WPMetadata, read_wp_frontmatter
 
 
@@ -127,7 +131,10 @@ def resolve_context(
 
     Args:
         wp_code: Work package display alias (e.g., "WP01").
-        mission_slug: Feature slug (e.g., "057-canonical-context-architecture-cleanup").
+        mission_slug: Mission handle (full slug such as
+            "057-canonical-context-architecture-cleanup", bare mid8, or
+            numeric prefix). Canonicalized to the resolved mission
+            directory name before anything is composed or persisted (F-001).
         agent: Name of the agent creating this context.
         repo_root: Absolute path to the repository root.
 
@@ -155,15 +162,44 @@ def resolve_context(
     # 1. Read project_uuid
     project_uuid = _read_project_uuid(repo_root)
 
-    # 2. Locate feature directory
+    # 2. Locate feature directory — primary-anchor pattern (implement.py:1018).
+    # ``resolve_feature_dir_for_mission`` is coord-aware: it resolves the
+    # canonical directory for F-001 slug canonicalization. Reads that follow
+    # (meta.json, WP frontmatter, lanes.json) are PRIMARY-partition artifacts
+    # and are routed through ``resolve_planning_read_dir`` so they are
+    # topology-blind (C-007: no consolidation of the coord-aware resolver).
     try:
-        feature_dir = resolve_feature_dir_for_mission(repo_root, mission_slug)
+        _canon_dir = resolve_feature_dir_for_mission(repo_root, mission_slug)
     except ActionContextError as exc:
+        # FR-001 / M1 (T038): preserve the resolver's typed read-path signal
+        # instead of flattening it into "Check that the mission slug is correct."
+        # The resolver produces a precise code (e.g. COORDINATION_BRANCH_DELETED /
+        # STATUS_READ_PATH_NOT_FOUND) plus the real read-path remediation; a
+        # generic "check the slug" mis-routes the operator (the mission is not
+        # missing — its read path is broken). Mirror the agent/context.py
+        # translation: carry ``exc.code`` + the resolver message through verbatim.
         msg = (
-            f"Feature directory not found for '{mission_slug}'. "
-            "Check that the mission slug is correct."
+            f"[{exc.code}] Read path could not be resolved for mission "
+            f"'{mission_slug}'. {exc}"
         )
         raise FeatureNotFoundError(msg) from exc
+
+    # F-001 boundary canonicalization (the finalize-tasks pattern): the
+    # caller-supplied ``mission_slug`` is an operator HANDLE (full slug, bare
+    # mid8, numeric prefix). The directory resolution above already
+    # canonicalized it, so key everything composed and persisted downstream —
+    # the lane-branch ``authoritative_ref`` (``lane_branch_name``) and the
+    # MissionContext token fields — by the resolved directory name, never the
+    # raw handle. A raw mid8 here composes a wrong-but-plausible
+    # ``kitty/mission-<mid8>-…`` ref and persists a raw ``mission_slug``.
+    mission_slug = _canon_dir.name
+
+    # Route all PRIMARY-partition reads (meta.json, WP frontmatter) through the
+    # seam so they always resolve to the primary checkout under coord topology
+    # (coord husk carries STATUS events only, not planning artifacts).
+    feature_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
     if not feature_dir.exists():
         msg = f"Feature directory not found: {feature_dir}. Check that '{mission_slug}' is the correct feature slug."
         raise FeatureNotFoundError(msg)
@@ -183,11 +219,16 @@ def resolve_context(
     # Compute authoritative_ref: uniform lane lookup for ALL WPs (including planning_artifact).
     # After T010, planning_artifact WPs are assigned to the "lane-planning" lane in lanes.json.
     # lane_branch_name() returns target_branch for lane-planning (T011).
+    # lanes.json is LANE_STATE (PRIMARY-partition) — use its truthful kind so a
+    # future LANE_STATE re-partition does not silently misroute.
     target_branch = meta["target_branch"]
-    lane = require_lanes_json(feature_dir).lane_for_wp(wp_code)
+    _lanes_dir = resolve_planning_read_dir(
+        repo_root, mission_slug, kind=MissionArtifactKind.LANE_STATE
+    )
+    lane = require_lanes_json(_lanes_dir).lane_for_wp(wp_code)
     if lane is None:
         msg = (
-            f"WP {wp_code!r} has no lane assignment in {feature_dir / 'lanes.json'}. "
+            f"WP {wp_code!r} has no lane assignment in {_lanes_dir / 'lanes.json'}. "
             f"Run 'spec-kitty agent mission finalize-tasks --mission {mission_slug}' "
             f"to compute lanes."
         )

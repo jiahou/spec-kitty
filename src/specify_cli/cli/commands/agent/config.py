@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -16,12 +17,26 @@ from specify_cli.core.agent_config import (
     AgentConfig,
     AgentConfigError,
 )
+from specify_cli.core.utils import write_text_within_directory
 from specify_cli.runtime.agent_commands import get_global_command_dir
+from specify_cli.session_presence.hooks.claude_code_hook import ClaudeCodeHookRegistrar
 from specify_cli.upgrade.migrations.m_0_9_1_complete_lane_migration import (
     AGENT_DIR_TO_KEY,
     CompleteLaneMigration,
 )
+from specify_cli.skills._agent_roster import SUPPORTED_AGENTS as _SKILL_ONLY_ROSTER
 from specify_cli.task_utils import find_repo_root
+
+from .surface_presence import SurfacePresenceIndex
+
+#: Command wired into harness post-edit hooks when ``lint_on_edit`` is enabled.
+#: It takes no path argument — the edited file is delivered on stdin by the
+#: harness and resolved by ``spec-kitty lint`` (see lint.py).
+LINT_HOOK_COMMAND = "spec-kitty lint --json"
+#: Claude PostToolUse matcher scoping the hook to file-editing tools.
+LINT_HOOK_MATCHER = "Edit|Write"
+_ENABLED_LABEL = "[green]enabled[/green]"
+_DISABLED_LABEL = "[yellow]disabled[/yellow]"
 
 app = typer.Typer(
     name="config",
@@ -36,7 +51,11 @@ KEY_TO_AGENT_DIR = {
     for agent_dir, subdir in CompleteLaneMigration.AGENT_DIRS
     if agent_dir in AGENT_DIR_TO_KEY
 }
-SKILL_ONLY_AGENTS = {"codex", "vibe", "pi", "letta"}
+#: Derived from the single roster authority (#1941); no standalone literal
+#: tool-universe lives here. Patching ``_agent_roster.SUPPORTED_AGENTS`` and
+#: reloading this module flows straight through to ``SKILL_ONLY_AGENTS`` and the
+#: ``VALID_AGENTS`` union.
+SKILL_ONLY_AGENTS = set(_SKILL_ONLY_ROSTER)
 GLOBAL_COMMAND_AGENTS = frozenset(AGENT_COMMAND_CONFIG)
 VALID_AGENTS = set(AGENT_DIR_TO_KEY.values()) | SKILL_ONLY_AGENTS
 
@@ -51,21 +70,35 @@ def _display_path(path: Path) -> str:
     return label.rstrip("/") + "/"
 
 
-def _agent_location(repo_root: Path, agent_key: str) -> tuple[Path | None, str, bool]:
-    """Return the managed command/skill location for an agent."""
+def _agent_location(
+    repo_root: Path,
+    agent_key: str,
+    presence: SurfacePresenceIndex | None = None,
+) -> tuple[Path | None, str, bool]:
+    """Return the managed command/skill location for an agent.
+
+    Install state ("does the managed surface exist?") is resolved through the
+    surface contract via ``presence`` when supplied, so ``agent config`` no
+    longer recomputes its own per-agent existence probe. The *labels* below stay
+    owned here because they are part of the frozen ``agent config`` interface.
+    """
+
+    def _exists(path: Path) -> bool:
+        return presence.exists(agent_key) if presence is not None else path.exists()
+
     if agent_key in GLOBAL_COMMAND_AGENTS:
         path = get_global_command_dir(agent_key)
-        return path, f"{_display_path(path)} (global)", path.exists()
+        return path, f"{_display_path(path)} (global)", _exists(path)
 
     if agent_key in SKILL_ONLY_AGENTS:
         path = repo_root / ".agents" / "skills"
-        return path, ".agents/skills/ (project skills)", path.exists()
+        return path, ".agents/skills/ (project skills)", _exists(path)
 
     agent_dir_info = KEY_TO_AGENT_DIR.get(agent_key)
     if agent_dir_info:
         agent_dir, subdir = agent_dir_info
         path = repo_root / agent_dir / subdir
-        return path, f"{agent_dir}/{subdir}/", path.exists()
+        return path, f"{agent_dir}/{subdir}/", _exists(path)
 
     return None, "unknown agent", False
 
@@ -290,15 +323,21 @@ def list_agents():
         console.print("\nRun 'spec-kitty init' or use 'spec-kitty agent config add' to add agents.")
         return
 
+    # Resolve install state through the surface contract (WP07): the plan is the
+    # source of truth for "is this tool's managed surface present?".
+    presence = SurfacePresenceIndex.build(
+        repo_root, config.available, global_command_dir=get_global_command_dir
+    )
+
     # Display configured agents
     console.print("[cyan]Configured agents:[/cyan]")
     for agent_key in config.available:
-        _, location, exists = _agent_location(repo_root, agent_key)
+        _, location, exists = _agent_location(repo_root, agent_key, presence)
         status = "✓" if exists else "⚠"
         console.print(f"  {status} {agent_key} ({location})")
 
     # Show auto-commit setting
-    auto_commit_label = "[green]enabled[/green]" if config.auto_commit else "[yellow]disabled[/yellow]"
+    auto_commit_label = _ENABLED_LABEL if config.auto_commit else _DISABLED_LABEL
     console.print(f"\n[cyan]Auto-commit:[/cyan] {auto_commit_label}")
     if not config.auto_commit:
         console.print("[dim]  Agents will stage changes but not create commits unless explicitly instructed.[/dim]")
@@ -489,8 +528,14 @@ def agent_status():
 
     all_agent_keys = sorted(VALID_AGENTS)
 
+    # Resolve install state through the surface contract (WP07) for every known
+    # tool, so the status table no longer recomputes existence per agent.
+    presence = SurfacePresenceIndex.build(
+        repo_root, all_agent_keys, global_command_dir=get_global_command_dir
+    )
+
     for agent_key in all_agent_keys:
-        _, location, exists_bool = _agent_location(repo_root, agent_key)
+        _, location, exists_bool = _agent_location(repo_root, agent_key, presence)
         configured = "✓" if agent_key in config.available else "✗"
         exists = "✓" if exists_bool else "✗"
 
@@ -540,11 +585,17 @@ def sync_agents(
         "--remove-orphaned/--keep-orphaned",
         help="Remove directories for agents not in config",
     ),
+    sync_hooks: bool = typer.Option(
+        False,
+        "--sync-hooks",
+        help="Update AI harness hook configurations (Claude, Cursor, etc.)",
+    ),
 ):
     """Sync filesystem with config.yaml.
 
     By default, removes orphaned directories (present but not configured).
     Use --create-missing to also create directories for configured agents.
+    Use --sync-hooks to update harness-specific post-edit hooks.
     """
     try:
         repo_root = find_repo_root()
@@ -565,10 +616,119 @@ def sync_agents(
     if create_missing:
         changes_made = _check_or_create_configured_agent_dirs(repo_root, config) or changes_made
 
+    # Sync hooks
+    if sync_hooks:
+        changes_made = _sync_harness_hooks(repo_root, config) or changes_made
+
     if not changes_made:
         console.print("[dim]No changes needed - filesystem matches config[/dim]")
     else:
         console.print("\n[green]✓ Sync complete[/green]")
+
+
+def _parse_bool_value(value: str) -> bool | None:
+    """Parse a CLI boolean string; return None when it is not a valid bool."""
+    lowered = value.lower()
+    if lowered in ("true", "1", "yes", "on"):
+        return True
+    if lowered in ("false", "0", "no", "off"):
+        return False
+    return None
+
+
+def _sync_harness_hooks(repo_root: Path, config: AgentConfig) -> bool:
+    """Update harness hook configurations based on lint_on_edit setting.
+
+    config.yaml is the single source of truth: a harness is synced only when
+    its agent key is in ``config.available`` (a stray ``.claude``/``.cursor``
+    directory never triggers a write — see CLAUDE.md agent-config rules).
+    """
+    console.print("\n[cyan]Syncing harness hooks...[/cyan]")
+    changes = False
+
+    if "claude" in config.available and _sync_claude_hooks(repo_root, config.lint_on_edit):
+        changes = True
+
+    if "cursor" in config.available and _sync_cursor_hooks(repo_root, config.lint_on_edit):
+        changes = True
+
+    return changes
+
+
+def _sync_claude_hooks(repo_root: Path, enabled: bool) -> bool:
+    """Register/unregister the lint PostToolUse hook in .claude/settings.json.
+
+    Delegates to the canonical :class:`ClaudeCodeHookRegistrar`, which writes
+    atomically, preserves all unrelated keys/hooks, removes only the lint hook
+    (never sibling hooks), and backs up invalid JSON before rewriting.
+    """
+    registrar = ClaudeCodeHookRegistrar(event_key="PostToolUse")
+    already = registrar.is_registered(repo_root, LINT_HOOK_COMMAND)
+
+    changed = False
+    if enabled and not already:
+        registrar.register(repo_root, LINT_HOOK_COMMAND, matcher=LINT_HOOK_MATCHER)
+        changed = True
+    elif not enabled and already:
+        registrar.unregister(repo_root, LINT_HOOK_COMMAND)
+        changed = True
+
+    if changed:
+        console.print(f"  [green]✓[/green] {'Updated' if enabled else 'Removed'} Claude Code lint hook")
+    else:
+        console.print("  [dim]• Claude Code hooks already in sync[/dim]")
+    return changed
+
+
+def _load_cursor_hooks(path: Path) -> dict | None:
+    """Load Cursor hooks.json, or ``None`` if it exists but is corrupt.
+
+    A corrupt file returns ``None`` so the caller refuses to overwrite it
+    (no silent data loss); a missing file returns the empty default.
+    """
+    if not path.exists():
+        return {"version": 1, "hooks": {}}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        console.print(
+            f"  [yellow]![/yellow] Cursor hooks file is unreadable ({exc}); "
+            "leaving it untouched. Fix or remove it, then re-run."
+        )
+        return None
+    return loaded if isinstance(loaded, dict) else {"version": 1, "hooks": {}}
+
+
+def _sync_cursor_hooks(repo_root: Path, enabled: bool) -> bool:
+    path = repo_root / ".cursor" / "hooks.json"
+    data = _load_cursor_hooks(path)
+    if data is None:
+        return False  # corrupt config: refuse to clobber
+
+    hooks = data.setdefault("hooks", {})
+    after_file_edit = hooks.get("afterFileEdit", [])
+    existing_idx = next(
+        (i for i, h in enumerate(after_file_edit) if h.get("command") == LINT_HOOK_COMMAND),
+        -1,
+    )
+
+    changed = False
+    if enabled and existing_idx == -1:
+        after_file_edit.append({"command": LINT_HOOK_COMMAND})
+        changed = True
+    elif not enabled and existing_idx != -1:
+        after_file_edit.pop(existing_idx)
+        changed = True
+
+    if changed:
+        hooks["afterFileEdit"] = after_file_edit
+        data["hooks"] = hooks
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_within_directory(path, json.dumps(data, indent=2) + "\n", root=path.parent)
+        console.print(f"  [green]✓[/green] {'Updated' if enabled else 'Removed'} Cursor lint hook")
+    else:
+        console.print("  [dim]• Cursor hooks already in sync[/dim]")
+    return changed
 
 
 @app.command(name="set")
@@ -580,10 +740,11 @@ def set_config(
 
     Currently supported keys:
         auto_commit  - Enable/disable automatic commits by agents (true/false)
+        lint_on_edit - Enable/disable auto-linting feedback loop (true/false)
 
     Examples:
         spec-kitty agent config set auto_commit false
-        spec-kitty agent config set auto_commit true
+        spec-kitty agent config set lint_on_edit true
     """
     try:
         repo_root = find_repo_root()
@@ -594,25 +755,35 @@ def set_config(
     config = _load_config_or_exit(repo_root)
 
     if key == "auto_commit":
-        if value.lower() in ("true", "1", "yes", "on"):
-            config.auto_commit = True
-        elif value.lower() in ("false", "0", "no", "off"):
-            config.auto_commit = False
-        else:
+        parsed = _parse_bool_value(value)
+        if parsed is None:
             console.print(f"[red]Error:[/red] Invalid value for auto_commit: '{value}'. Use 'true' or 'false'.")
             raise typer.Exit(1)
-
+        config.auto_commit = parsed
         save_agent_config(repo_root, config)
 
-        status_label = "[green]enabled[/green]" if config.auto_commit else "[yellow]disabled[/yellow]"
+        status_label = _ENABLED_LABEL if config.auto_commit else _DISABLED_LABEL
         console.print(f"[green]✓[/green] auto_commit set to {status_label}")
         if not config.auto_commit:
             console.print("[dim]Agents will stage changes but not create commits unless explicitly instructed.[/dim]")
             console.print("[dim]Per-command flags (--auto-commit/--no-auto-commit) override this setting.[/dim]")
+    elif key == "lint_on_edit":
+        parsed = _parse_bool_value(value)
+        if parsed is None:
+            console.print(f"[red]Error:[/red] Invalid value for lint_on_edit: '{value}'. Use 'true' or 'false'.")
+            raise typer.Exit(1)
+        config.lint_on_edit = parsed
+        save_agent_config(repo_root, config)
+
+        status_label = _ENABLED_LABEL if config.lint_on_edit else _DISABLED_LABEL
+        console.print(f"[green]✓[/green] lint_on_edit set to {status_label}")
+        if config.lint_on_edit:
+            console.print("[cyan]Tip:[/cyan] Run 'spec-kitty agent config sync --sync-hooks' to update harness configurations.")
     else:
         console.print(f"[red]Error:[/red] Unknown configuration key: '{key}'")
         console.print("\nSupported keys:")
         console.print("  auto_commit  - Enable/disable automatic commits by agents (true/false)")
+        console.print("  lint_on_edit - Enable/disable auto-linting feedback loop (true/false)")
         raise typer.Exit(1)
 
 

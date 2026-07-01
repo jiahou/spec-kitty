@@ -14,11 +14,20 @@ surface; they operate on per-mission metadata, not doctrine mission types.
 
 from __future__ import annotations
 
-from specify_cli.core.constants import KITTY_SPECS_DIR
-from specify_cli.missions.feature_dir_resolver import resolve_feature_dir_for_mission
+import contextlib
 import json
+
+from specify_cli.core.constants import KITTY_SPECS_DIR
+from specify_cli.core.paths import get_main_repo_root
+from specify_cli.lanes.branch_naming import resolve_mid8
+from specify_cli.mission_metadata import load_meta
+from specify_cli.missions._read_path_resolver import (
+    candidate_feature_dir_for_mission,
+    primary_feature_dir_for_mission,
+    resolve_feature_dir_for_mission,
+)
+from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Annotated, Any
 
 import typer
@@ -27,7 +36,6 @@ from rich.table import Table
 from rich.text import Text
 
 from specify_cli.cli.helpers import console, get_project_root_or_exit
-from specify_cli.cli.selector_resolution import resolve_selector
 from specify_cli.mission import (
     Mission,
     MissionError,
@@ -63,24 +71,6 @@ def _resolve_primary_repo_root(project_root: Path) -> Path:
     for segment in parts[1:idx]:
         base /= segment
     return base
-
-
-def _list_active_worktrees(repo_root: Path) -> list[str]:
-    """Return list of active worktree directories relative to the repo root."""
-    worktrees_dir = repo_root / ".worktrees"
-    if not worktrees_dir.exists():
-        return []
-
-    active: list[str] = []
-    for entry in sorted(worktrees_dir.iterdir()):
-        if not entry.is_dir():
-            continue
-        try:
-            rel = entry.relative_to(repo_root)
-        except ValueError:
-            rel = entry
-        active.append(str(rel))
-    return active
 
 
 def _mission_details_lines(mission: Mission, include_description: bool = True) -> list[str]:
@@ -194,17 +184,13 @@ def _detect_current_feature(project_root: Path) -> str | None:
 @app.command("current")
 def current_cmd(
     mission: Annotated[str | None, typer.Option("--mission", "-f", help="Mission slug")] = None,
-    feature: Annotated[
-        str | None,
-        typer.Option("--feature", hidden=True, help="(deprecated) Use --mission"),
-    ] = None,
 ) -> None:
     """Show currently active mission for a mission (auto-detects mission from cwd)."""
     project_root = get_project_root_or_exit()
 
     detected_mission = _detect_current_feature(project_root)
 
-    if mission is None and feature is None and not detected_mission:
+    if mission is None and not detected_mission:
         console.print(
             "[yellow]No active mission detected.[/yellow]\n"
             "\nUse [cyan]--mission <slug>[/cyan] to specify one, "
@@ -223,28 +209,19 @@ def current_cmd(
                     console.print(f"  - {slug}")
                 if len(missions) > 10:
                     console.print(f"  ... and {len(missions) - 10} more")
-        raise typer.Exit(1)
+        raise typer.Exit(2)
 
     mission_slug: str
-    if mission is None and feature is None:
-        # Neither flag was explicitly provided — use auto-detected mission as-is.
+    if mission is None:
+        # No flag was explicitly provided — use auto-detected mission as-is.
         # (We already exited above when detected_mission was also None.)
         assert detected_mission is not None
         mission_slug = detected_mission
     else:
-        try:
-            resolved = resolve_selector(
-                canonical_value=mission,
-                canonical_flag="--mission",
-                alias_value=feature,
-                alias_flag="--feature",
-                suppress_env_var="SPEC_KITTY_SUPPRESS_FEATURE_DEPRECATION",
-                command_hint="--mission <slug>",
-            )
-            mission_slug = resolved.canonical_value
-        except typer.BadParameter as exc:
-            console.print(f"[red]Error:[/red] {exc}")
-            raise typer.Exit(1) from exc
+        mission_norm = mission.strip() if isinstance(mission, str) else None
+        if not mission_norm:
+            raise typer.BadParameter("--mission <slug> is required")
+        mission_slug = mission_norm
 
     try:
         feature_dir = resolve_feature_dir_for_mission(project_root, mission_slug)
@@ -298,14 +275,6 @@ def info_cmd(
         border_style="cyan",
     )
     console.print(panel)
-
-
-def _print_active_worktrees(active_worktrees: Iterable[str]) -> None:
-    console.print("[red]Cannot switch missions: active features exist[/red]")
-    console.print("\n[yellow]Active worktrees:[/yellow]")
-    for wt in active_worktrees:
-        console.print(f"  • {wt}")
-    console.print("\n[cyan]Suggestion:[/cyan] Complete, merge, or remove these worktrees before switching missions.")
 
 
 @app.command("create")
@@ -412,6 +381,38 @@ def create_cmd(
     console.print()
 
 
+def _resolve_mission_slug(repo_root: Path, mission_slug: str) -> str:
+    """Canonicalize a ``--mission`` handle at the ``run`` boundary.
+
+    F-001: ``--mission`` accepts handles (bare mid8, full ULID, numeric
+    prefix). Canonicalize here — the same pattern as the agent
+    ``_find_mission_slug`` helpers and ``next_cmd._resolve_mission_slug`` —
+    so ``run_custom_mission`` -> ``get_or_start_run`` keys
+    ``.kittify/runtime/feature-runs.json`` (and its persisted
+    ``mission_slug``) by the canonical directory name. A raw mid8 here
+    creates a split-brain duplicate run vs the full-slug invocation.
+    Handles that resolve to no existing directory keep their raw form,
+    preserving the historical lazy-meta-creation behaviour downstream; an
+    ambiguous handle propagates MissionSelectorAmbiguous (C-CTX-4 —
+    structured error, never a silent fallback).
+    """
+    from specify_cli.missions._read_path_resolver import StatusReadPathNotFound
+
+    try:
+        candidate: Path = candidate_feature_dir_for_mission(
+            get_main_repo_root(repo_root), mission_slug
+        )
+    except StatusReadPathNotFound:
+        # Fail-closed coordination window (coord worktree root materialized,
+        # mission dir absent): fall back to the raw handle so slug resolution
+        # stays non-raising at this boundary — the runtime surfaces its own
+        # diagnostic downstream.
+        return mission_slug
+    if candidate.exists():
+        return candidate.name
+    return mission_slug
+
+
 @app.command("run")
 def run_cmd(
     mission_key: Annotated[
@@ -434,6 +435,7 @@ def run_cmd(
     from specify_cli.mission_loader.command import run_custom_mission
 
     project_root = get_project_root_or_exit()
+    mission_slug = _resolve_mission_slug(project_root, mission_slug)
     result = run_custom_mission(mission_key, mission_slug, project_root)
     _render_envelope(result.envelope, json_output)
     raise typer.Exit(code=result.exit_code)
@@ -523,10 +525,14 @@ def close_cmd(
 ) -> None:
     """Close a mission. Wraps FR-016 lifecycle teardown.
 
-    Without ``--discard``: tear down the coordination worktree only.
-    This is a safe no-op after a successful ``spec-kitty merge`` (the
-    merge command already runs the same teardown); useful when the
-    teardown was skipped (e.g. legacy merge path) or interrupted.
+    Without ``--discard``: run the merge-completion teardown — persist the
+    mission retrospective to its durable home and tear down the coordination
+    worktree. Idempotent after a successful ``spec-kitty merge`` (which already
+    ran the same teardown); useful when the teardown was skipped (e.g. the legacy
+    plain-git/GitHub merge path) or interrupted. NOTE: on a mission that was
+    merged without a retrospective, this generates one
+    (``kitty-specs/<slug>/retrospective.yaml``) plus a ``RetrospectiveCaptured``
+    event and commits both — it is not a pure no-op in that case.
 
     With ``--discard``: abandon the mission mid-flight. Deletes the
     coordination branch and every lane branch named in
@@ -556,6 +562,34 @@ def close_cmd(
         console.print(f"[red]Mission not found:[/red] {mission_slug}")
         raise typer.Exit(1)
 
+    # F-001: re-key to the canonical directory name. `--mission` accepts
+    # handles (bare mid8, numeric prefix); the resolver canonicalizes the
+    # DIRECTORY only, while `_discard_mission` / `_teardown_coordination_worktree`
+    # compose names from the slug — `_delete_lane_branches` via
+    # `lane_branch_name(raw, lane_id)` and `_remove_lane_worktrees` via the
+    # exact-name `_expected_lane_worktree_dir_names` composition
+    # (`<slug>-<mid8>-lane-<id>`). Fed a raw handle, those helpers would compose
+    # the WRONG on-disk names and leave the real worktrees/branches behind while
+    # the command reports success.
+    mission_slug = feature_dir.name
+
+    # Surface fix (#2120): identity/lane reads (meta.json/lanes.json) and the
+    # teardown below are all PRIMARY-anchored. The resolver above stays the
+    # canonical handle-resolution + structured-error source, but once a
+    # coordination worktree exists it returns that worktree's status-only dir
+    # (no meta.json → _read_mission_mid8 empties → teardown silently no-ops).
+    # Re-anchor to the primary mission dir, matching how `mission reopen` resolves.
+    # FR-005/WP03: fold through _canonicalize_primary_read_handle so the gate
+    # detects the handle as provably canonical (mission_slug is feature_dir.name
+    # from :584 — already composed — but the fold is explicit for the gate seam).
+    from specify_cli.missions._read_path_resolver import (  # noqa: PLC0415
+        _canonicalize_primary_read_handle,
+    )
+    feature_dir = primary_feature_dir_for_mission(
+        repo_root,
+        _canonicalize_primary_read_handle(repo_root, mission_slug),
+    )
+
     meta_path = feature_dir / "meta.json"
     mid8_value = _read_mission_mid8(meta_path)
 
@@ -568,31 +602,37 @@ def close_cmd(
             meta_path=meta_path,
             force=force,
         )
-
-    # Teardown the coordination worktree. Same path as merge.py:1568.
-    # Idempotent: no-ops on legacy missions / when already torn down.
-    _teardown_coordination_worktree(repo_root, mission_slug, mid8_value)
-
-    if discard:
+        # Fail closed (#2120): a destructive discard must not report success
+        # while leaving worktrees/branches behind. Verify BEFORE flattening so the
+        # legacy-branch check can still read coordination_branch from meta.json.
+        _verify_discard_complete(
+            repo_root, mission_slug, mid8_value, feature_dir, meta_path
+        )
+        # Flatten: drop the now-dangling coordination_branch marker so subsequent
+        # commands for this mission don't trip CoordinationBranchDeleted (#2120).
+        _flatten_discarded_mission(feature_dir)
         console.print(f"[green]✓[/green] Mission {mission_slug} discarded.")
     else:
+        # Teardown the coordination worktree. Routes through the shared
+        # ``coordination/teardown.py`` seam (persist-before-destroy), the same
+        # seam the ``spec-kitty merge`` cleanup + ``--abort`` paths use.
+        # Idempotent: no-ops on legacy missions / when already torn down.
+        _teardown_coordination_worktree(repo_root, mission_slug, mid8_value)
         console.print(f"[green]✓[/green] Mission {mission_slug} closed.")
 
 
 def _read_mission_mid8(meta_path: Path) -> str:
-    if not meta_path.exists():
-        return ""
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
+    meta = load_meta(meta_path.parent, allow_missing=True, on_malformed="none")
     if not isinstance(meta, dict):
         return ""
     mid8_value = str(meta.get("mid8") or "").strip()
     if mid8_value:
         return mid8_value
     mission_id_meta = str(meta.get("mission_id") or "").strip()
-    return mission_id_meta[:8] if len(mission_id_meta) >= 8 else ""
+    # No slug in scope here; the canonical resolver derives ``mission_id[:8]``
+    # from the declared id alone. The >= 8 guard preserves the ``else ""``
+    # contract (resolve_mid8 also declines to "" below 8 chars).
+    return resolve_mid8("", mission_id=mission_id_meta) if len(mission_id_meta) >= 8 else ""
 
 
 def _discard_mission(
@@ -605,12 +645,184 @@ def _discard_mission(
     force: bool,
 ) -> None:
     _confirm_discard(mission_slug, force=force)
-    lanes_manifest = _load_lanes_manifest(feature_dir)
+    lanes_manifest = _load_lanes_manifest_for_discard(feature_dir, mission_slug)
+    # Remove ALL worktrees BEFORE deleting their branches (#2120): a branch that
+    # is checked out in a worktree cannot be `git branch -D`'d, so the prior
+    # branch-first order silently leaked the coordination/lane branches.
+    _teardown_coordination_worktree(repo_root, mission_slug, mid8_value)
     if lanes_manifest is not None:
+        _remove_lane_worktrees(repo_root, mission_slug, lanes_manifest)
         _delete_lane_branches(repo_root, mission_slug, lanes_manifest)
-        _remove_lane_worktrees(repo_root, mission_slug, mid8_value, lanes_manifest)
         return
     _delete_legacy_coordination_branch(repo_root, meta_path)
+
+
+def _load_lanes_manifest_for_discard(feature_dir: Path, mission_slug: str) -> Any | None:
+    """Load ``lanes.json`` for a discard, failing CLOSED on corruption.
+
+    Unlike :func:`_load_lanes_manifest` (which degrades a corrupt manifest to
+    ``None``), a destructive discard must not silently route a modern mission
+    through the legacy single-branch path on a corrupt manifest — that would
+    leave the lane branches/worktrees behind while reporting success (#2120).
+    A *missing* manifest is still a legacy mission (``None``); a *corrupt* one
+    aborts.
+    """
+    from specify_cli.lanes.persistence import (
+        CorruptLanesError,
+        MissingLanesError,
+        require_lanes_json,
+    )
+
+    try:
+        return require_lanes_json(feature_dir)
+    except MissingLanesError:
+        return None
+    except CorruptLanesError as exc:
+        console.print(
+            f"[red]Error:[/red] cannot discard {mission_slug}: lanes.json is "
+            f"corrupt ({exc}). Repair or remove it, then retry."
+        )
+        raise typer.Exit(1) from exc
+
+
+def _branch_exists(repo_root: Path, branch_name: str) -> bool:
+    import subprocess as _subprocess
+
+    result = _subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _registered_worktree_names(repo_root: Path) -> list[str]:
+    """Return the directory names of every git-registered worktree.
+
+    Reads ``git worktree list --porcelain`` so the residual check can catch a
+    stale/broken registration whose on-disk directory is already gone — which a
+    plain ``.worktrees/`` directory scan would miss.
+    """
+    import subprocess as _subprocess
+
+    result = _subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    names: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            names.append(Path(line[len("worktree "):].strip()).name)
+    return names
+
+
+def _expected_discard_branches(
+    feature_dir: Path, mission_slug: str, meta_path: Path
+) -> list[str]:
+    """The branches a discard is expected to delete (for post-teardown verify).
+
+    Mirrors :func:`_delete_lane_branches` / :func:`_delete_legacy_coordination_branch`
+    so the residual check verifies exactly the set the discard tried to remove.
+    """
+    branches: list[str] = []
+    manifest = _load_lanes_manifest(feature_dir)
+    if manifest is not None:
+        from specify_cli.lanes.branch_naming import lane_branch_name
+        from specify_cli.lanes.compute import is_planning_lane
+
+        for lane in manifest.lanes:
+            if is_planning_lane(lane):
+                continue
+            branches.append(lane_branch_name(mission_slug, lane.lane_id))
+        branches.append(manifest.mission_branch)
+        return branches
+    meta = load_meta(meta_path.parent, allow_missing=True, on_malformed="none")
+    coord_branch = meta.get("coordination_branch") if isinstance(meta, dict) else None
+    if coord_branch:
+        branches.append(str(coord_branch))
+    return branches
+
+
+def _verify_discard_complete(
+    repo_root: Path,
+    mission_slug: str,
+    mid8_value: str,
+    feature_dir: Path,
+    meta_path: Path,
+) -> None:
+    """Fail closed if a discard left worktrees or branches behind (#2120).
+
+    The bug this guards against is a *silent* no-op that still printed success.
+    After teardown, any surviving coordination worktree, EXACT lane worktree, or
+    expected branch is a real leak — surface it as a non-zero error instead of a
+    false ``✓``. Worktrees are matched by exact name (not a ``<slug>-*`` prefix)
+    so a sibling mission sharing the prefix neither masks a leak nor trips a
+    spurious failure.
+    """
+    leaks: list[str] = []
+    worktrees_root = repo_root / ".worktrees"
+    # A surviving worktree leaks if its directory is on disk OR a stale/broken git
+    # registration remains (dir gone) — the latter is invisible to an on-disk scan.
+    registered = set(_registered_worktree_names(repo_root))
+
+    # Coordination worktree — exact canonical name, on disk OR still registered.
+    if mid8_value:
+        from specify_cli.coordination import CoordinationWorkspace
+
+        coord_name = CoordinationWorkspace.worktree_path(
+            repo_root, mission_slug, mid8_value
+        ).name
+        if (
+            CoordinationWorkspace.is_present(repo_root, mission_slug, mid8_value)
+            or coord_name in registered
+        ):
+            leaks.append(f".worktrees/{coord_name}")
+
+    # Lane worktrees — EXACT names from the manifest (no prefix over-match),
+    # likewise checked both on disk and in the git worktree registry.
+    manifest = _load_lanes_manifest(feature_dir)
+    if manifest is not None:
+        for name in sorted(_expected_lane_worktree_dir_names(mission_slug, manifest)):
+            if (worktrees_root / name).is_dir() or name in registered:
+                leaks.append(f".worktrees/{name}")
+
+    for branch in _expected_discard_branches(feature_dir, mission_slug, meta_path):
+        if _branch_exists(repo_root, branch):
+            leaks.append(f"branch {branch}")
+
+    if not leaks:
+        return
+
+    console.print(
+        f"[red]Error:[/red] discard of {mission_slug} did not complete — these "
+        "artifacts were not removed:"
+    )
+    for leak in leaks:
+        console.print(f"  - {leak}")
+    console.print(
+        "[dim]Remove them manually (git worktree remove --force / git branch -D) "
+        "and retry, or report this as a bug.[/dim]"
+    )
+    raise typer.Exit(1)
+
+
+def _flatten_discarded_mission(feature_dir: Path) -> None:
+    """Drop the dangling ``coordination_branch`` marker after a discard (#2120).
+
+    Tolerant: a missing meta.json (legacy mission) is a no-op — flattening is a
+    best-effort cleanup, never a hard failure of an otherwise-successful discard.
+    """
+    from specify_cli.mission_metadata import clear_coordination_metadata
+
+    with contextlib.suppress(FileNotFoundError):
+        clear_coordination_metadata(feature_dir)
 
 
 def _confirm_discard(mission_slug: str, *, force: bool) -> None:
@@ -658,12 +870,7 @@ def _delete_lane_branches(repo_root: Path, mission_slug: str, lanes_manifest: An
 
 
 def _delete_legacy_coordination_branch(repo_root: Path, meta_path: Path) -> None:
-    if not meta_path.exists():
-        return
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
+    meta = load_meta(meta_path.parent, allow_missing=True, on_malformed="none")
     coord_branch = meta.get("coordination_branch") if isinstance(meta, dict) else None
     if coord_branch:
         _force_delete_branch_if_exists(repo_root, str(coord_branch))
@@ -673,24 +880,24 @@ def _delete_legacy_coordination_branch(repo_root: Path, meta_path: Path) -> None
 def _teardown_coordination_worktree(repo_root: Path, mission_slug: str, mid8_value: str) -> None:
     if not mid8_value:
         return
-    try:
-        from specify_cli.coordination import CoordinationWorkspace
+    # Route through the shared ``teardown_coordination_topology`` seam (FR-004):
+    # persist the retrospective to its durable home BEFORE destroying the
+    # coordination worktree (persist-before-destroy, FR-005). The destroy leg is
+    # best-effort inside the seam; we report success/failure from the on-disk
+    # ``is_present`` truth so the operator sees whether manual cleanup is needed.
+    from specify_cli.coordination.teardown import teardown_coordination_topology
+    from specify_cli.coordination.workspace import CoordinationWorkspace
 
-        CoordinationWorkspace.teardown(repo_root, mission_slug, mid8_value)
-        if CoordinationWorkspace.is_present(repo_root, mission_slug, mid8_value):
-            console.print(
-                "[yellow]Warning:[/yellow] coordination worktree still "
-                "present after teardown; manual cleanup may be required."
-            )
-        else:
-            console.print(
-                f"[green]✓[/green] Coordination worktree torn down for "
-                f"{mission_slug}-{mid8_value}"
-            )
-    except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+    teardown_coordination_topology(repo_root, mission_slug, mid8_value)
+    if CoordinationWorkspace.is_present(repo_root, mission_slug, mid8_value):
         console.print(
-            f"[yellow]Warning:[/yellow] coordination worktree teardown "
-            f"failed (non-fatal): {exc}"
+            "[yellow]Warning:[/yellow] coordination worktree still "
+            "present after teardown; manual cleanup may be required."
+        )
+    else:
+        console.print(
+            f"[green]✓[/green] Coordination worktree torn down for "
+            f"{mission_slug}-{mid8_value}"
         )
 
 
@@ -716,32 +923,46 @@ def _force_delete_branch_if_exists(repo_root: Path, branch_name: str) -> None:
     )
 
 
+def _expected_lane_worktree_dir_names(mission_slug: str, lanes_manifest: Any) -> set[str]:
+    """Exact on-disk lane-worktree dir names a discard targets (no prefix match).
+
+    Composed by the canonical ``worktree_dir_name`` grammar, keyed on the same
+    ``mission_slug`` (= ``feature_dir.name``) and lane set as
+    :func:`_delete_lane_branches`, so worktree removal and branch deletion target
+    the SAME lanes. Replaces ``.worktrees/<slug>-*`` prefix matching, which
+    over-matches a *sibling* mission whose name shares the prefix (legacy non-mid8
+    slugs) and could delete its worktree — including uncommitted work.
+    """
+    from specify_cli.lanes.branch_naming import worktree_dir_name
+    from specify_cli.lanes.compute import is_planning_lane
+
+    return {
+        worktree_dir_name(mission_slug, mission_id=None, lane_id=lane.lane_id)
+        for lane in lanes_manifest.lanes
+        if not is_planning_lane(lane)
+    }
+
+
 def _remove_lane_worktrees(
     repo_root: Path,
     mission_slug: str,
-    mid8_value: str,
     lanes_manifest: Any,
 ) -> None:
-    """Remove every operator-visible lane worktree for this mission."""
+    """Remove this mission's operator-visible lane worktrees by EXACT name.
+
+    The coordination worktree is handled separately by
+    :func:`_teardown_coordination_worktree`.
+    """
     import subprocess as _subprocess
 
-    # Lane worktrees are at .worktrees/<slug>-<mid8>-<lane_id>/ by convention.
     worktrees_root = repo_root / ".worktrees"
     if not worktrees_root.exists():
         return
 
-    # Best-effort: scan worktrees that start with the mission slug.
-    prefix_with_mid8 = f"{mission_slug}-{mid8_value}-" if mid8_value else f"{mission_slug}-"
-    prefix_legacy = f"{mission_slug}-"
     removed = 0
-    for entry in worktrees_root.iterdir():
+    for name in sorted(_expected_lane_worktree_dir_names(mission_slug, lanes_manifest)):
+        entry = worktrees_root / name
         if not entry.is_dir():
-            continue
-        name = entry.name
-        if name.endswith("-coord"):
-            # Coordination worktree is handled separately.
-            continue
-        if not (name.startswith(prefix_with_mid8) or name.startswith(prefix_legacy)):
             continue
         _subprocess.run(
             ["git", "-C", str(repo_root), "worktree", "remove", str(entry), "--force"],
@@ -752,6 +973,391 @@ def _remove_lane_worktrees(
         removed += 1
     if removed:
         console.print(f"  Removed {removed} lane worktree(s)")
+
+
+# ---------------------------------------------------------------------------
+# WP02 / FR-001/FR-002 — post-mission lifecycle commands
+# (``spec-kitty mission reopen`` + ``spec-kitty mission follow-up``)
+# ---------------------------------------------------------------------------
+
+def _detect_actor() -> str:
+    """Detect caller identity from environment variables.
+
+    Mirrors the ``do``/``advise`` actor-detection chokepoint so re-open and
+    follow-up attribution is consistent across the governed-Op surfaces.
+    """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "claude"
+    if os.environ.get("CODEX_CLI"):
+        return "codex"
+    return "operator"
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedMissionHandle:
+    """Resolution of an operator ``<handle>`` to a concrete mission (T008)."""
+
+    mission_id: str | None
+    mission_slug: str
+    feature_dir: Path
+    mission_branch: str | None
+
+
+def _resolve_mission_handle(repo_root: Path, handle: str) -> _ResolvedMissionHandle:
+    """Resolve a ``mission_id`` / ``mid8`` / slug handle to a mission (T008).
+
+    Disambiguates by ``mission_id`` via the canonical identity resolver
+    (``context.mission_resolver.resolve_mission``). An ambiguous handle raises
+    ``MissionSelectorAmbiguous`` (stable error code ``MISSION_AMBIGUOUS_SELECTOR``)
+    — never a silent slug guess (NFR-004). When the handle resolves to a single
+    identity-bearing mission, the canonical ``feature_dir`` is used. Handles that
+    match no identity-bearing mission fall back to the literal slug directory
+    (legacy missions without ``mission_id`` and direct directory names).
+    """
+    from specify_cli.context.mission_resolver import (  # noqa: PLC0415
+        AmbiguousHandleError,
+        MissionNotFoundError,
+        resolve_mission,
+    )
+    from specify_cli.missions._read_path_resolver import (  # noqa: PLC0415
+        MissionSelectorAmbiguous,
+        _canonicalize_primary_read_handle,
+    )
+
+    try:
+        resolved = resolve_mission(handle, repo_root)
+    except AmbiguousHandleError as exc:
+        # Re-raise as the canonical structured selector error (no silent fallback).
+        raise MissionSelectorAmbiguous(
+            handle=handle,
+            candidates=[c.mission_slug for c in exc.candidates],
+        ) from exc
+    except MissionNotFoundError:
+        # Legacy / no-mission_id handle: fall back to the literal slug directory.
+        # #2136/#2164: fold the handle through the proven full-fold FIRST so a bare
+        # human slug whose on-disk primary dir carries the composed ``<slug>-<mid8>``
+        # name lands on the real dir (the identity resolver above keys on the dir NAME
+        # and so cannot match a bare slug onto a composed dir — it raised
+        # MissionNotFoundError). The fold is a NO-OP for a genuinely literal/legacy
+        # dir name (back-compat preserved) and propagates ``MissionSelectorAmbiguous``
+        # on an ambiguous handle (no silent pick — C-009).
+        canonical_handle = _canonicalize_primary_read_handle(repo_root, handle)
+        feature_dir = primary_feature_dir_for_mission(repo_root, canonical_handle)
+        meta = _safe_load_meta(feature_dir)
+        return _ResolvedMissionHandle(
+            mission_id=(meta or {}).get("mission_id") if meta else None,
+            mission_slug=feature_dir.name,
+            feature_dir=feature_dir,
+            mission_branch=(meta or {}).get("mission_branch") if meta else None,
+        )
+
+    meta = _safe_load_meta(resolved.feature_dir)
+    return _ResolvedMissionHandle(
+        mission_id=resolved.mission_id,
+        mission_slug=resolved.mission_slug,
+        feature_dir=resolved.feature_dir,
+        mission_branch=(meta or {}).get("mission_branch") if meta else None,
+    )
+
+
+def _safe_load_meta(feature_dir: Path) -> dict[str, Any] | None:
+    """Load ``meta.json`` tolerating absence/corruption (returns ``None``)."""
+    try:
+        result: dict[str, Any] | None = load_meta(feature_dir)
+        return result
+    except (ValueError, OSError):
+        return None
+
+
+def _branch_resolvable(repo_root: Path, branch: str) -> bool:
+    """Return ``True`` when *branch* resolves in the local repo OR any remote.
+
+    Fail-closed predicate (per contract): the mission branch must exist either
+    as a local ref (``git rev-parse --verify refs/heads/<branch>``) or on any
+    configured remote (``git ls-remote --heads <remote> <branch>``). A missing
+    worktree directory alone does NOT make a mission unrecoverable — the branch
+    is re-materializable — so this check is intentionally branch-only.
+    """
+    from specify_cli.core import git_ops  # noqa: PLC0415
+
+    code, _out, _err = git_ops.run_command(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        check_return=False,
+        capture=True,
+        cwd=repo_root,
+    )
+    if code == 0:
+        return True
+
+    code, remotes, _err = git_ops.run_command(
+        ["git", "remote"],
+        check_return=False,
+        capture=True,
+        cwd=repo_root,
+    )
+    if code != 0 or not remotes:
+        return False
+    for remote in remotes.splitlines():
+        remote = remote.strip()
+        if not remote:
+            continue
+        ls_code, ls_out, _ls_err = git_ops.run_command(
+            ["git", "ls-remote", "--heads", remote, branch],
+            check_return=False,
+            capture=True,
+            cwd=repo_root,
+        )
+        if ls_code == 0 and ls_out.strip():
+            return True
+    return False
+
+
+def _emit_selector_error(exc: Exception) -> None:
+    """Render a structured ``MISSION_AMBIGUOUS_SELECTOR`` error and exit non-zero."""
+    console.print(f"[red]MISSION_AMBIGUOUS_SELECTOR[/red]\n{exc}")
+
+
+@app.command("reopen")
+def reopen_cmd(
+    handle: Annotated[
+        str,
+        typer.Argument(help="Mission handle: mission_id (ULID), mid8, or slug."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Why the mission is being re-opened (required, audited)."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a JSON envelope instead of a rich panel."),
+    ] = False,
+) -> None:
+    """Re-open a merged/closed mission, returning it to an actionable state (FR-002).
+
+    Appends a ``MissionReopened`` lifecycle event (the authority for
+    actionability — ``derive_mission_lifecycle`` reports the ``reopened``
+    surface_state) and clears the ``merged_*`` markers from ``meta.json``. Does
+    NOT mutate WP lanes — the operator repositions WPs explicitly afterwards.
+
+    Fail-closed (NFR-004): the mission is unrecoverable when ``meta.json`` is
+    absent/corrupt OR the mission branch resolves in neither the local repo nor
+    any configured remote. A missing worktree directory alone is recoverable. On
+    unrecoverable input the command exits non-zero with a remediation hint and
+    writes no event / no metadata change.
+    """
+    from specify_cli.missions._read_path_resolver import (  # noqa: PLC0415
+        MissionSelectorAmbiguous,
+    )
+    from specify_cli.mission_metadata import clear_merge_metadata
+    from specify_cli.status import emit_mission_reopened, is_mission_completed
+
+    project_root = get_project_root_or_exit()
+    repo_root = _resolve_primary_repo_root(project_root)
+
+    try:
+        resolved = _resolve_mission_handle(repo_root, handle)
+    except MissionSelectorAmbiguous as exc:
+        _emit_selector_error(exc)
+        raise typer.Exit(1) from exc
+
+    # Fail-closed predicate (a): meta.json absent / corrupt (no resolvable mission_id).
+    meta = _safe_load_meta(resolved.feature_dir)
+    if meta is None or not resolved.mission_id:
+        console.print(
+            "[red]Error:[/red] mission is unrecoverable — "
+            f"meta.json is missing or corrupt for handle [bold]{handle}[/bold].\n"
+            "[dim]Remediation: restore meta.json (or run "
+            "`spec-kitty migrate backfill-identity`) before re-opening.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Fail-closed predicate (b): branch in neither local repo nor any remote.
+    mission_branch = resolved.mission_branch or meta.get("mission_branch")
+    if mission_branch and not _branch_resolvable(repo_root, str(mission_branch)):
+        console.print(
+            "[red]Error:[/red] mission is unrecoverable — branch "
+            f"[bold]{mission_branch}[/bold] resolves in neither the local repo "
+            "nor any configured remote.\n"
+            "[dim]Remediation: fetch the branch (`git fetch <remote> "
+            f"{mission_branch}`) or restore it before re-opening.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Fail-closed precondition (#1926): a mission can only be re-opened once it
+    # has reached completion (merged, or all WPs terminal). Checked BEFORE any
+    # metadata mutation so a rejected re-open leaves meta.json untouched and
+    # writes no event. The emit helper enforces the same invariant defensively.
+    if not is_mission_completed(resolved.feature_dir):
+        console.print(
+            "[red]Error:[/red] cannot re-open: mission "
+            f"[bold]{resolved.mission_slug}[/bold] has not completed/merged.\n"
+            "[dim]Remediation: a mission can only be re-opened after it has "
+            "merged or all its work packages are terminal.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Recoverable: clear merge markers, then emit the authority event.
+    cleared = clear_merge_metadata(resolved.feature_dir)
+    event = emit_mission_reopened(
+        resolved.feature_dir,
+        mission_id=resolved.mission_id,
+        mission_slug=resolved.mission_slug,
+        reason=reason,
+        reopened_by=_detect_actor(),
+        cleared_merge=cleared or None,
+    )
+
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "result": "reopened",
+                    "mission_id": resolved.mission_id,
+                    "mission_slug": resolved.mission_slug,
+                    "reason": reason,
+                    "cleared_merge": cleared,
+                    "event_id": (event or {}).get("event_id"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(0)
+
+    console.print(
+        f"[green]✓[/green] Mission [bold]{resolved.mission_slug}[/bold] re-opened "
+        "and is actionable again."
+    )
+    if cleared:
+        console.print(f"  [dim]Cleared merge markers: {', '.join(sorted(cleared))}[/dim]")
+    raise typer.Exit(0)
+
+
+@app.command("follow-up")
+def follow_up_cmd(
+    handle: Annotated[
+        str,
+        typer.Argument(help="Mission handle: mission_id (ULID), mid8, or slug."),
+    ],
+    commit: Annotated[
+        str | None,
+        typer.Option("--commit", help="40-hex commit SHA of the follow-up."),
+    ] = None,
+    pr: Annotated[
+        int | None,
+        typer.Option("--pr", help="Pull-request number of the follow-up."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a JSON envelope instead of a rich panel."),
+    ] = False,
+) -> None:
+    """Record a follow-up commit or PR against a mission (FR-001).
+
+    Exactly one of ``--commit <40-hex>`` / ``--pr <int>`` must be supplied.
+    Appends a ``FollowUpRecorded`` lifecycle event attributed to ``mission_id``.
+    Fail-closed (#1926): only valid once the mission has reached completion
+    (merged, or all WPs terminal) — a follow-up against a not-yet-completed
+    mission exits non-zero with a structured error and writes no event.
+    Idempotent on its dedup key ``(mission_id, commit_sha | pr_number)`` —
+    re-recording the same reference is a successful no-op.
+    """
+    import re  # noqa: PLC0415
+
+    from specify_cli.missions._read_path_resolver import (  # noqa: PLC0415
+        MissionSelectorAmbiguous,
+    )
+    from specify_cli.status import emit_follow_up_recorded, is_mission_completed
+
+    # Validate: exactly one of --commit / --pr.
+    if (commit is None) == (pr is None):
+        console.print(
+            "[red]Error:[/red] supply exactly one of [cyan]--commit <40-hex>[/cyan] "
+            "or [cyan]--pr <int>[/cyan]."
+        )
+        raise typer.Exit(1)
+
+    if commit is not None and not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+        console.print(
+            f"[red]Error:[/red] --commit must be a 40-character hex SHA, got {commit!r}."
+        )
+        raise typer.Exit(1)
+
+    project_root = get_project_root_or_exit()
+    repo_root = _resolve_primary_repo_root(project_root)
+
+    try:
+        resolved = _resolve_mission_handle(repo_root, handle)
+    except MissionSelectorAmbiguous as exc:
+        _emit_selector_error(exc)
+        raise typer.Exit(1) from exc
+
+    if not resolved.mission_id:
+        console.print(
+            "[red]Error:[/red] mission has no resolvable mission_id for handle "
+            f"[bold]{handle}[/bold].\n"
+            "[dim]Remediation: run `spec-kitty migrate backfill-identity`.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Fail-closed precondition (#1926): a follow-up is a post-mission fact and is
+    # only valid once the mission has reached completion (merged, or all WPs
+    # terminal). Checked before emitting so a rejected follow-up writes no event.
+    # The emit helper enforces the same invariant defensively.
+    if not is_mission_completed(resolved.feature_dir):
+        console.print(
+            "[red]Error:[/red] cannot record follow-up: mission "
+            f"[bold]{resolved.mission_slug}[/bold] has not completed/merged.\n"
+            "[dim]Remediation: follow-ups can only be recorded after a mission "
+            "has merged or all its work packages are terminal.[/dim]"
+        )
+        raise typer.Exit(1)
+
+    follow_up_type = "commit" if commit is not None else "pr"
+    event = emit_follow_up_recorded(
+        resolved.feature_dir,
+        mission_id=resolved.mission_id,
+        mission_slug=resolved.mission_slug,
+        follow_up_type=follow_up_type,
+        commit_sha=commit,
+        pr_number=pr,
+        recorded_by=_detect_actor(),
+    )
+
+    deduped = event is None  # idempotent no-op when already recorded.
+
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "result": "recorded" if not deduped else "duplicate",
+                    "mission_id": resolved.mission_id,
+                    "mission_slug": resolved.mission_slug,
+                    "follow_up_type": follow_up_type,
+                    "commit_sha": commit,
+                    "pr_number": pr,
+                    "event_id": (event or {}).get("event_id"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(0)
+
+    ref = commit if commit is not None else f"#{pr}"
+    if deduped:
+        console.print(
+            f"[dim]Follow-up {follow_up_type} {ref} already recorded for "
+            f"{resolved.mission_slug} (no-op).[/dim]"
+        )
+    else:
+        console.print(
+            f"[green]✓[/green] Recorded follow-up {follow_up_type} [bold]{ref}[/bold] "
+            f"for {resolved.mission_slug}."
+        )
+    raise typer.Exit(0)
 
 
 @app.command("switch", deprecated=True)

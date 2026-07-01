@@ -96,13 +96,13 @@ next scheduling decision.
 Every WP MUST follow this state flow:
 
 ```
-planned --> [workflow implement] --> in_progress --> [agent works] --> for_review --> [review] --> approved or planned
+planned --> claimed --> [workflow implement] --> in_progress --> [agent works] --> for_review --> in_review --> approved or planned
 ```
 
 After review rejection (WP moves back to `planned` with `review_status: has_feedback`):
 
 ```
-planned --> [workflow implement] --> in_progress --> [agent fixes] --> for_review --> [review] --> approved or planned
+planned --> claimed --> [workflow implement] --> in_progress --> [agent fixes] --> for_review --> in_review --> approved or planned
 ```
 
 After ALL WPs are approved: run `spec-kitty accept --mission <slug>` first as
@@ -118,8 +118,9 @@ To determine what to do next, always run:
 spec-kitty next --agent <your-name> --mission <mission-slug>
 ```
 
-> **Note:** `--feature` is the hidden deprecated alias for `--mission`.
-> Always use `--mission` in new scripts.
+> **Note:** `--mission` is the canonical selector. The legacy `--feature` alias
+> has been removed from the internal/agent commands (e.g. `agent action implement`,
+> `agent action review`); always use `--mission`.
 
 This reads the dependency graph and current lane state and returns the exact
 command. Do NOT reason about lane transitions yourself.
@@ -149,11 +150,9 @@ Examples:
 - `--agent codex:gpt-4o:python-pedro:implementer`
 
 Partial compact strings are accepted (missing fields default to `unknown`).
-You may also use explicit flags instead:
-- `--tool <tool>` — agent key (e.g. `opencode`, `claude`)
-- `--model <model>` — AI model identifier (e.g. `o3`, `gpt-4o`)
-- `--profile <profile-id>` — doctrine profile (e.g. `python-pedro`)
-- `--role <role>` — role label (e.g. `implementer`, `reviewer`)
+Pass the compact identity through `--agent <tool>:<model>:<profile>:<role>`.
+The `agent action implement` and `agent action review` command surfaces do not
+accept separate `--tool`, `--model`, `--profile`, or `--role` flags.
 
 This command:
 - Moves WP from `planned` to `in_progress`
@@ -297,7 +296,7 @@ spec-kitty agent tasks status
 ```
 
 This shows:
-- Kanban board with WPs in lanes: planned, in_progress, for_review, approved, done
+- Kanban board with WPs in lanes: planned, claimed, in_progress, for_review, in_review, approved, done
 - Progress bar showing completion percentage
 - Which WPs are ready for review, in progress, and planned
 
@@ -363,21 +362,23 @@ Build a combined prompt and pipe to the agent. The mandatory instruction
 ensures the agent runs the `move-task` command after reviewing.
 
 ```bash
-# Build combined prompt with mandatory instruction
-printf 'IMPORTANT: After reviewing, you MUST execute the appropriate spec-kitty agent tasks move-task command shown at the bottom of this prompt.\n---\n' > /tmp/review-prompt-WP##.md
-cat "$REVIEW_PROMPT" >> /tmp/review-prompt-WP##.md
+# Build combined prompt with mandatory instruction.
+# Scope temp paths by <mission> so concurrent missions sharing a WP id (e.g.
+# two missions both with WP01) do not collide on the same /tmp file (#1831).
+printf 'IMPORTANT: After reviewing, you MUST execute the appropriate spec-kitty agent tasks move-task command shown at the bottom of this prompt.\n---\n' > /tmp/review-prompt-<mission>-WP##.md
+cat "$REVIEW_PROMPT" >> /tmp/review-prompt-<mission>-WP##.md
 
 # Dispatch to configured reviewer (same CLI patterns as Step 1b)
 # Example for codex:
-cat /tmp/review-prompt-WP##.md | codex exec --sandbox danger-full-access \
+cat /tmp/review-prompt-<mission>-WP##.md | codex exec --sandbox danger-full-access \
   -C "$WORKTREE" --add-dir "$(pwd)" \
-  -o "/tmp/review-result-WP##.md" -
+  -o "/tmp/review-result-<mission>-WP##.md" -
 
 # Example for claude:
-claude -p "$(cat /tmp/review-prompt-WP##.md)" --output-format json -C "$WORKTREE"
+claude -p "$(cat /tmp/review-prompt-<mission>-WP##.md)" --output-format json -C "$WORKTREE"
 
 # Example for gemini:
-gemini -p "$(cat /tmp/review-prompt-WP##.md)" --yolo --output-format json -C "$WORKTREE"
+gemini -p "$(cat /tmp/review-prompt-<mission>-WP##.md)" --yolo --output-format json -C "$WORKTREE"
 ```
 
 Capture the reviewer command exit status. If the configured/chosen reviewer
@@ -416,7 +417,7 @@ spec-kitty agent tasks move-task WP## --to approved --note "Review passed (by <a
 
 # If rejected:
 spec-kitty agent tasks move-task WP## --to planned --force \
-  --review-feedback-file /tmp/feedback-WP##.md
+  --review-feedback-file /tmp/feedback-<mission>-WP##.md
 ```
 
 ### Step 3c: Verify the Outcome
@@ -428,7 +429,7 @@ After review completes:
 spec-kitty agent tasks status
 
 # If reviewer output was captured to a file:
-cat /tmp/review-result-WP##.md
+cat /tmp/review-result-<mission>-WP##.md
 ```
 
 Before final approval, if `spec.md` references GitHub issues, ensure
@@ -663,7 +664,7 @@ Dispatch in parallel. Each must complete its review cycle before feature merge.
 
 ```bash
 # 1. Determine what to do next
-spec-kitty next --agent <name> --mission <slug>
+spec-kitty next --mission <slug> --json
 
 # 2. Dispatch implementation (two steps)
 #    --agent compact form: <tool>:<model>:<profile>:<role>
@@ -876,7 +877,9 @@ files but still need manual commit from the repository root checkout:
 **Stale WP (in_progress but no agent activity)**: Force back to planned and
 re-dispatch:
 ```bash
-spec-kitty agent tasks move-task WP## --to planned --force --note "Stale agent recovery"
+printf '%s\n' "Stale implementation lease recovered; redispatch required." > /tmp/stale-agent-feedback.md
+spec-kitty agent tasks move-task WP## --to planned \
+  --review-feedback-file /tmp/stale-agent-feedback.md
 ```
 
 **Cross-worktree visibility**: Each agent only sees its own WP worktree.

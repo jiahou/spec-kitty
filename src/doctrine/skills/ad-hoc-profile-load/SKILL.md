@@ -69,10 +69,10 @@ profile = repo.resolve_profile("architect")
 from doctrine.agent_profiles.profile import TaskContext
 
 context = TaskContext(
-    languages=["python"],
-    frameworks=["fastapi", "<project-test-runner>"],
-    file_patterns=["src/**/*.py"],
-    domain_keywords=["architecture", "design"],
+    language="python",
+    framework="fastapi",
+    file_paths=["src/example.py"],
+    keywords=["architecture", "design"],
 )
 
 profile = repo.find_best_match(context)
@@ -86,14 +86,14 @@ spec-kitty agent profile list
 
 **One-shot invocation (when the user wants a profile-governed answer rather
 than to adopt the role for the session):** route the request through the
-canonical invoke surfaces instead of loading the profile manually:
+canonical dispatch surface instead of loading the profile manually:
 
 ```bash
 # Ask a named profile to handle a specific request:
-spec-kitty ask <profile-id> "<request>"
+spec-kitty dispatch "<request>" --profile <profile-id>
 
 # Or let the router pick a profile for the request:
-spec-kitty advise "<request>" --profile <profile-id>
+spec-kitty dispatch "<request>"
 ```
 
 ---
@@ -214,19 +214,16 @@ for mode in profile.mode_defaults:
 
 ---
 
-## Step 5: Tool Context Persistence (Optional)
+## Step 5: Standalone Profile Invocation
 
-To persist the profile for the current tool so it loads automatically on
-next session, start an ad-hoc specialist session via the slash command:
+For a profile-governed answer outside a mission, use standalone dispatch:
 
 ```
-/spec-kitty.profile-context <profile-id>
+spec-kitty dispatch "<request>" --profile <profile-id>
 ```
 
-This anchors the named profile as the active advisory context for the tool
-so it is available to the agent on subsequent turns. For a single
-profile-governed answer without persisting context, use `spec-kitty ask`
-or `spec-kitty advise` (see Step 1).
+This opens a governed Op with governance context. It does not advance mission
+state, and it replaces the retired `/spec-kitty.profile-context` surface.
 
 ---
 
@@ -241,11 +238,10 @@ spec-kitty agent profile show architect
 spec-kitty agent profile show architect --all
 
 # One-shot profile-governed invocation
-spec-kitty ask architect "<request>"
-spec-kitty advise "<request>" --profile architect
+spec-kitty dispatch "<request>" --profile architect
 
-# Persist a profile as the tool's advisory context (slash command)
-# /spec-kitty.profile-context architect
+# Profile-governed standalone invocation
+spec-kitty dispatch "<request>" --profile architect
 ```
 
 ```python

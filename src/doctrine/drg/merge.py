@@ -4,7 +4,7 @@ This module owns the **canonical relationship merge** for the Doctrine
 Reference Graph (OQ-2(ii) / C-009). It overlays the built-in DRG with
 organisation-tier fragments and an optional project-tier graph, producing a
 single merged :class:`~doctrine.drg.models.DRGGraph` whose nodes and edges
-carry a ``provenance`` sidecar attribute.
+carry a declared ``provenance`` field.
 
 Relocated from ``charter.drg`` (mission
 ``org-doctrine-profile-integrity-activation-closure-01KT1TV1`` WP03). The
@@ -80,13 +80,16 @@ _PLURAL_TO_SINGULAR: dict[str, str] = {
 }
 
 
-#: Default relation used when a fragment edge labels its relation with a
-#: refinement verb that is not (yet) in the canonical :class:`Relation`
-#: enum. ``refines`` is a common operator-friendly synonym for
-#: ``Relation.APPLIES`` in advisory contexts.
+#: Operator-friendly relation aliases mapping a fragment-authored verb to a
+#: canonical :class:`Relation`. ``refines`` is NO LONGER aliased — it is now a
+#: first-class ``Relation.REFINES`` (#2079) and resolves via the canonical
+#: branch in :func:`_resolve_relation`. ``extends`` is overlay-inheritance
+#: language and maps to ``Relation.SPECIALIZES_FROM`` (lineage), NOT to the inert
+#: ``Relation.APPLIES`` sink. INVARIANT: an alias MUST NOT map to
+#: ``Relation.APPLIES`` — no traversal reads ``APPLIES``, so aliasing an authored
+#: relation onto it silently turns the edge into a no-op (the #2079 defect class).
 _RELATION_ALIASES: dict[str, Relation] = {
-    "refines": Relation.APPLIES,
-    "extends": Relation.APPLIES,
+    "extends": Relation.SPECIALIZES_FROM,
 }
 
 
@@ -114,6 +117,12 @@ class OrgDRGConflict:
     * ``hard_fail`` — the merge raises :class:`OrgDRGConflictError`.
     * ``built_in_wins`` — silent precedence (the built-in value is retained).
     * ``project_wins`` — silent precedence (the project value is retained).
+    * ``org_override`` — a SAME-KIND org node permissibly substitutes a built-in
+      node in place (the org value wins, with a WARNING for operator visibility).
+      Non-fatal: the merge does NOT raise. Whether a given repo *tolerates* this
+      override is a per-repo governance TEST (see
+      ``tests/architectural/test_builtin_override_policy.py``), not a merge-time
+      prohibition.
     """
 
     kind: Literal[
@@ -124,7 +133,9 @@ class OrgDRGConflict:
     built_in_value: Any | None
     org_value: Any
     project_value: Any | None
-    resolution_applied: Literal["hard_fail", "built_in_wins", "project_wins"]
+    resolution_applied: Literal[
+        "hard_fail", "built_in_wins", "project_wins", "org_override"
+    ]
 
 
 class OrgDRGConflictError(Exception):
@@ -189,35 +200,23 @@ class UnknownRelationError(Exception):
 
 
 def _tag_source(obj: _ModelT, source: str) -> _ModelT:
-    """Attach a ``provenance`` sidecar attribute to a frozen Pydantic model.
+    """Return a copy of *obj* with its declared ``provenance`` field set.
 
-    DRGNode / DRGEdge are :class:`BaseModel` instances with no native
-    ``provenance`` field. We thread provenance through the merged graph
-    without changing the built-in model shape by monkey-setting a plain
-    attribute. Consumers read with ``getattr(node, 'provenance', None)``.
+    DRGNode / DRGEdge now declare a typed ``provenance: str | None`` field
+    (FR-013, D2-revised). Provenance is set via ``model_copy(update=...)`` so
+    the field is populated through the model's own validation surface instead
+    of the former ``object.__setattr__`` sidecar. Consumers read the field
+    directly (``node.provenance``) or, where the graph object is duck-typed,
+    via ``getattr(node, "provenance", None)``.
 
     .. note::
-        The attribute is named ``provenance`` (NOT ``source``) to avoid
-        colliding with ``DRGEdge.source``, which is the source-endpoint URN
-        declared in the Pydantic model. Using ``source`` as the sidecar name
-        caused ``_tag_source`` to silently overwrite the endpoint URN on every
-        merged edge (P0 bug, Robert review 2026-05).
-
-    The Pydantic v2 ``object.__setattr__`` workaround is needed because
-    BaseModel restricts attribute assignment to declared fields by default.
-
-    .. note:: T013 (FR-013) — provenance sidecar typing.
-        A fully-typed provenance carrier (a declared optional field on the
-        DRG models or a typed wrapper dataclass) would change the public
-        shape of ``DRGNode`` / ``DRGEdge`` and ripple into every consumer
-        that reads ``getattr(node, "provenance", None)`` across the doctrine,
-        charter, and specify_cli layers. That is not a low-risk change for a
-        close-out WP, so the typed-provenance refactor is deferred to a
-        tracker per the "SHOULD … OR tracker" disposition. Follow-up tracker:
-        org-doctrine-profile-integrity-closeout WP06/T021 (DIRECTIVE_013).
+        The field is named ``provenance`` (NOT ``source``) to avoid colliding
+        with ``DRGEdge.source``, which is the source-endpoint URN. Using
+        ``source`` as the marker name caused an earlier sidecar to silently
+        overwrite the endpoint URN on every merged edge (P0 bug, Robert review
+        2026-05).
     """
-    object.__setattr__(obj, "provenance", source)
-    return obj
+    return obj.model_copy(update={"provenance": source})
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +244,21 @@ def _violates_layer_rule(node: Any) -> bool:
 
 
 def _built_in_invariant_ids(built_in: DRGGraph) -> frozenset[str]:
-    """The set of URNs that org packs cannot override.
+    """The set of built-in URNs that an org node may collide with.
 
-    Mission policy (FR-005): every built-in node is treated as an invariant.
-    Org packs may only add new nodes or refine relations; they may not collide
-    with built-in node URNs. An operator who needs to override a built-in
-    invariant must escalate via a governance proposal rather than ship a
-    silently-overriding org pack.
+    Every built-in node URN is returned. A collision is no longer an automatic
+    hard-fail: an org node whose URN matches a built-in URN **and whose kind
+    matches** is permitted to override the built-in in place (permitted-but-
+    visible — a ``node_override`` conflict with ``resolution_applied =
+    "org_override"`` is recorded and a WARNING is emitted). A collision whose
+    kind DIFFERS (kind-drift) still hard-fails: an override may replace a
+    built-in's content, never its kind. Layer-rule violations also still
+    hard-fail.
+
+    Whether a given repo *tolerates* a built-in override is a per-repo
+    governance TEST (``tests/architectural/test_builtin_override_policy.py``
+    consults ``.kittify/doctrine/replaceable-builtins.yaml``), not a merge-time
+    prohibition.
     """
     return frozenset(n.urn for n in built_in.nodes)
 
@@ -270,8 +277,7 @@ def _bridge_org_node_to_drg_node(node: Any, source: str) -> tuple[str, DRGNode]:
     singular = _PLURAL_TO_SINGULAR[node.kind]
     urn = f"{singular}:{node.id}"
     drg_node = DRGNode(urn=urn, kind=NodeKind(singular), label=node.title)
-    _tag_source(drg_node, source)
-    return urn, drg_node
+    return urn, _tag_source(drg_node, source)
 
 
 def _resolve_relation(relation_value: str, source_marker: str) -> Relation:
@@ -319,8 +325,54 @@ def _bridge_org_edge_to_drg_edge(
         target_urn = f"directive:{edge.target}"
 
     drg_edge = DRGEdge(source=source_urn, target=target_urn, relation=relation)
-    _tag_source(drg_edge, source)
-    return drg_edge
+    return _tag_source(drg_edge, source)
+
+
+def _resolve_builtin_collision(
+    urn: str,
+    org_node: Any,
+    drg_node: DRGNode,
+    merged_nodes: dict[str, DRGNode],
+    conflicts: list[OrgDRGConflict],
+    source_marker: str,
+) -> None:
+    """Resolve an org node whose URN collides with a built-in node.
+
+    Kind-drift (the org node's kind DIFFERS from the built-in node's kind) is a
+    ``hard_fail``: an override may replace a built-in's content, never its kind.
+    A SAME-KIND collision is PERMITTED — the org node substitutes the built-in
+    in place (``merged_nodes[urn] = drg_node``), a ``node_override`` conflict
+    with ``resolution_applied = "org_override"`` is recorded, and a WARNING is
+    emitted. In-place URN substitution preserves the built-in's inbound and
+    outbound edges (no rehoming), mirroring the project-layer override path.
+    """
+    built_in_node = merged_nodes[urn]
+    if drg_node.kind != built_in_node.kind:
+        conflicts.append(
+            OrgDRGConflict(
+                kind="node_override",
+                conflicting_layers=["built-in", source_marker],
+                target_id=urn,
+                built_in_value=built_in_node.model_dump(),
+                org_value=org_node.model_dump(),
+                project_value=None,
+                resolution_applied="hard_fail",
+            )
+        )
+        return
+    merged_nodes[urn] = drg_node
+    conflicts.append(
+        OrgDRGConflict(
+            kind="node_override",
+            conflicting_layers=["built-in", source_marker],
+            target_id=urn,
+            built_in_value=built_in_node.model_dump(),
+            org_value=org_node.model_dump(),
+            project_value=None,
+            resolution_applied="org_override",
+        )
+    )
+    _warn_builtin_override(urn, source_marker)
 
 
 def _merge_org_fragment(
@@ -334,6 +386,13 @@ def _merge_org_fragment(
 
     Extracted from :func:`merge_three_layers` to keep its cyclomatic
     complexity within the ruff C901 limit (15).
+
+    A built-in URN collision is delegated to :func:`_resolve_builtin_collision`:
+    a SAME-KIND org node permissibly overrides the built-in in place (a
+    ``node_override`` conflict with ``resolution_applied = "org_override"`` plus
+    a WARNING); a kind-drift collision still hard-fails. Whether the repo
+    tolerates a permitted override is a per-repo governance test, not a merge
+    prohibition.
     """
     source_marker = f"org:{fragment.pack_name}"
     surviving_nodes: list[Any] = []
@@ -358,16 +417,8 @@ def _merge_org_fragment(
         urn, drg_node = _bridge_org_node_to_drg_node(node, source_marker)
         node_id_to_urn[node.id] = urn
         if urn in invariant_urns:
-            conflicts.append(
-                OrgDRGConflict(
-                    kind="node_override",
-                    conflicting_layers=["built-in", source_marker],
-                    target_id=urn,
-                    built_in_value=merged_nodes[urn].model_dump(),
-                    org_value=node.model_dump(),
-                    project_value=None,
-                    resolution_applied="hard_fail",
-                )
+            _resolve_builtin_collision(
+                urn, node, drg_node, merged_nodes, conflicts, source_marker
             )
             continue
         if urn not in merged_nodes:
@@ -377,6 +428,23 @@ def _merge_org_fragment(
         drg_edge = _bridge_org_edge_to_drg_edge(edge, node_id_to_urn, source_marker)
         if drg_edge is not None:
             merged_edges.append(drg_edge)
+
+
+def _warn_builtin_override(urn: str, source_marker: str) -> None:
+    """Emit a WARNING when a same-kind org node overrides a built-in node.
+
+    Mirrors :func:`_warn_project_override`. The override is permitted by the
+    merge (kind matches), but is surfaced for operator visibility: a per-repo
+    governance test decides whether the override is allowed for this repo.
+    """
+    _logger.warning(
+        "Org doctrine %r overrides built-in node %r (same-kind override). "
+        "This is permitted by the merge but visible by design; a per-repo "
+        "governance test (replaceable-builtins allowlist) decides whether the "
+        "override is sanctioned.",
+        source_marker,
+        urn,
+    )
 
 
 def _warn_project_override(urn: str, existing_provenance: str) -> None:
@@ -414,14 +482,26 @@ def merge_three_layers(
     block the merge. Use :class:`OrgDRGConflict` records to query overrides
     programmatically.
 
-    Org-tier nodes that collide with a built-in node raise
-    :class:`OrgDRGConflictError` (``resolution_applied='hard_fail'``). Layer-rule
-    violations (org nodes reaching into ``src/specify_cli/``) always hard-fail.
-    An org/project fragment edge with an unrecognised relation label raises
-    :class:`UnknownRelationError` (FR-003 — no silent drop).
+    Org-tier nodes that collide with a built-in node are resolved by kind:
 
-    Every node and edge in the returned graph carries a ``provenance`` sidecar
-    attribute readable via ``getattr(node, 'provenance', None)``:
+    * **Same-kind** collision — PERMITTED. The org node substitutes the built-in
+      in place (preserving the built-in's inbound/outbound edges, mirroring the
+      project-layer override), a ``node_override`` conflict with
+      ``resolution_applied='org_override'`` is recorded, and a WARNING is
+      emitted. The merge does NOT raise. Whether a given repo *tolerates* this
+      override is a per-repo governance TEST
+      (``tests/architectural/test_builtin_override_policy.py`` consulting
+      ``.kittify/doctrine/replaceable-builtins.yaml``), not a merge prohibition.
+    * **Kind-drift** collision (org kind DIFFERS from built-in kind) — hard-fails
+      with :class:`OrgDRGConflictError` (``resolution_applied='hard_fail'``). An
+      override may replace a built-in's content, never its kind.
+
+    Layer-rule violations (org nodes reaching into ``src/specify_cli/``) always
+    hard-fail. An org/project fragment edge with an unrecognised relation label
+    raises :class:`UnknownRelationError` (FR-003 — no silent drop).
+
+    Every node and edge in the returned graph carries a declared ``provenance``
+    field readable via ``node.provenance``:
 
     * ``"built-in"`` — built-in layer (Mission A);
     * ``"org:<pack_name>"`` — contributed by an :class:`OrgDRGFragment`;
@@ -443,12 +523,14 @@ def merge_three_layers(
     Returns
     -------
     DRGGraph:
-        The merged graph. Nodes and edges carry the ``provenance`` sidecar.
+        The merged graph. Nodes and edges carry the declared ``provenance`` field.
 
     Raises
     ------
     OrgDRGConflictError:
-        On layer-rule violation OR built-in invariant override. The error
+        On a layer-rule violation OR a kind-drift built-in collision (org kind
+        differs from the built-in kind). A SAME-KIND built-in override does NOT
+        raise (it is recorded as an ``org_override`` conflict). The error
         carries the full conflict list; the caller can inspect ``exc.conflicts``.
     UnknownRelationError:
         On an org/project fragment edge with an unrecognised relation label
@@ -458,10 +540,10 @@ def merge_three_layers(
 
     # Seed the merged maps with the built-in layer.
     merged_nodes: dict[str, DRGNode] = {
-        n.urn: _tag_source(n.model_copy(), "built-in") for n in built_in.nodes
+        n.urn: _tag_source(n, "built-in") for n in built_in.nodes
     }
     merged_edges: list[DRGEdge] = [
-        _tag_source(e.model_copy(), "built-in") for e in built_in.edges
+        _tag_source(e, "built-in") for e in built_in.edges
     ]
 
     invariant_urns = _built_in_invariant_ids(built_in)
@@ -477,13 +559,11 @@ def merge_three_layers(
     if project is not None:
         for node in project.nodes:
             if node.urn in merged_nodes:
-                existing_provenance = getattr(
-                    merged_nodes[node.urn], "provenance", "unknown"
-                )
+                existing_provenance = merged_nodes[node.urn].provenance or "unknown"
                 _warn_project_override(node.urn, existing_provenance)
-            merged_nodes[node.urn] = _tag_source(node.model_copy(), "project")
+            merged_nodes[node.urn] = _tag_source(node, "project")
         for edge in project.edges:
-            merged_edges.append(_tag_source(edge.model_copy(), "project"))
+            merged_edges.append(_tag_source(edge, "project"))
 
     return DRGGraph(
         schema_version=built_in.schema_version,

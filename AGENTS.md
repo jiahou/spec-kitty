@@ -39,7 +39,7 @@ src/doctrine/missions/mission-steps/{mission_type}/{step_id}/prompt.md  (SOURCE)
 **All changes to origin/main MUST go through pull requests. Direct pushes are prohibited.**
 
 - `spec-kitty merge` merges to **local main** only. It does NOT push to origin/main.
-- After `spec-kitty merge`, create a PR branch and open a pull request.
+- After `spec-kitty merge`, if the user explicitly asks to share or publish: create a PR branch (`git checkout -b pr/<slug>`) and open a pull request (`gh pr create`). Do NOT do this automatically — wait for explicit user instruction.
 - Never run `git push origin main` or equivalent. Use a PR branch and `gh pr create`.
 - Always distinguish: **local main** (your checkout) vs **origin/main** (the remote). Never say just "main" — always qualify.
 
@@ -174,7 +174,7 @@ kitty-specs/      # Mission specs (dogfooding)
 docs/             # User documentation
 ```
 
-New architectural designs → `architecture/` following `architecture/README.md` template.
+New architectural designs → `architecture/` following `docs/architecture/README.md` template.
 
 ## Commands
 
@@ -184,6 +184,36 @@ ruff check .
 PWHEADLESS=1 pytest tests/   # headless (prevents browser windows)
 ```
 
+### Local parallel test run (default)
+
+Run the suite in parallel locally — at least 2× faster on a ≥4-core machine:
+
+```bash
+PWHEADLESS=1 pytest tests/ -n auto --dist loadfile -p no:cacheprovider
+# daemon/real-port tests run serially:
+PWHEADLESS=1 pytest tests/sync/test_orphan_sweep.py -n0 -q
+```
+
+Rules:
+
+- **Always `--dist loadfile`, never bare `--dist load`.** `loadfile` keeps every
+  test in a file on a single worker, preserving file-scoped fixture and
+  collection semantics; `load` scatters a file's tests across workers and breaks
+  them.
+- **Per-worker HOME isolation (WP04)** means a parallel run never touches the
+  real `~/.spec-kitty` — each `pytest-xdist` worker (and the serial master) gets
+  its own isolated home / XDG / AppData directories.
+- **Real-port / daemon tests run serially.** OS-global resources (real ports,
+  daemons — e.g. `tests/sync/test_orphan_sweep.py`, ports 9400–9449) are not
+  protected by per-worker HOME isolation, so run them in their own `-n0` pass.
+
+Full rationale, the volume env gates, and the stability ratchet:
+[docs/guides/testing-parallel.md](docs/guides/testing-parallel.md).
+
+When a test goes red on CI unrelated to your diff, follow the flakiness policy —
+**tune budget gates, fix correctness flakes at the root, never retry-to-green:**
+[docs/guides/testing-flakiness.md](docs/guides/testing-flakiness.md).
+
 ## Code Style
 
 Python 3.11+. Follow standard conventions. Any changes to `__init__.py` require a version bump in `pyproject.toml` and a `CHANGELOG.md` entry.
@@ -191,6 +221,19 @@ Python 3.11+. Follow standard conventions. Any changes to `__init__.py` require 
 **New code MUST pass `ruff` and `mypy` with zero issues and zero warnings. Do NOT disable, suppress, or relax checks (no blanket `# noqa`, `# type: ignore`, or per-file ignore additions) to achieve this — fix the code instead.** Narrowly-scoped, individually-justified suppressions are allowed only when the check is genuinely wrong about correct code, and must carry an inline rationale.
 
 **Pre-push: run the terminology guard when touching `src/doctrine/` or user-facing prose.** Some repo-wide gates run only in CI's `integration-tests-core-misc` job, NOT in the `fast-tests-*` suites — so a forbidden-term regression passes local doctrine runs and only fails at CI. Before pushing doctrine/prose changes, run `pytest tests/architectural/test_no_legacy_terminology.py` (≈0.1 s); it enforces the Terminology Canon (e.g. canonical `status commit` not `ceremony`; `Mission` not `feature`). The full `tests/architectural/` suite is the complete safety net.
+
+## Sonar Expectations
+
+Treat these as code-shaping constraints, not post-hoc cleanup:
+
+- **Complexity ceiling is 15.** Ruff `C901` and Sonar `S3776` are aligned (`[tool.ruff.lint.mccabe].max-complexity = 15`). When touching a function near that limit, keep it at `<=15` by extracting small helpers, flattening nested conditionals, or separating lookup/build/emit phases. Do **not** leave a function at 16+ and assume "tests passing" is enough.
+- **Repeated non-trivial literals become constants.** If a string/path/message/help text appears `>=3` times in the same module, hoist it to a named module constant instead of duplicating it. This is the default response to Sonar `S1192`.
+- **Do not leave empty or effect-free exception handlers.** If an `except` block does nothing meaningful, either remove it and let the exception propagate, or add the concrete recovery/logging/translation logic Sonar expects.
+- **Every new branch/helper needs tests in the same PR.** Sonar's project gate is dominated by new-code coverage; extracting helpers without adding focused tests simply moves the failure. When you add or refactor logic, add narrow tests that execute the new branches/helpers directly.
+- **Prefer testable extractions.** Sonar generally rewards pure/helper extraction plus focused tests. If a function is large, extract deterministic subroutines with stable inputs/outputs, then test those paths instead of only relying on a broad integration test.
+- **Prefer real fixes over suppression.** Do not add `# noqa`, `# type: ignore`, or Sonar suppression comments to silence maintainability findings unless the tool is materially wrong about correct code. If suppression is unavoidable, keep it narrow and explain why the code is safe.
+- **Loopback/local-only HTTP is a special case.** Do not "fix" localhost/127.0.0.1 control-plane URLs by forcing HTTPS when the transport is intentionally loopback-only. Keep the safe loopback semantics, add/keep regression tests, and record the rationale in the PR if Sonar raises a hotspot. Code change and hotspot review are separate actions.
+- **PR description must call out remaining Sonar UI work.** If the code is correct but Sonar still needs hotspot review or UI-side rationale application, say so explicitly in the PR body so a later agent does not waste time trying to "fix" it in code.
 
 ## Recent Changes
 
@@ -239,11 +282,11 @@ Full docs: [CONTRIBUTING.md](CONTRIBUTING.md#release-process)
 2. Update agent wrappers to use the resolver.
 3. Update templates, skills, and docs together.
 
-**Testing:** Unit coverage for workspace resolution + integration coverage for `agent workflow implement/review`.
+**Testing:** Unit coverage for workspace resolution + integration coverage for `agent action implement/review`.
 
 **Status source of truth:** Feature metadata on main branch, not the open worktree.
 
-**References:** [execution-lanes.md](docs/explanation/execution-lanes.md), [git-worktrees.md](docs/explanation/git-worktrees.md)
+**References:** [execution-lanes.md](docs/architecture/execution-lanes.md), [git-worktrees.md](docs/architecture/git-worktrees.md)
 
 ---
 
@@ -369,13 +412,13 @@ Full runbook: [docs/migration/mission-id-canonical-identity.md](docs/migration/m
 
 Enforced by `tests/architectural/test_shared_package_boundary.py`, `test_pyproject_shape.py`, and the `clean-install-verification` CI job.
 
-ADR: [`architecture/3.x/adr/2026-04-25-1-shared-package-boundary.md`](architecture/3.x/adr/2026-04-25-1-shared-package-boundary.md). Runbook: [`docs/migration/shared-package-boundary-cutover.md`](docs/migration/shared-package-boundary-cutover.md).
+ADR: [`docs/adr/3.x/2026-04-25-1-shared-package-boundary.md`](docs/adr/3.x/2026-04-25-1-shared-package-boundary.md). Runbook: [`docs/migration/shared-package-boundary-cutover.md`](docs/migration/shared-package-boundary-cutover.md).
 
 ---
 
 ## Charter Activation and Doctrine Integrity Model
 
-Governing ADR: [`architecture/3.x/adr/2026-05-16-1-doctrine-layer-merge-semantics.md`](architecture/3.x/adr/2026-05-16-1-doctrine-layer-merge-semantics.md)
+Governing ADR: [`docs/adr/3.x/2026-05-16-1-doctrine-layer-merge-semantics.md`](docs/adr/3.x/2026-05-16-1-doctrine-layer-merge-semantics.md)
 
 ### Activation Engine (`charter.activation_engine`)
 
@@ -485,7 +528,7 @@ npm install --save-dev jsdoc docdash   # JavaScript generator
 ```
 Low-confidence classification: add `---\ntype: tutorial\n---` frontmatter. Unpopulated templates: replace all `[TODO: ...]` placeholders.
 
-**Implementation:** `src/specify_cli/missions/documentation/mission.yaml`, `doc_generators.py`, `gap_analysis.py`, `doc_state.py`. User guide: [docs/documentation-mission.md](docs/documentation-mission.md).
+**Implementation:** `src/specify_cli/missions/documentation/mission.yaml`, `doc_generators.py`, `gap_analysis.py`, `doc_state.py`. User guide: [docs/architecture/documentation-mission.md](docs/architecture/documentation-mission.md).
 
 ---
 
@@ -528,10 +571,12 @@ Two usage patterns:
   trigger: "spec out", "create a mission", "write a spec", "plan this"
   → run `/spec-kitty.specify`
 - **Lightweight dispatch** (ad-hoc fix, question, or advice — no mission created):
-  trigger: "hey spec kitty", "use spec kitty to", "spec kitty, fix/do/ask/advise"
-  → **ALWAYS run `spec-kitty do "<request verbatim>"` — do NOT answer directly.**
+  trigger: "hey spec kitty", "use spec kitty to", "spec kitty <anything>"
+  → **ALWAYS run `spec-kitty dispatch "<request verbatim>"` — do NOT answer directly.**
   If you know the right profile, pass it to skip routing:
-  `spec-kitty do --profile <profile-id> "<request verbatim>"`
-  Reason: `spec-kitty do` loads governance context, routes to the correct agent
-  profile, and records the Op. Skipping it produces ungoverned, untracked responses.
+  `spec-kitty dispatch "<request verbatim>" --profile <profile-id>`
+  Reason: `spec-kitty dispatch` loads governance context, routes the request,
+  and opens the Op. Skipping it produces ungoverned, untracked responses.
+  After finishing the work, close the Op:
+  `spec-kitty profile-invocation complete --invocation-id <id> --outcome <done|failed|abandoned>`
 <!-- /spec-kitty:orientation -->

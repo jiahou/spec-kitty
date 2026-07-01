@@ -79,15 +79,79 @@ These are one time installations required to be able to test your changes locall
 1. Install [Git](https://git-scm.com/downloads)
 1. Have an [AI coding agent available](README.md#-supported-ai-agents)
 
-### Private Dependencies
+### Global CLI Install on macOS
 
-Spec-kitty depends on two private libraries:
-- **[spec-kitty-events](https://github.com/Priivacy-ai/spec-kitty-events)** v3.0.0 - Event system and mission-next integration
-- **[spec-kitty-runtime](https://github.com/Priivacy-ai/spec-kitty-runtime)** v0.4.3 - Runtime execution engine
+Contributor tests run from a source checkout, not from a globally installed
+`spec-kitty` binary. Use a global install when you want to run Spec Kitty outside
+this repository or when you are explicitly testing install/update behavior.
+Use one tool manager for a normal global install; installing with both can put
+two `spec-kitty` binaries on your `PATH`.
 
-For CI/CD setup, see [SSH Deploy Keys documentation](docs/development/ssh-deploy-keys.md).
+To install the latest `main` branch from GitHub with `uv`:
 
-For local development, ensure you have SSH access to the repository.
+```bash
+uv tool install "spec-kitty-cli @ git+https://github.com/Priivacy-ai/spec-kitty.git@main"
+uv tool update-shell
+# Open a new shell if uv changed your PATH, then verify:
+spec-kitty --version
+```
+
+To install the latest `main` branch from GitHub with `pipx`:
+
+```bash
+pipx install "git+https://github.com/Priivacy-ai/spec-kitty.git@main"
+pipx ensurepath
+# Open a new shell if pipx changed your PATH, then verify:
+spec-kitty --version
+```
+
+To update an existing GitHub-based global install to the latest `main` branch,
+force a reinstall through the same tool manager:
+
+```bash
+uv tool install --force --upgrade "spec-kitty-cli @ git+https://github.com/Priivacy-ai/spec-kitty.git@main"
+```
+
+```bash
+pipx install --force "git+https://github.com/Priivacy-ai/spec-kitty.git@main"
+```
+
+For the latest PyPI release instead of GitHub `main`, install or upgrade by
+package name:
+
+```bash
+uv tool install spec-kitty-cli
+uv tool upgrade spec-kitty-cli
+```
+
+```bash
+pipx install spec-kitty-cli
+pipx upgrade spec-kitty-cli
+```
+
+After a new PyPI release, CDN caching can make upgrades lag briefly. If that
+happens, reinstall the exact version instead:
+
+```bash
+uv tool install --force spec-kitty-cli==X.Y.Z
+pipx install --force spec-kitty-cli==X.Y.Z
+```
+
+### Shared Dependencies
+
+Spec-kitty's shared libraries are published to PyPI and resolved automatically by
+`uv sync` — **no SSH access or special repository permissions are required for
+local development**:
+
+- **[spec-kitty-events](https://pypi.org/project/spec-kitty-events/)** — event system and mission-next integration.
+- **[spec-kitty-tracker](https://pypi.org/project/spec-kitty-tracker/)** — tracker consumer surface.
+
+Compatibility ranges are declared in `pyproject.toml`; exact pinned versions live
+in `uv.lock`.
+
+`spec-kitty-runtime` is no longer a dependency: the CLI's runtime surface is
+internalized under `src/runtime/next/`, and its absence is enforced by
+`tests/architectural/test_pyproject_shape.py`.
 
 ## Running Tests
 
@@ -107,6 +171,71 @@ pytest tests/integration/        # Integration tests
 pytest tests/unit/               # Unit tests
 pytest tests/integration/test_version_isolation.py  # Isolation tests
 ```
+
+To run the suite in parallel (typically ≥2× faster on a ≥4-core machine), plus
+the serial daemon pass and the coverage-neutrality gates, see
+[Running the test suite in parallel](docs/guides/testing-parallel.md).
+
+### Testing Unreleased Main or a Pull Request
+
+When you need to test the current `main` branch or a specific pull request
+before it is published to PyPI, avoid replacing your normal global
+`spec-kitty` install unless that is the thing you are testing.
+
+For normal contributor work, run from a source checkout:
+
+```bash
+git clone https://github.com/Priivacy-ai/spec-kitty.git
+cd spec-kitty
+
+# Latest main:
+git switch main
+git pull --ff-only
+
+# Or a specific pull request:
+gh pr checkout <PR_NUMBER>
+
+uv sync --frozen --all-extras
+
+SPEC_KITTY_NO_UPGRADE_CHECK=1 SPEC_KITTY_NO_NAG=1 \
+  .venv/bin/spec-kitty --version
+```
+
+For a one-shot smoke test without cloning or installing a persistent tool, use
+`uvx --isolated`:
+
+```bash
+# Latest main:
+SPEC_KITTY_NO_UPGRADE_CHECK=1 SPEC_KITTY_NO_NAG=1 \
+  uvx --isolated --from "git+https://github.com/Priivacy-ai/spec-kitty.git@main" \
+  spec-kitty --version
+
+# Specific pull request:
+SPEC_KITTY_NO_UPGRADE_CHECK=1 SPEC_KITTY_NO_NAG=1 \
+  uvx --isolated --from "git+https://github.com/Priivacy-ai/spec-kitty.git@refs/pull/<PR_NUMBER>/head" \
+  spec-kitty --version
+```
+
+For a temporary installed binary, isolate both the tool environment and the
+generated executable:
+
+```bash
+tmp="$(mktemp -d)"
+
+UV_TOOL_DIR="$tmp/tools" UV_TOOL_BIN_DIR="$tmp/bin" \
+  uv tool install --force \
+  "spec-kitty-cli @ git+https://github.com/Priivacy-ai/spec-kitty.git@refs/pull/<PR_NUMBER>/head"
+
+SPEC_KITTY_NO_UPGRADE_CHECK=1 SPEC_KITTY_NO_NAG=1 \
+  "$tmp/bin/spec-kitty" --version
+
+rm -rf "$tmp"
+```
+
+If you are testing a fork branch or an exact commit, replace the URL/ref with
+`git+https://github.com/<OWNER>/spec-kitty.git@<BRANCH_OR_SHA>`. Hosted
+tracker and sync flows are opt-in; set `SPEC_KITTY_ENABLE_SAAS_SYNC=1` only
+when the scenario explicitly exercises those flows.
 
 ### Test Isolation
 
@@ -200,7 +329,7 @@ If the broken package lives in a global or Homebrew Python environment, remove
 the stale `spec_kitty_events/` directory and matching `.dist-info/` metadata
 from that interpreter's `site-packages`, then reinstall
 `spec-kitty-events`. See
-[Diagnose Installation Problems](docs/how-to/diagnose-installation.md#9-shared-package-imports-resolve-as-a-namespace-package)
+[Diagnose Installation Problems](docs/guides/diagnose-installation.md#9-shared-package-imports-resolve-as-a-namespace-package)
 for the full recovery procedure.
 
 ### How Test Isolation Works

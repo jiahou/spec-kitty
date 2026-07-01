@@ -150,8 +150,13 @@ def test_scope_rejects_empty_explicit_set() -> None:
         CascadeScope(is_all=False, kinds=frozenset())
 
 
-def test_reference_relations_are_requires_and_suggests() -> None:
-    assert frozenset({Relation.REQUIRES, Relation.SUGGESTS}) == REFERENCE_RELATIONS
+def test_reference_relations_are_requires_suggests_and_refines() -> None:
+    # REFINES joined the cascade reference set in #2079 so a refinement edge is
+    # traversed (not born inert like APPLIES); REQUIRES/SUGGESTS are the legacy set.
+    assert (
+        frozenset({Relation.REQUIRES, Relation.SUGGESTS, Relation.REFINES})
+        == REFERENCE_RELATIONS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +201,22 @@ def test_cascade_activation_is_transitive() -> None:
     )
     result = cascade_activation_targets(graph, "agent_profile:pedro", CascadeScope.all())
     assert result.activated == {"tactic": ["a", "b"]}
+
+
+def test_cascade_follows_refines_edges() -> None:
+    # #2079 behavioral guard (not just set membership): REFINES is a cascade
+    # reference relation, so activating an artifact cascades to what it REFINES.
+    # If REFINES were dropped from REFERENCE_RELATIONS / the traversal, tactic:refined
+    # would not appear — this proves the wiring behaviorally, not just by constant.
+    graph = _graph(
+        nodes=[
+            _node("tactic:base", NodeKind.TACTIC),
+            _node("tactic:refined", NodeKind.TACTIC),
+        ],
+        edges=[_edge("tactic:base", "tactic:refined", Relation.REFINES)],
+    )
+    result = cascade_activation_targets(graph, "tactic:base", CascadeScope.all())
+    assert result.activated == {"tactic": ["refined"]}
 
 
 def test_cascade_activation_no_references_is_empty() -> None:

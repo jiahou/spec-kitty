@@ -19,6 +19,7 @@ before clearing the state file (see ``_kill_and_cleanup``).
 from __future__ import annotations
 
 import errno
+import importlib
 import json
 import logging
 import os
@@ -37,7 +38,7 @@ from enum import Enum
 from functools import cache
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, cast
 
 if sys.platform == "win32":
     import msvcrt
@@ -46,15 +47,34 @@ else:  # pragma: no cover - platform-specific
 
 if TYPE_CHECKING:
     from specify_cli.sync.config import SyncConfig
+    from specify_cli.sync.owner import DaemonOwnerRecord
 
-import psutil  # type: ignore[import-untyped]
+import psutil
 
 from specify_cli.core.atomic import atomic_write
+from specify_cli.core.loopback_http import (
+    build_loopback_base_url,
+    build_loopback_url,
+    create_loopback_server,
+)
+from specify_cli.paths import get_runtime_root
 from specify_cli.sync.diagnostics import SyncDiagnosticCode, emit_sync_diagnostic
 
 logger = logging.getLogger(__name__)
 
-_SPEC_KITTY_DIRNAME = ".spec-kitty"
+
+def _spec_kitty_dir() -> Path:
+    """Return the runtime state root, honouring ``SPEC_KITTY_HOME`` (WP01).
+
+    Resolved lazily on every call so environment overrides and test ``HOME``
+    monkeypatching are honoured (research.md D5). On POSIX this is
+    ``~/.spec-kitty`` when ``SPEC_KITTY_HOME`` is unset — byte-identical to the
+    retired import-time ``SPEC_KITTY_DIR`` constant it replaces.
+    """
+    # ``get_runtime_root`` is seen as ``Any`` here because mypy skips imports
+    # for ``specify_cli.*`` (follow_imports=skip); coerce at the typed boundary.
+    base: Path = get_runtime_root().base
+    return base
 
 
 def _sync_root() -> Path:
@@ -62,12 +82,13 @@ def _sync_root() -> Path:
 
     On Windows: resolves to ``%LOCALAPPDATA%\\spec-kitty\\sync\\``
     via the unified RuntimeRoot.
-    On POSIX: returns ``~/.spec-kitty/sync`` unchanged (preserving existing behavior).
+    On POSIX: returns ``<runtime root>/sync`` (``~/.spec-kitty/sync`` when
+    ``SPEC_KITTY_HOME`` is unset), preserving the existing flat layout.
     """
     if sys.platform == "win32":
-        from specify_cli.paths import get_runtime_root  # noqa: PLC0415
         return get_runtime_root().sync_dir
-    return Path.home() / _SPEC_KITTY_DIRNAME / "sync"
+    base: Path = get_runtime_root().base
+    return base / "sync"
 
 
 def _daemon_root() -> Path:
@@ -75,21 +96,88 @@ def _daemon_root() -> Path:
 
     On Windows: resolves to ``%LOCALAPPDATA%\\spec-kitty\\daemon\\``
     via the unified RuntimeRoot.
-    On POSIX: returns ``~/.spec-kitty`` unchanged (state files live directly
-    under ~/.spec-kitty on POSIX, preserving existing behavior).
+    On POSIX: returns the runtime root itself (``~/.spec-kitty`` when
+    ``SPEC_KITTY_HOME`` is unset) — daemon state files live directly under the
+    flat root on POSIX (research.md D3), never under a ``daemon`` subdir.
     """
     if sys.platform == "win32":
-        from specify_cli.paths import get_runtime_root  # noqa: PLC0415
         return get_runtime_root().daemon_dir
-    return Path.home() / _SPEC_KITTY_DIRNAME
+    base: Path = get_runtime_root().base
+    return base
 
 
-# Module-level path constants derived from platform-aware helpers so that
-# existing code referencing these names continues to work unchanged.
-SPEC_KITTY_DIR = Path.home() / _SPEC_KITTY_DIRNAME
-DAEMON_STATE_FILE = _daemon_root() / "sync-daemon"
-DAEMON_LOG_FILE = _daemon_root() / "sync-daemon.log"
-DAEMON_LOCK_FILE = _daemon_root() / "sync-daemon.lock"
+# Daemon state/log/lock paths are derived lazily from the platform-aware
+# ``_daemon_root()`` helper. Resolving them on every access (rather than freezing
+# them at import time) is what lets ``SPEC_KITTY_HOME`` — and test ``HOME``
+# monkeypatching — take effect even when it is set or changed after this module
+# was first imported (#2171, mirrors the ``SPEC_KITTY_DIR`` shim below).
+#
+# A test (or caller) may still pin an explicit value with
+# ``monkeypatch.setattr(daemon, "DAEMON_STATE_FILE", path)``; that binds the name
+# as a real module global, which then shadows ``__getattr__`` for lookups. The
+# in-module helpers below honor such an override first so production reads and
+# patched-out tests agree on a single seam.
+_LAZY_PATH_RESOLVERS: dict[str, Callable[[], Path]]  # forward decl for helpers
+
+
+def _resolve_lazy_path(name: str, resolver: Callable[[], Path]) -> Path:
+    """Return an explicitly-pinned module override for ``name`` if present, else
+    the lazily-resolved default.
+
+    The four lazy path names are never defined as real module globals (they are
+    served by ``__getattr__``), so ``globals().get(name)`` is ``None`` unless a
+    caller — typically a test via ``monkeypatch.setattr`` — pinned a value. Any
+    such override (a real ``Path`` or a duck-typed test double exposing the
+    ``Path`` surface the daemon uses) is honored verbatim; otherwise the
+    platform-aware default is resolved fresh on every call.
+    """
+    override: Any = globals().get(name)
+    if override is not None:
+        # Production overrides are real Paths; tests may pin a duck-typed double
+        # exposing the Path surface the daemon consumes. Either is honored.
+        return cast("Path", override)
+    return resolver()
+
+
+def _daemon_state_file() -> Path:
+    """Return the daemon singleton state file under the current daemon root."""
+    return _resolve_lazy_path("DAEMON_STATE_FILE", lambda: _daemon_root() / "sync-daemon")
+
+
+def _daemon_log_file() -> Path:
+    """Return the daemon log file under the current daemon root."""
+    return _resolve_lazy_path("DAEMON_LOG_FILE", lambda: _daemon_root() / "sync-daemon.log")
+
+
+def _daemon_lock_file() -> Path:
+    """Return the daemon advisory-lock file under the current daemon root."""
+    return _resolve_lazy_path("DAEMON_LOCK_FILE", lambda: _daemon_root() / "sync-daemon.lock")
+
+
+_LAZY_PATH_RESOLVERS = {
+    "SPEC_KITTY_DIR": _spec_kitty_dir,
+    "DAEMON_STATE_FILE": _daemon_state_file,
+    "DAEMON_LOG_FILE": _daemon_log_file,
+    "DAEMON_LOCK_FILE": _daemon_lock_file,
+}
+
+
+def __getattr__(name: str) -> Path:
+    """Lazily resolve path-valued module constants on every access.
+
+    ``SPEC_KITTY_DIR`` and the ``DAEMON_*_FILE`` paths used to be evaluated at
+    import time, which froze them to the home directory present when the module
+    first loaded and defeated ``SPEC_KITTY_HOME`` / test ``HOME`` monkeypatching
+    (research.md D5, #2171). They are now resolved on every access. Kept as
+    module-level shims because external importers (and several daemon tests)
+    reference the names. NOTE: importers must read them as module attributes
+    (``daemon.DAEMON_STATE_FILE``); a ``from daemon import DAEMON_STATE_FILE``
+    binds the value once and re-freezes it.
+    """
+    resolver = _LAZY_PATH_RESOLVERS.get(name)
+    if resolver is not None:
+        return resolver()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class DaemonIntent(str, Enum):
@@ -117,6 +205,9 @@ DAEMON_PORT_MAX_ATTEMPTS = 50
 # compares this against the running daemon and restarts it on mismatch.
 DAEMON_PROTOCOL_VERSION = 1
 
+# Loopback health-check endpoint path served by the sync daemon.
+_HEALTH_ENDPOINT_PATH = "/api/health"
+
 # Keep shutdown latency tight for restart-daemon NFR-002. The default
 # ``serve_forever`` poll interval is 0.5s, which is user-visible on restart.
 DAEMON_SERVE_FOREVER_POLL_SECONDS: float = 0.05
@@ -125,6 +216,17 @@ DAEMON_SERVE_FOREVER_POLL_SECONDS: float = 0.05
 # DAEMON_STATE_FILE this often; if the recorded port is held by a different
 # live process, the daemon retires itself.  See FR-008 / FR-010.
 DAEMON_TICK_SECONDS: int = 30
+
+# Idle self-retirement window (FR-011 / DD-03).  A daemon with no authenticated
+# requests and no sync work in flight retires after this many seconds.  The
+# constant is module-level so tests can patch it to a low value without
+# introducing wall-clock sleeps.
+SYNC_DAEMON_IDLE_RETIREMENT_SECONDS: float = 900.0
+
+# Tracks the monotonic time of the last authenticated request received by this
+# daemon process.  Initialised to the process start time so a freshly-spawned
+# daemon does not immediately retire before its first client connects.
+_daemon_last_activity_time: float = time.monotonic()
 
 _RUNTIME_BACKGROUND_START_DELAY_SECONDS: float = 1.0
 _STARTUP_HEALTH_TIMEOUT_SECONDS: float = 0.1
@@ -275,7 +377,7 @@ def _fetch_health_payload(health_url: str, timeout: float = 0.5) -> dict[str, An
 
 
 def _check_sync_daemon_health(port: int, expected_token: str | None, timeout: float = 0.5) -> bool:
-    data = _fetch_health_payload(f"http://127.0.0.1:{port}/api/health", timeout=timeout)
+    data = _fetch_health_payload(build_loopback_url(port, _HEALTH_ENDPOINT_PATH), timeout=timeout)
     if not data:
         return False
     if data.get("status") != "ok":
@@ -288,14 +390,13 @@ def _check_sync_daemon_health(port: int, expected_token: str | None, timeout: fl
 
 def _daemon_version_matches(port: int, expected_token: str | None, timeout: float = 0.5) -> bool:
     """Return True if the running daemon reports the current protocol + package version."""
-    data = _fetch_health_payload(f"http://127.0.0.1:{port}/api/health", timeout=timeout)
+    data = _fetch_health_payload(build_loopback_url(port, _HEALTH_ENDPOINT_PATH), timeout=timeout)
     if not data:
         return False
     if data.get("status") != "ok":
         return False
-    if expected_token:
-        if data.get("token") != expected_token:
-            return False
+    if expected_token and data.get("token") != expected_token:
+        return False
     remote_proto = data.get("protocol_version")
     remote_pkg = data.get("package_version")
     if remote_proto != DAEMON_PROTOCOL_VERSION:
@@ -316,6 +417,7 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
     """Localhost-only HTTP control plane for the machine-global sync daemon."""
 
     daemon_token: str | None = None
+    daemon_owner_record: DaemonOwnerRecord | None = None
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         del format, args
@@ -373,7 +475,7 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed_path = urllib.parse.urlparse(self.path)
-        if parsed_path.path == "/api/health":
+        if parsed_path.path == _HEALTH_ENDPOINT_PATH:
             self.handle_health()
             return
         if parsed_path.path == "/api/sync/trigger":
@@ -397,7 +499,7 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def handle_health(self) -> None:
-        from specify_cli.sync.owner import read_owner_record, redact_token
+        from specify_cli.sync.owner import redact_token
 
         sync: Any | None = None
         websocket_status = "Offline"
@@ -414,6 +516,13 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
         payload: dict[str, Any] = {
             "status": "ok",
             "token": getattr(self, "daemon_token", None),
+            # FR-001 / C-001: hard family tag lets a scanner confirm identity
+            # from the self-report (defense-in-depth on top of port-range isolation).
+            "daemon_family": "sync",
+            # Surface the resolved daemon-root scope so scanners can verify
+            # singleton_scope_id matches the foreground scope without needing
+            # to inspect the process cmdline separately.
+            "singleton_scope_id": _daemon_scope_root(),
             "protocol_version": DAEMON_PROTOCOL_VERSION,
             "package_version": _get_package_version(),
             "sync": {
@@ -423,10 +532,9 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
             },
             "websocket_status": websocket_status,
         }
-        # Surface the redacted owner record (FR-006). The redactor returns
-        # ``None`` when no record exists; we drop the key in that case so
-        # the wire shape stays clean.
-        owner_view = redact_token(read_owner_record())
+        # Surface this daemon instance's own owner record, not the shared
+        # owner.json file that another same-scope daemon may have overwritten.
+        owner_view = redact_token(getattr(self, "daemon_owner_record", None))
         if owner_view is not None:
             payload["owner"] = owner_view
         self._send_json(200, payload)
@@ -435,6 +543,7 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
         if self._require_token() is None:
             return
 
+        _touch_last_activity()
         from specify_cli.sync.runtime import get_runtime
 
         runtime = get_runtime()
@@ -449,6 +558,7 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
         if payload is None:
             return
 
+        _touch_last_activity()
         raw_event = payload.get("event")
         if not isinstance(raw_event, dict):
             self._send_json(400, {"error": "invalid_event"})
@@ -469,6 +579,7 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
         if self._require_token() is None:
             return
 
+        _touch_last_activity()
         self._send_json(200, {"status": "stopping"})
 
         def shutdown_server(server: HTTPServer) -> None:
@@ -478,46 +589,100 @@ class SyncDaemonHandler(BaseHTTPRequestHandler):
         threading.Thread(target=shutdown_server, args=(self.server,), daemon=True).start()
 
 
+def _touch_last_activity() -> None:
+    """Record that an authenticated request was just received.
+
+    Called from authenticated handler endpoints so the idle-retirement clock
+    resets on each real client interaction.  Not called for unauthenticated
+    probes (e.g. ``/api/health``), which do not constitute "work".
+    """
+    global _daemon_last_activity_time
+    _daemon_last_activity_time = time.monotonic()
+
+
+def _should_self_retire(
+    *,
+    my_port: int,
+    parsed_port: int | None,
+    parsed_pid: int | None,
+    sync_is_running: bool,
+    idle_seconds: float,
+) -> tuple[bool, str]:
+    """Pure retirement predicate — all decisions made here, not in the tick.
+
+    Returns ``(should_retire, reason)`` so callers can log the reason and tests
+    can assert on it without mocking ``server.shutdown()``.
+
+    Rules (FR-010 / FR-011):
+    - Never retire while sync work is in flight (``sync_is_running``).
+    - Retire promptly when superseded: the state file records a different port
+      whose PID is still alive, meaning a newer daemon took over.
+    - Retire after ``SYNC_DAEMON_IDLE_RETIREMENT_SECONDS`` when no auth/work
+      for the full idle window.
+    """
+    if sync_is_running:
+        return False, "sync_in_flight"
+
+    # Superseded check (prompt retirement — no idle wait).
+    if parsed_port is not None and parsed_port != my_port and parsed_pid is not None:
+        if _is_process_alive(parsed_pid):
+            return True, "superseded"
+
+    # General idle timeout (FR-011).
+    if idle_seconds >= SYNC_DAEMON_IDLE_RETIREMENT_SECONDS:
+        return True, "idle_timeout"
+
+    return False, "active"
+
+
 def _decide_self_retire(server: HTTPServer, my_port: int) -> None:
-    """Inspect ``DAEMON_STATE_FILE`` and retire the running daemon if it is no
-    longer the recorded singleton.
+    """Inspect ``DAEMON_STATE_FILE`` and retire the running daemon if warranted.
 
     State-file ownership belongs exclusively to
     ``_ensure_sync_daemon_running_locked``: this function MUST NOT call
     ``_write_daemon_file`` or ``DAEMON_STATE_FILE.unlink``.  When the recorded
-    record is missing, malformed, or matches our own port we simply continue.
-    When the recorded port differs and the recorded PID is still alive we are
-    by definition the orphan and call ``server.shutdown()``.  When the
-    recorded PID is dead, the file is stale; the next ``ensure_running`` call
-    will reconcile it, so we keep running.
+    record is missing or malformed we check only the idle timeout.  When the
+    recorded port matches our own port we are the singleton and check only the
+    idle timeout (we will never be superseded).
+
+    Retirement conditions (delegated to ``_should_self_retire``):
+    - **Superseded**: state file records a different port whose PID is alive.
+    - **General idle**: no authenticated request for
+      ``SYNC_DAEMON_IDLE_RETIREMENT_SECONDS`` and no sync work in flight.
+    - **Guard**: never retire while ``sync.is_running`` is True (FR-010).
     """
     try:
-        _url, parsed_port, _token, parsed_pid = _parse_daemon_file(DAEMON_STATE_FILE)
+        _url, parsed_port, _token, parsed_pid = _parse_daemon_file(_daemon_state_file())
     except Exception:
-        logger.debug("self-check tick: parse error, skipping")
-        return
+        logger.debug("self-check tick: parse error, skipping singleton check")
+        parsed_port = None
+        parsed_pid = None
 
-    if parsed_port is None:
-        logger.debug("self-check tick: no recorded port, skipping")
-        return
+    # Gather sync-in-flight state without importing the full runtime on the
+    # hot path; failure to probe is safe (treated as "not running").
+    sync_is_running = False
+    try:
+        runtime_module = importlib.import_module("specify_cli.sync.runtime")
+        _rt = getattr(runtime_module, "_runtime", None)
+        if _rt is not None and _rt.background_service is not None:
+            sync_is_running = bool(_rt.background_service.is_running)
+    except Exception:
+        logger.debug("self-check tick: could not probe sync state", exc_info=True)
 
-    if parsed_port == my_port:
-        logger.debug("self-check tick: port matches (%d), continuing", my_port)
-        return
-
-    if parsed_pid is None or not _is_process_alive(parsed_pid):
-        logger.debug(
-            "self-check tick: recorded port=%d but pid=%s not alive; not retiring",
-            parsed_port,
-            parsed_pid,
-        )
-        return
-
-    logger.info(
-        "self-retiring (state file points at port=%d, our port=%d)",
-        parsed_port,
-        my_port,
+    idle_seconds = time.monotonic() - _daemon_last_activity_time
+    should_retire, reason = _should_self_retire(
+        my_port=my_port,
+        parsed_port=parsed_port,
+        parsed_pid=parsed_pid,
+        sync_is_running=sync_is_running,
+        idle_seconds=idle_seconds,
     )
+
+    if not should_retire:
+        logger.debug("self-check tick: continuing (reason=%s)", reason)
+        return
+
+    logger.info("self-retiring (reason=%s, port=%d)", reason, my_port)
     server.shutdown()
 
 
@@ -584,14 +749,20 @@ def _start_self_check_tick(
     return timer
 
 
-def _start_runtime_bootstrap_thread(port: int, daemon_token: str | None) -> None:
+def _start_runtime_bootstrap_thread(
+    port: int,
+    daemon_token: str | None,
+    handler_class: type[SyncDaemonHandler],
+) -> None:
     def _start_runtime_in_background() -> None:
         try:
             time.sleep(_RUNTIME_BACKGROUND_START_DELAY_SECONDS)
             from specify_cli.sync.runtime import get_runtime
 
             get_runtime()
-            _write_daemon_owner_record(port, daemon_token, allow_network=True)
+            owner_record = _write_daemon_owner_record(port, daemon_token, allow_network=True)
+            if owner_record is not None:
+                handler_class.daemon_owner_record = owner_record
         except Exception:  # noqa: BLE001 — health endpoint stays available
             logger.exception("Failed to start sync runtime")
 
@@ -602,7 +773,9 @@ def _start_runtime_bootstrap_thread(port: int, daemon_token: str | None) -> None
     ).start()
 
 
-def _write_daemon_owner_record(port: int, daemon_token: str | None, *, allow_network: bool) -> None:
+def _write_daemon_owner_record(
+    port: int, daemon_token: str | None, *, allow_network: bool
+) -> DaemonOwnerRecord | None:
     from specify_cli.sync.owner import (
         build_record_for_current_process,
         write_owner_record,
@@ -622,16 +795,18 @@ def _write_daemon_owner_record(port: int, daemon_token: str | None, *, allow_net
         if not allow_network:
             raise
         logger.debug("Failed to enrich daemon owner record", exc_info=True)
+        return None
+    return record
 
 
-def _register_daemon_owner_cleanup() -> Callable[[], None]:
+def _register_daemon_owner_cleanup(pid: int, port: int) -> Callable[[], None]:
     import atexit
 
-    from specify_cli.sync.owner import remove_owner_record
+    from specify_cli.sync.owner import remove_owner_record_if_matches
 
     def _cleanup_owner_record() -> None:
         try:
-            remove_owner_record()
+            remove_owner_record_if_matches(pid, port)
         except Exception:  # noqa: BLE001
             logger.debug("Owner record cleanup raised; continuing")
 
@@ -677,16 +852,18 @@ def run_sync_daemon(port: int, daemon_token: str | None) -> None:
     handler_class = type(
         "SyncDaemonRouter",
         (SyncDaemonHandler,),
-        {"daemon_token": daemon_token},
+        {"daemon_token": daemon_token, "daemon_owner_record": None},
     )
-    server = HTTPServer(("127.0.0.1", port), handler_class)  # NOSONAR -- sync daemon control plane binds to localhost only
+    handler_type = cast("type[SyncDaemonHandler]", handler_class)
+    server = create_loopback_server(port, handler_class)
 
     # Bind succeeded — record ownership BEFORE accepting traffic so any
     # health probe that arrives in the first scheduling slice already sees
     # a coherent owner field.
-    _write_daemon_owner_record(port, daemon_token, allow_network=False)
-    _start_runtime_bootstrap_thread(port, daemon_token)
-    cleanup_owner_record = _register_daemon_owner_cleanup()
+    owner_record = _write_daemon_owner_record(port, daemon_token, allow_network=False)
+    handler_type.daemon_owner_record = owner_record
+    _start_runtime_bootstrap_thread(port, daemon_token, handler_type)
+    cleanup_owner_record = _register_daemon_owner_cleanup(os.getpid(), port)
     _install_daemon_signal_handlers(server, cleanup_owner_record)
 
     tick = _start_self_check_tick(server, my_port=port)
@@ -702,6 +879,13 @@ def _background_script(port: int, daemon_token: str | None) -> str:
 
     Uses ``-m`` style import so the installed package is found via normal
     ``sys.path`` resolution rather than hard-coding a repo checkout path.
+
+    The spawner (``_spawn_sync_daemon_process``) appends the daemon-root
+    scope marker (:func:`daemon_scope_marker`) and the spawn-interpreter
+    identity marker (:func:`daemon_exec_marker`) as trailing argv elements so
+    the canonical reaper can positively attribute the daemon to its state
+    root and to the interpreter that spawned it; the script itself never
+    reads them.
     """
     return textwrap.dedent(
         f"""\
@@ -713,20 +897,76 @@ def _background_script(port: int, daemon_token: str | None) -> str:
     )
 
 
+# argv prefix marking which daemon state root a spawned ``run_sync_daemon``
+# process belongs to. The canonical reaper (``owner.reap_orphan_daemons``)
+# only reaps processes whose marker matches its own daemon root; processes
+# without a recognizable marker are never auto-reaped.
+DAEMON_SCOPE_ARG_PREFIX = "--spec-kitty-daemon-root="
+
+
+def _daemon_scope_root() -> str:
+    """Return the canonical (symlink-resolved) daemon state root for this process.
+
+    This is the ``$HOME``-derived scope identity embedded in the spawned
+    daemon's argv (:func:`daemon_scope_marker`) and matched by the canonical
+    reaper, so a daemon belonging to a different ``$HOME`` / container /
+    state root is never reaped.
+    """
+    root = _daemon_root()
+    try:
+        return str(root.resolve())
+    except (OSError, RuntimeError):
+        return str(root)
+
+
+def daemon_scope_marker() -> str:
+    """Return the argv scope-marker element for daemons spawned by this process."""
+    return DAEMON_SCOPE_ARG_PREFIX + _daemon_scope_root()
+
+
+# argv prefix recording the canonical (symlink-resolved) interpreter the
+# spawn used. On macOS framework Python the spawned interpreter re-execs the
+# ``Resources/Python.app/Contents/MacOS/Python`` stub, rewriting BOTH the
+# running daemon's ``Process.exe()`` AND its ``argv[0]`` to the stub path —
+# so no live-process identity source can ever equal the foreground's
+# canonical ``sys.executable``. The inert argv tail survives the re-exec
+# verbatim, so the reaper compares this spawn-recorded identity instead of
+# guessing platform rewrites.
+DAEMON_EXEC_ARG_PREFIX = "--spec-kitty-daemon-exec="
+
+
+def _spawn_interpreter_identity() -> str:
+    """Return the canonical (symlink-resolved) interpreter spawning daemons.
+
+    Mirrors ``owner._canonical_executable_path(sys.executable)`` without
+    importing ``owner`` (which imports this module). Resolve failures fall
+    back to the raw ``sys.executable`` string.
+    """
+    try:
+        return str(Path(sys.executable).resolve())
+    except (OSError, RuntimeError):
+        return str(sys.executable)
+
+
+def daemon_exec_marker() -> str:
+    """Return the argv exec-identity element for daemons spawned by this process."""
+    return DAEMON_EXEC_ARG_PREFIX + _spawn_interpreter_identity()
+
+
 def get_sync_daemon_status(timeout: float = 0.5) -> SyncDaemonStatus:
     """Return health and sync metadata for the machine-global daemon."""
-    if not DAEMON_STATE_FILE.exists():
+    if not _daemon_state_file().exists():
         return SyncDaemonStatus(healthy=False)
 
-    url, port, token, pid = _parse_daemon_file(DAEMON_STATE_FILE)
+    url, port, token, pid = _parse_daemon_file(_daemon_state_file())
     if port is None:
         return SyncDaemonStatus(healthy=False, url=url, token=token, pid=pid)
 
-    data = _fetch_health_payload(f"http://127.0.0.1:{port}/api/health", timeout=timeout)
+    data = _fetch_health_payload(build_loopback_url(port, _HEALTH_ENDPOINT_PATH), timeout=timeout)
     if not data:
         return SyncDaemonStatus(
             healthy=False,
-            url=url or f"http://127.0.0.1:{port}",
+            url=url or build_loopback_base_url(port),
             port=port,
             token=token,
             pid=pid,
@@ -742,7 +982,7 @@ def get_sync_daemon_status(timeout: float = 0.5) -> SyncDaemonStatus:
     websocket_status = str(data.get("websocket_status") or "Offline")
     return SyncDaemonStatus(
         healthy=healthy,
-        url=url or f"http://127.0.0.1:{port}",
+        url=url or build_loopback_base_url(port),
         port=port,
         token=token,
         pid=pid,
@@ -795,7 +1035,7 @@ def _kill_and_cleanup(pid: int | None, *, wait_timeout: float = 2.0) -> None:
                         pass
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    DAEMON_STATE_FILE.unlink(missing_ok=True)
+    _daemon_state_file().unlink(missing_ok=True)
 
 
 def _daemon_start_skip_reason(
@@ -837,10 +1077,10 @@ def _release_daemon_lock(lock_fd: Any) -> None:
 
 
 def _read_daemon_pid() -> int | None:
-    if not DAEMON_STATE_FILE.exists():
+    if not _daemon_state_file().exists():
         return None
     try:
-        _u, _p, _t, pid = _parse_daemon_file(DAEMON_STATE_FILE)
+        _u, _p, _t, pid = _parse_daemon_file(_daemon_state_file())
     except Exception:
         return None
     return pid
@@ -880,7 +1120,7 @@ def ensure_sync_daemon_running(  # noqa: C901 — lifecycle decision matrix plus
     # Row 4 & 5: AUTO + REMOTE_REQUIRED — attempt to start
     _daemon_root().mkdir(parents=True, exist_ok=True)
 
-    lock_fd = open(DAEMON_LOCK_FILE, "w")  # noqa: SIM115
+    lock_fd = open(_daemon_lock_file(), "w")  # noqa: SIM115
     acquired = False
     try:
         try:
@@ -947,6 +1187,18 @@ def _ensure_sync_daemon_running_locked(
     if existing is not None:
         return existing
 
+    # FR-014b / #1071: before spawning a replacement, reap any stale
+    # ``run_sync_daemon`` orphans that belong to THIS scope — same canonical
+    # interpreter AND a cmdline daemon-root marker matching THIS daemon state
+    # root. This enforces one daemon per daemon-root scope: a leak from two
+    # spawners in one ``$HOME`` each recycling the other's recorded PID
+    # leaves untracked orphans on fresh ports; the canonical reaper clears
+    # them at spawn. A daemon from a different ``$HOME`` / container
+    # (different daemon root) or one without a recognizable marker
+    # (pre-marker spawns) is never touched (reaper-over-kill guard).
+    # Best-effort: a reaper failure must not block the spawn.
+    _reap_same_executable_orphans()
+
     if preferred_port is not None:
         port = preferred_port
     else:
@@ -954,7 +1206,7 @@ def _ensure_sync_daemon_running_locked(
     token = secrets.token_hex(16)
 
     proc = _spawn_sync_daemon_process(port, token)
-    url = f"http://127.0.0.1:{port}"
+    url = build_loopback_base_url(port)
 
     # Wait up to ~20s for the daemon to become healthy (matching dashboard pattern)
     retry_delays = _bounded_retry_delays(
@@ -967,7 +1219,7 @@ def _ensure_sync_daemon_running_locked(
             token,
             timeout=_STARTUP_HEALTH_TIMEOUT_SECONDS,
         ):
-            _write_daemon_file(DAEMON_STATE_FILE, url, port, token, proc.pid)
+            _write_daemon_file(_daemon_state_file(), url, port, token, proc.pid)
             return url, port, True
         time.sleep(delay)
 
@@ -977,12 +1229,34 @@ def _ensure_sync_daemon_running_locked(
     raise RuntimeError(f"Sync daemon failed health check on port {port}")
 
 
+def _reap_same_executable_orphans() -> None:
+    """Reap stale same-scope ``run_sync_daemon`` orphans at spawn time.
+
+    Delegates to the single canonical reaper (``owner.reap_orphan_daemons``),
+    scoped by this process's interpreter identity AND its daemon-root scope
+    marker (see ``daemon_scope_marker``). Best-effort: any failure is logged
+    at DEBUG and swallowed so a reaper hiccup never blocks daemon startup.
+    """
+    try:
+        from specify_cli.sync.owner import reap_orphan_daemons
+
+        result = reap_orphan_daemons()
+        if result.reaped:
+            logger.info(
+                "Reaped %d stale sync-daemon orphan(s) at spawn: %s",
+                len(result.reaped),
+                result.reaped,
+            )
+    except Exception:  # noqa: BLE001 — reaping is best-effort on the spawn path.
+        logger.debug("Spawn-path orphan reap raised; continuing", exc_info=True)
+
+
 def _reuse_or_cleanup_existing_daemon() -> tuple[str, int, bool] | None:
-    if not DAEMON_STATE_FILE.exists():
+    if not _daemon_state_file().exists():
         return None
 
     existing_url, existing_port, existing_token, existing_pid = _parse_daemon_file(
-        DAEMON_STATE_FILE
+        _daemon_state_file()
     )
     if existing_port is not None and _check_sync_daemon_health(
         existing_port,
@@ -994,33 +1268,46 @@ def _reuse_or_cleanup_existing_daemon() -> tuple[str, int, bool] | None:
             existing_token,
             timeout=_STARTUP_HEALTH_TIMEOUT_SECONDS,
         ):
-            return existing_url or f"http://127.0.0.1:{existing_port}", existing_port, False
+            return existing_url or build_loopback_base_url(existing_port), existing_port, False
 
         logger.info("Recycling sync daemon (version mismatch)")
         _stop_daemon_by_http(
-            existing_url or f"http://127.0.0.1:{existing_port}", existing_token
+            existing_url or build_loopback_base_url(existing_port), existing_token
         )
         _kill_and_cleanup(existing_pid)
         return None
 
     if existing_pid is not None and not _is_process_alive(existing_pid):
-        DAEMON_STATE_FILE.unlink(missing_ok=True)
+        _daemon_state_file().unlink(missing_ok=True)
     elif existing_pid is not None:
         _kill_and_cleanup(existing_pid)
     else:
-        DAEMON_STATE_FILE.unlink(missing_ok=True)
+        _daemon_state_file().unlink(missing_ok=True)
     return None
 
 
 def _spawn_sync_daemon_process(port: int, token: str) -> subprocess.Popen[str]:
-    DAEMON_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(DAEMON_LOG_FILE, "a")  # noqa: SIM115
+    _daemon_log_file().parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(_daemon_log_file(), "a")  # noqa: SIM115
     proc = subprocess.Popen(
-        [sys.executable, "-c", _background_script(port, token)],
+        # The trailing marker argv elements are inert for the script
+        # (``python -c`` exposes them only via ``sys.argv``) but let the
+        # canonical reaper attribute this daemon to THIS daemon state root
+        # and to THIS spawn interpreter (the exec marker is the only identity
+        # that survives the macOS framework re-exec, which rewrites exe()
+        # and argv[0] to the Python.app stub).
+        [
+            sys.executable,
+            "-c",
+            _background_script(port, token),
+            daemon_scope_marker(),
+            daemon_exec_marker(),
+        ],
         stdout=log_fh,
         stderr=log_fh,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
+        text=True,
         env={**os.environ, "SPEC_KITTY_CLI_VERSION": _get_package_version()},
     )
     log_fh.close()
@@ -1044,12 +1331,12 @@ def _stop_daemon_by_http(url: str, token: str | None) -> None:
 
 def stop_sync_daemon(timeout: float = 5.0) -> tuple[bool, str]:
     """Stop the machine-global sync daemon."""
-    if not DAEMON_STATE_FILE.exists():
+    if not _daemon_state_file().exists():
         return False, "No sync daemon metadata found."
 
-    url, port, token, pid = _parse_daemon_file(DAEMON_STATE_FILE)
+    url, port, token, pid = _parse_daemon_file(_daemon_state_file())
     if port is None:
-        DAEMON_STATE_FILE.unlink(missing_ok=True)
+        _daemon_state_file().unlink(missing_ok=True)
         return False, "Sync daemon metadata was invalid and has been cleared."
 
     if not _check_sync_daemon_health(port, token):
@@ -1058,12 +1345,12 @@ def stop_sync_daemon(timeout: float = 5.0) -> tuple[bool, str]:
             return True, "Unhealthy sync daemon metadata has been cleared."
         return True, "Unhealthy sync daemon process stopped. Metadata has been cleared."
 
-    _stop_daemon_by_http(url or f"http://127.0.0.1:{port}", token)
+    _stop_daemon_by_http(url or build_loopback_base_url(port), token)
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not _check_sync_daemon_health(port, token, timeout=0.2):
-            DAEMON_STATE_FILE.unlink(missing_ok=True)
+            _daemon_state_file().unlink(missing_ok=True)
             return True, "Sync daemon stopped."
         time.sleep(0.05)
 
@@ -1072,7 +1359,7 @@ def stop_sync_daemon(timeout: float = 5.0) -> tuple[bool, str]:
             psutil.Process(pid).kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    DAEMON_STATE_FILE.unlink(missing_ok=True)
+    _daemon_state_file().unlink(missing_ok=True)
     return True, "Sync daemon stopped."
 
 
@@ -1138,10 +1425,10 @@ def scan_sync_daemons() -> DaemonSingletonReport:
     excluded from the orphan list.
     """
     state_pid: int | None = None
-    state_present = DAEMON_STATE_FILE.exists()
+    state_present = _daemon_state_file().exists()
     if state_present:
         try:
-            _, _, _, state_pid = _parse_daemon_file(DAEMON_STATE_FILE)
+            _, _, _, state_pid = _parse_daemon_file(_daemon_state_file())
         except Exception:  # noqa: BLE001
             state_pid = None
 
@@ -1175,6 +1462,14 @@ def cleanup_orphan_sync_daemons(
 ) -> tuple[DaemonSingletonReport, list[int]]:
     """Terminate orphan sync-daemon processes; return report and PIDs killed.
 
+    Diagnostic surface for ``sync status`` / ``sync doctor``. The actual kill
+    escalation delegates to the canonical reaper's single sweep
+    (``owner._sweep_daemon_process``) so there is exactly ONE kill path
+    host-wide (FR-015 / SC-7). Unlike :func:`reap_orphan_daemons`, this surface
+    is *not* executable-scoped: operators running ``sync status`` expect to see
+    and clear every leaked ``run_sync_daemon`` they own, regardless of
+    interpreter.
+
     Args:
         dry_run: When True, report the orphans without terminating
             anything. Useful for diagnostics and tests.
@@ -1187,28 +1482,19 @@ def cleanup_orphan_sync_daemons(
         that received a kill signal. When ``dry_run`` is True the list
         is always empty.
     """
+    from specify_cli.sync.owner import _sweep_daemon_process
+
     report = scan_sync_daemons()
     killed: list[int] = []
     if dry_run:
         return report, killed
 
     for orphan in report.orphan_processes:
-        try:
-            proc = psutil.Process(orphan.pid)
-        except psutil.NoSuchProcess:
-            continue
-        try:
-            proc.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        try:
-            proc.wait(timeout=timeout)
-        except psutil.TimeoutExpired:
-            try:
-                proc.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        except psutil.NoSuchProcess:
-            pass
-        killed.append(orphan.pid)
+        reaped, _signal_path, _reason = _sweep_daemon_process(
+            orphan.pid,
+            terminate_wait_s=timeout,
+            kill_wait_s=timeout,
+        )
+        if reaped:
+            killed.append(orphan.pid)
     return report, killed

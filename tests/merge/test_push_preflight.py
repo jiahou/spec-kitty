@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
 
 def test_domain_preflight_does_not_import_push_preflight_at_module_load() -> None:
@@ -217,7 +217,7 @@ def test_resume_preserves_original_push_request() -> None:
         wp_order=["WP01"],
         push_requested=True,
     )
-    with patch("specify_cli.cli.commands.merge.load_state", return_value=state):
+    with patch("specify_cli.merge.preflight.load_state", return_value=state):
         assert _effective_push_requested(Path("/fake/repo"), "mission-01KT", False) is True
 
 
@@ -233,5 +233,5 @@ def test_resume_cannot_add_push_to_local_only_merge() -> None:
         wp_order=["WP01"],
         push_requested=False,
     )
-    with patch("specify_cli.cli.commands.merge.load_state", return_value=state):
+    with patch("specify_cli.merge.preflight.load_state", return_value=state):
         assert _effective_push_requested(Path("/fake/repo"), "mission-01KT", True) is False

@@ -23,6 +23,7 @@ from rich.table import Table
 from typing_extensions import Annotated
 
 from specify_cli.context.mission_resolver import AmbiguousHandleError, MissionNotFoundError, ResolvedMission, resolve_mission
+from specify_cli.coordination.surface_resolver import resolve_status_surface
 from specify_cli.core.paths import locate_project_root
 from specify_cli.doctrine_synthesizer import (
     SynthesisResult,
@@ -46,7 +47,12 @@ from specify_cli.retrospective.schema import (
     RetrospectiveRecord,
 )
 from specify_cli.retrospective.schema import RecordValidationError
-from specify_cli.retrospective.writer import WriterError, write_gen_record, write_record
+from specify_cli.retrospective.writer import (
+    WriterError,
+    resolve_existing_record_path,
+    write_gen_record,
+    write_record,
+)
 from specify_cli.status import reduce as reduce_status_events
 from specify_cli.status import read_events
 
@@ -70,9 +76,15 @@ def resolve_mission_handle(handle: str, repo_root: Path, *, json_mode: bool = Fa
 # ---------------------------------------------------------------------------
 
 
-def _retro_path(repo_root: Path, mission_id: str) -> Path:
-    """Return the canonical retrospective.yaml path for a mission."""
-    return repo_root / ".kittify" / "missions" / mission_id / "retrospective.yaml"
+def _retro_path(repo_root: Path, mission_slug: str, mission_id: str = "") -> Path:
+    """Return the retrospective.yaml path to read for a mission.
+
+    FR-006 (#1771): the record lives in the tracked feature_dir
+    (``kitty-specs/<slug>/retrospective.yaml``); falls back to the legacy
+    gitignored ``.kittify/missions/<id>/`` location for pre-relocation records.
+    """
+    record_path: Path = resolve_existing_record_path(repo_root, mission_slug, mission_id)
+    return record_path
 
 
 def _build_actor(actor_id: Optional[str]) -> ActorRef:
@@ -194,8 +206,37 @@ def _empty_synthesis_result(*, dry_run: bool) -> SynthesisResult:
     )
 
 
-def _mission_artifacts_sufficient_for_empty_record(feature_dir: Path) -> bool:
-    """Return True when mission artifacts can support an empty retrospective."""
+def _canonical_events_dir(repo_root: Path, mission_slug: str, fallback_dir: Path) -> Path:
+    """Resolve the directory holding the canonical ``status.events.jsonl`` (FR-009 / #1735).
+
+    Under coordination topology the authoritative event log lives in the
+    coordination worktree, not the primary checkout's feature dir — reading
+    events through ``resolved.feature_dir`` directly is exactly the #1735
+    split-brain bug class. Route through the single canonical surface
+    resolver (:func:`resolve_status_surface`, C-005); fall back to
+    *fallback_dir* only when the surface cannot be resolved (e.g.
+    ``meta.json`` absent for a legacy mission).
+    """
+    try:
+        surface: Path = resolve_status_surface(repo_root, mission_slug)
+    except (FileNotFoundError, ValueError):
+        return fallback_dir
+    return surface.parent
+
+
+def _mission_artifacts_sufficient_for_empty_record(
+    feature_dir: Path,
+    *,
+    repo_root: Path,
+    mission_slug: str,
+) -> bool:
+    """Return True when mission artifacts can support an empty retrospective.
+
+    ``feature_dir`` anchors the *artifact* checks (spec/plan/tasks live in the
+    primary checkout); the *status events* are read through the canonical
+    status surface (FR-009 / #1735), which diverges from ``feature_dir`` under
+    coordination topology.
+    """
     for required in ("spec.md", "plan.md", "tasks.md"):
         if not (feature_dir / required).is_file():
             return False
@@ -203,7 +244,7 @@ def _mission_artifacts_sufficient_for_empty_record(feature_dir: Path) -> bool:
     if not tasks_dir.is_dir() or not list(tasks_dir.glob("WP*.md")):
         return False
     try:
-        events = read_events(feature_dir)
+        events = read_events(_canonical_events_dir(repo_root, mission_slug, feature_dir))
         if not events:
             return False
         snapshot = reduce_status_events(events)
@@ -384,12 +425,15 @@ def synthesize_cmd(
     # Step 3: Load retrospective record
     # Exit 2 = I/O error, 3 = malformed/missing
     # ------------------------------------------------------------------
-    retro_file = _retro_path(repo_root, mission_id)
+    retro_file = _retro_path(repo_root, resolved.mission_slug, mission_id)
     outcome = "retrospective_synthesized"
-    generator_record = None
+    record: RetrospectiveRecord | None = None
+    generator_record: GenRetrospectiveRecord | None = None
+    _fabricated_empty = False
     try:
         record = read_record(retro_file)
     except FileNotFoundError as exc:
+        missing_record_exc = exc
         # T028: Default path — error with RETROSPECTIVE_RECORD_MISSING (exit 1).
         # Legacy path preserved behind --fabricate-empty flag.
         if not fabricate_empty:
@@ -415,11 +459,15 @@ def synthesize_cmd(
                     f"No retrospective record found for this mission.\n"
                     f"Author one with: [bold]spec-kitty retrospect create --mission {resolved.mission_slug}[/bold]"
                 )
-            raise typer.Exit(1) from exc
+            raise typer.Exit(1) from missing_record_exc
 
         # --fabricate-empty: legacy auto-fabrication path
         feature_dir = resolved.feature_dir
-        if feature_dir is not None and _mission_artifacts_sufficient_for_empty_record(feature_dir):
+        if feature_dir is not None and _mission_artifacts_sufficient_for_empty_record(
+            feature_dir,
+            repo_root=repo_root,
+            mission_slug=resolved.mission_slug,
+        ):
             try:
                 retro_file, _gen_record = _create_empty_retrospective_record(
                     repo_root=repo_root,
@@ -476,9 +524,9 @@ def synthesize_cmd(
                         }
                     )
                 )
-                raise typer.Exit(0) from exc
+                raise typer.Exit(0) from missing_record_exc
             _err_console.print(f"[red]Error:[/red] {msg}")
-            raise typer.Exit(3) from exc
+            raise typer.Exit(3) from missing_record_exc
     except (YAMLParseError, SchemaError) as exc:
         try:
             generator_record = read_gen_record(retro_file)
@@ -517,7 +565,11 @@ def synthesize_cmd(
     # When --fabricate-empty created the record, _fabricated_empty is True and
     # record is not defined (the gen record format is incompatible with Pydantic
     # read_record). The fabricated record has no proposals by definition.
-    all_proposals = [] if locals().get("_fabricated_empty") or generator_record is not None else record.proposals
+    if _fabricated_empty or generator_record is not None:
+        all_proposals = []
+    else:
+        assert record is not None
+        all_proposals = record.proposals
 
     if proposal_id:
         # --proposal-id filter: restrict approved_proposal_ids to those listed

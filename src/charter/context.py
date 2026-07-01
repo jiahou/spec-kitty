@@ -9,17 +9,22 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from charter.activations import ActivationEntry
     from charter.pack_context import PackContext
     from charter.scope import CharterScope
+    from doctrine.drg.models import DRGGraph
+    import doctrine.service as _doctrine_service_module
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from charter._catalog_miss import (
+    CatalogMissDiagnosis,
     classify_catalog_miss,
+    classify_scope_filtered_miss,
     emit_catalog_miss_warning,
     format_catalog_miss_stanza,
 )
@@ -40,7 +45,7 @@ from charter.governance_references import (
     render_governance_references,
 )
 from charter.language_scope import infer_repo_languages
-from charter.schemas import DoctrineSelectionConfig
+from charter.schemas import DirectivesConfig, DoctrineSelectionConfig
 from doctrine.agent_profiles import AgentProfile, AgentProfileRepository
 from doctrine.spdd_reasons import append_spdd_reasons_guidance, is_spdd_reasons_active
 from kernel.atomic import atomic_write
@@ -160,7 +165,7 @@ def build_charter_context(
     # MEDIUM-2: honour the scope kwarg by overriding repo_root when provided.
     if scope is not None:
         repo_root = scope.root
-    profile_record = _load_agent_profile(profile) if profile else None
+    profile_record = _load_agent_profile(profile, repo_root) if profile else None
 
     # WP06 / FR-015 — surface a loud diagnostic when the consumer's
     # config references an org pack whose snapshot is missing on disk.
@@ -326,7 +331,7 @@ def build_charter_context_include(
         )
         if section is None:
             raise ValueError(f"No charter section found for selector '{selector}'.")
-        return section
+        return str(section)
 
     org_roots = [org_root] if org_root is not None else None
 
@@ -363,9 +368,12 @@ def build_charter_context_include(
         # raises ("No agent_profile found ...") for a gated/missing one — it
         # never returns None here, so a direct return is sufficient (no dead
         # fall-through branch to guard).
-        return _render_doctrine_artifact_include(
+        artifact_result = _render_doctrine_artifact_include(
             gated_service, canonical_kind, identifier
         )
+        if artifact_result is None:
+            raise ValueError(f"No {canonical_kind} found for selector '{selector}'.")
+        return artifact_result
 
     service = _build_doctrine_service(repo_root, org_roots=org_roots)
     if canonical_kind == ArtifactKind.DIRECTIVE.value:
@@ -400,14 +408,7 @@ def _render_template_include(
     from doctrine.resolver import ResolutionTier
     from doctrine.template_catalog import TierRoot, resolve_template_by_id
 
-    from charter.pack_context import CharterPackConfigError
-
-    try:
-        project_root = resolve_project_root(repo_root)
-    except CharterPackConfigError:
-        # Fail closed (parity with WP12): a malformed charter pack config
-        # must surface, not silently degrade to a partial template lookup.
-        raise
+    project_root = resolve_project_root(repo_root)
 
     tier_roots = [
         TierRoot(
@@ -499,6 +500,7 @@ def _render_generic_artifact_include(service: object, identifier: str) -> str:
     ):
         selector = f"{candidate_kind}:{identifier}"
         try:
+            rendered: str | None
             if candidate_kind == "directive":
                 rendered = _render_directive_include(service, identifier, selector)
             elif candidate_kind == "tactic":
@@ -573,7 +575,7 @@ def _render_doctrine_artifact_include(
 
     repo_attr, label, title_attr, body_formatter = renderer
     repo = getattr(service, repo_attr, None)
-    artifact = repo.get(identifier) if repo is not None else None  # type: ignore[attr-defined]
+    artifact = repo.get(identifier) if repo is not None else None
     if artifact is None:
         raise ValueError(f"No {kind} found for selector '{kind}:{identifier}'.")
     title = getattr(artifact, title_attr, identifier)
@@ -612,7 +614,7 @@ def _prepare_context_state(
 
 def _classify_artifact_urns(
     artifact_urns: frozenset[str] | set[str],
-    merged: object,
+    merged: DRGGraph,
     project_directives: set[str],
     selected_tactics: set[str] | None = None,
     selected_paradigms: set[str] | None = None,
@@ -642,7 +644,7 @@ def _classify_artifact_urns(
     styleguide_ids: list[str] = []
     toolguide_ids: list[str] = []
     for urn in sorted(artifact_urns):
-        node = merged.get_node(urn)  # type: ignore[attr-defined]
+        node = merged.get_node(urn)
         if node is None:
             continue
         artifact_id = urn.split(":", 1)[1] if ":" in urn else urn
@@ -692,7 +694,7 @@ def _enumerate_org_pack_paths(repo_root: Path) -> list[tuple[str, Path]]:
         registry = load_pack_registry(repo_root)
     except Exception:  # noqa: BLE001 - context rendering stays best-effort
         return []
-    return [(pack.name, pack.local_path) for pack in registry.packs]
+    return [(pack.name, pack.effective_root(repo_root)) for pack in registry.packs]
 
 
 def _missing_pack_diagnostic(repo_root: Path) -> str | None:
@@ -837,7 +839,7 @@ def _load_action_doctrine_bundle(
     # get the two-layer (built-in + project) merge.
     #
     # WP04 (charter-mediated-doctrine-selection): a project that authors a
-    # user doctrine artifact (e.g. ``.kittify/doctrine/styleguides/foo.yaml``)
+    # user doctrine artifact (e.g. ``.kittify/doctrine/styleguide/foo.yaml``)
     # without a sibling ``*.graph.yaml`` fragment causes ``load_graph_or_dir``
     # to raise ``DRGLoadError``. The DRG-action resolution is orthogonal to
     # charter-level global selection rendering, so we collapse the failure to
@@ -1009,13 +1011,14 @@ def _render_bootstrap_text(
     _extend_named_artifact_lines(lines, "Tactics", doctrine_bundle.tactic_ids, service.tactics, "name", "purpose", org_source_map=_action_org_source_map)  # type: ignore[attr-defined]
 
     if effective_depth >= _EXTENDED_CONTEXT_DEPTH:
-        _extend_named_artifact_lines(  # type: ignore[attr-defined]
+        _service_any: Any = service
+        _extend_named_artifact_lines(
             lines, "Styleguides", doctrine_bundle.styleguide_ids,
-            service.styleguides, "title", None, org_source_map=_action_org_source_map,
+            _service_any.styleguides, "title", None, org_source_map=_action_org_source_map,
         )
-        _extend_named_artifact_lines(  # type: ignore[attr-defined]
+        _extend_named_artifact_lines(
             lines, "Toolguides", doctrine_bundle.toolguide_ids,
-            service.toolguides, "title", None, org_source_map=_action_org_source_map,
+            _service_any.toolguides, "title", None, org_source_map=_action_org_source_map,
         )
 
     _append_guidelines_lines(lines, doctrine_bundle.mission, action)
@@ -1249,7 +1252,11 @@ def _build_action_org_source_map(
     return source_map
 
 
-def _build_doctrine_service(repo_root: Path, *, org_roots: list[Path] | None = None) -> object:
+def _build_doctrine_service(
+    repo_root: Path,
+    *,
+    org_roots: list[Path] | None = None,
+) -> _doctrine_service_module.DoctrineService:
     """Build a DoctrineService for the given repo root.
 
     The project-root candidate list (in priority order):
@@ -1273,17 +1280,21 @@ def _build_doctrine_service(repo_root: Path, *, org_roots: list[Path] | None = N
 
     doctrine_root = resolve_doctrine_root()
     project_root = resolve_project_root(repo_root)
-    kwargs: dict[str, object] = {
-        "built_in_root": doctrine_root,
-        "project_root": project_root,
-        "active_languages": infer_repo_languages(repo_root),
-    }
     # Only pass ``org_roots`` when it carries paths so charter-internal
     # callers see byte-identical kwargs (preserves existing test stubs and
     # downstream constructors that may not declare the parameter).
     if org_roots:
-        kwargs["org_roots"] = org_roots
-    return DoctrineService(**kwargs)
+        return DoctrineService(
+            built_in_root=doctrine_root,
+            project_root=project_root,
+            active_languages=infer_repo_languages(repo_root),
+            org_roots=org_roots,
+        )
+    return DoctrineService(
+        built_in_root=doctrine_root,
+        project_root=project_root,
+        active_languages=infer_repo_languages(repo_root),
+    )
 
 
 def _build_activation_aware_doctrine_service(
@@ -1303,22 +1314,20 @@ def _build_activation_aware_doctrine_service(
     other five callers of :func:`_build_doctrine_service` are deliberately left
     on the unwrapped service so their return type and behaviour are unchanged.
 
-    Backward compatibility: when the project declares no agent-profile
-    activation restriction (``activated_agent_profiles is None`` — the default
-    for projects without an explicit charter activation list), the wrapper has
-    no filtering to apply, so the inner service is returned unwrapped. This
-    keeps pre-#1636 behaviour byte-identical for unrestricted projects while
-    enforcing the gate as soon as a restriction is configured.
+    Single builder contract (R5): the service is ALWAYS wrapped, even when
+    ``activated_agent_profiles is None``. The wrapper's three-state filter
+    treats ``None`` as "admit all", so the unrestricted case stays byte-identical
+    in *behaviour* to the legacy fetch path while giving both activation-service
+    builders one contract — ``_inner`` is always valid and ``.agent_profiles``
+    is always a gated ``dict``. This matches
+    :func:`specify_cli.doctrine_service_factory.build_activation_aware_doctrine_service`,
+    which also wraps unconditionally.
     """
     from charter.pack_context import PackContext
     from charter.resolver import DoctrineService as ActivationAwareDoctrineService
 
     inner = _build_doctrine_service(repo_root, org_roots=org_roots)
     pack_context = PackContext.from_config(repo_root)
-    if pack_context.activated_agent_profiles is None:
-        # No activation restriction configured: the gate is a no-op, so return
-        # the unwrapped service (identical to the legacy fetch path).
-        return inner
     return ActivationAwareDoctrineService(inner, pack_context=pack_context)
 
 
@@ -1577,14 +1586,21 @@ _PROFILE_INLINE_BODY_LIMIT_CHARS = 2_400
 # at construction; we cache the default instance so per-call cost in the
 # resolver is a dict lookup (NFR-002 budget).
 _DEFAULT_AGENT_PROFILE_REPO: AgentProfileRepository | None = None
+# Per-repo cache of the **charter-activation-aware** profile map (org + project
+# + built-in, gated by ``activated_agent_profiles``). Populated only when the
+# repo declares org packs, so the no-org-packs path stays byte-identical to the
+# built-in-only fast path above (NFR-001). Keyed by resolved ``repo_root``.
+_ACTIVATION_AWARE_PROFILE_MAPS: dict[Path, dict[str, AgentProfile]] = {}
 
 
 def _default_agent_profile_repository() -> AgentProfileRepository:
-    """Return a process-wide cached :class:`AgentProfileRepository`.
+    """Return a process-wide cached **built-in-only** :class:`AgentProfileRepository`.
 
     The repository is constructed lazily on first call and reused for the
     lifetime of the interpreter. Tests that need a clean repository can
-    reset the cache via :func:`_reset_agent_profile_cache`.
+    reset the cache via :func:`_reset_agent_profile_cache`. This is the
+    no-org-packs fast path; org-aware resolution flows through
+    :func:`_activation_aware_profile_map` instead.
     """
     global _DEFAULT_AGENT_PROFILE_REPO
     if _DEFAULT_AGENT_PROFILE_REPO is None:
@@ -1593,12 +1609,82 @@ def _default_agent_profile_repository() -> AgentProfileRepository:
 
 
 def _reset_agent_profile_cache() -> None:
-    """Clear the cached default :class:`AgentProfileRepository` (test hook)."""
+    """Clear the cached profile stores (test hook)."""
     global _DEFAULT_AGENT_PROFILE_REPO
     _DEFAULT_AGENT_PROFILE_REPO = None
+    _ACTIVATION_AWARE_PROFILE_MAPS.clear()
 
 
-def _load_agent_profile(profile_id: str) -> AgentProfile | None:
+def _existing_org_roots(repo_root: Path) -> list[Path]:
+    """Return on-disk org-pack roots declared in ``.kittify/config.yaml``.
+
+    Best-effort: a missing/corrupt config yields an empty list so the caller
+    falls back to the built-in-only fast path. Imports stay charter→doctrine
+    (never charter→specify_cli) so the layer rule holds.
+    """
+    try:
+        from doctrine.drg.org_pack_config import resolve_org_roots  # noqa: PLC0415
+    except ImportError:
+        return []
+    try:
+        return [root for root in resolve_org_roots(repo_root) if root.exists()]
+    except Exception:  # noqa: BLE001 — context rendering stays best-effort
+        return []
+
+
+def _profiles_dict_from_service(service: object) -> dict[str, AgentProfile]:
+    """Return the activation-aware service's pre-gated ``{id: profile}`` map.
+
+    Single builder contract (R5): every activation-service builder now ALWAYS
+    wraps, so ``service.agent_profiles`` is the wrapper's already-gated ``dict``.
+    The empty fallback defends against a service that exposes no mapping.
+    """
+    attr = getattr(service, "agent_profiles", None)
+    return dict(attr) if isinstance(attr, dict) else {}
+
+
+def _activation_aware_profile_map(
+    repo_root: Path, org_roots: list[Path]
+) -> dict[str, AgentProfile]:
+    """Return (and cache) the activation-gated profile map for ``repo_root``.
+
+    Reuses the in-module :func:`_build_activation_aware_doctrine_service`
+    (the FR-016 precedent) so the ``activated_agent_profiles`` three-state
+    gate is honoured — never re-implemented — and threads the discovered org
+    roots in as **data** (no ``specify_cli`` import, preserving the layer
+    rule).
+    """
+    cached = _ACTIVATION_AWARE_PROFILE_MAPS.get(repo_root)
+    if cached is not None:
+        return cached
+    service = _build_activation_aware_doctrine_service(repo_root, org_roots=org_roots)
+    profile_map = _profiles_dict_from_service(service)
+    _ACTIVATION_AWARE_PROFILE_MAPS[repo_root] = profile_map
+    return profile_map
+
+
+def _resolve_agent_profile_record(
+    profile_id: str, repo_root: Path | None
+) -> AgentProfile | None:
+    """Resolve *profile_id*, threading charter activation when org packs exist.
+
+    ``repo_root is None`` (callers with no repo context) and "no org packs
+    declared" both take the built-in-only fast path (byte-identical to the
+    pre-mission behaviour, NFR-001). Org packs present → activation-aware map
+    so a dispatched, **activated** org profile resolves (FR-005) while a
+    de-activated one returns ``None`` (NFR-002).
+    """
+    if repo_root is None:
+        return _default_agent_profile_repository().get(profile_id)
+    org_roots = _existing_org_roots(repo_root)
+    if not org_roots:
+        return _default_agent_profile_repository().get(profile_id)
+    return _activation_aware_profile_map(repo_root, org_roots).get(profile_id)
+
+
+def _load_agent_profile(
+    profile_id: str, repo_root: Path | None = None
+) -> AgentProfile | None:
     """Resolve *profile_id* via the doctrine layer. Returns ``None`` on miss.
 
     Errors are intentionally swallowed: this helper is on the prompt-build
@@ -1607,7 +1693,7 @@ def _load_agent_profile(profile_id: str) -> AgentProfile | None:
     prompt collapsing.
     """
     try:
-        record = _default_agent_profile_repository().get(profile_id)
+        record = _resolve_agent_profile_record(profile_id, repo_root)
     except Exception:  # noqa: BLE001 — best-effort lookup
         _LOGGER.warning(
             "Profile '%s' lookup failed; profile-cited sections will be omitted.",
@@ -1735,7 +1821,7 @@ def _render_fetch_stanza(
     indent is preserved here to match the existing profile-cited
     rendering shape.
     """
-    return _shared_fetch_stanza_lines(selector, when_clause, indent="    ")
+    return list(_shared_fetch_stanza_lines(selector, when_clause, indent="    "))
 
 
 def _render_profile_directives(
@@ -1776,9 +1862,10 @@ def _render_profile_directives(
         if directive is None:
             # RISK-3 (Mission B post-merge): structured catalog-miss
             # stanza + warning instead of the generic placeholder.
-            diagnosis = classify_catalog_miss(
-                code, _available_catalog_ids(repo)
-            )
+            # FR-013: _diagnose_catalog_miss checks scope_filtered_ids
+            # first so a scope-filtered directive surfaces SCOPE_FILTERED
+            # rather than MISSING_ARTIFACT.
+            diagnosis = _diagnose_catalog_miss(code, repo)
             lines.extend(
                 format_catalog_miss_stanza(
                     selector_kind="directive",
@@ -1846,9 +1933,10 @@ def _render_profile_tactics(
         if tactic is None:
             # RISK-3 (Mission B post-merge): structured catalog-miss
             # stanza + warning instead of the generic placeholder.
-            diagnosis = classify_catalog_miss(
-                tactic_id, _available_catalog_ids(repo)
-            )
+            # FR-013: _diagnose_catalog_miss checks scope_filtered_ids
+            # first so a scope-filtered tactic surfaces SCOPE_FILTERED
+            # rather than MISSING_ARTIFACT.
+            diagnosis = _diagnose_catalog_miss(tactic_id, repo)
             lines.extend(
                 format_catalog_miss_stanza(
                     selector_kind="tactic",
@@ -2060,6 +2148,36 @@ def _format_inline_step_contract_body(contract: object) -> list[str]:
     return body_lines
 
 
+def _diagnose_catalog_miss(
+    missing_id: str,
+    repository: object | None,
+) -> CatalogMissDiagnosis:
+    """Return the best-fit :class:`CatalogMissDiagnosis` for *missing_id*.
+
+    Checks whether the repository recorded *missing_id* as scope-filtered
+    (present on disk but excluded by the active language scope) before
+    falling back to the fuzzy-match :func:`classify_catalog_miss`.  This
+    is the single gate that implements FR-013 end-to-end: any call site
+    that previously called ``classify_catalog_miss`` directly now calls
+    this helper instead, so scope-filtered misses are never surfaced as
+    ``MISSING_ARTIFACT``.
+
+    Active-language context is read directly from the repository's own
+    ``_active_languages`` attribute (the value already stored at
+    construction time), avoiding the need to thread ``repo_root`` through
+    every renderer.
+    """
+    scope_filtered: frozenset[str] | set[str] = getattr(
+        repository, "scope_filtered_ids", frozenset()
+    )
+    if isinstance(scope_filtered, (set, frozenset)) and missing_id in scope_filtered:
+        active_languages: list[str] | None = getattr(
+            repository, "_active_languages", None
+        )
+        return classify_scope_filtered_miss(missing_id, active_languages)
+    return classify_catalog_miss(missing_id, _available_catalog_ids(repository))
+
+
 def _available_catalog_ids(repository: object | None) -> list[str]:
     """Return the IDs the repository carries, for fuzzy-match suggestions.
 
@@ -2105,7 +2223,7 @@ def _render_selected_artifacts(
     header: str,
     selector_kind: str,
     when_clause: str,
-    body_formatter,  # noqa: ANN001 — callable[(object), list[str]]
+    body_formatter: Callable[[object], list[str]],
     org_source_map: dict[str, str] | None = None,
 ) -> list[str]:
     """Shared implementation for the 8 ``_render_selected_<kind>`` helpers.
@@ -2147,9 +2265,10 @@ def _render_selected_artifacts(
             # miss (typo vs. missing vs. schema-validation drop) and
             # routes a warning through both ``warnings.warn`` and the
             # module logger so the failure is never silent.
-            diagnosis = classify_catalog_miss(
-                artifact_id, _available_catalog_ids(repository)
-            )
+            # FR-013: _diagnose_catalog_miss checks scope_filtered_ids
+            # first so a scope-filtered artifact surfaces SCOPE_FILTERED
+            # rather than MISSING_ARTIFACT.
+            diagnosis = _diagnose_catalog_miss(artifact_id, repository)
             lines.extend(
                 format_catalog_miss_stanza(
                     selector_kind=selector_kind,
@@ -2519,7 +2638,7 @@ def _render_selection_block(
     return "\n\n".join(blocks)
 
 
-def _load_governance_activations(repo_root: Path) -> list[object]:
+def _load_governance_activations(repo_root: Path) -> list[ActivationEntry]:
     """Best-effort load of ``GovernanceConfig.activations`` for *repo_root*.
 
     The activation registry is a top-level governance field (per
@@ -2564,12 +2683,12 @@ def _render_activation_block(
     from charter._activation_render import render_activation_stanza
 
     try:
-        return render_activation_stanza(
-            activations,  # type: ignore[arg-type]
+        return str(render_activation_stanza(
+            activations,
             service,
             mission_type=mission_type,
             action=action,
-        )
+        ))
     except Exception:  # noqa: BLE001 — defensive: never crash the prompt build
         _LOGGER.warning(
             "Activation stanza renderer raised; surface omitted for action %s.",
@@ -2843,7 +2962,7 @@ def _bundle_root_for_json(repo_root: Path) -> Path:
     except Exception:  # noqa: BLE001 - JSON metadata is best-effort
         return repo_root
     if refresh_result is not None and refresh_result.canonical_root is not None:
-        return refresh_result.canonical_root
+        return Path(refresh_result.canonical_root)
     return repo_root
 
 
@@ -2915,7 +3034,7 @@ def _project_directive_entries(repo_root: Path) -> list[dict[str, object]]:
 
 def _load_project_directives(
     repo_root: Path,
-    load_directives_config: Callable[[Path], _DirectivesConfigLike],
+    load_directives_config: Callable[[Path], DirectivesConfig],
 ) -> tuple[dict[str, object], list[str]]:
     try:
         directives_cfg = load_directives_config(repo_root)

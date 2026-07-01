@@ -9,7 +9,7 @@ render_json    -- render the JSON-contract dict for a Plan.
 Security properties
 -------------------
 CHK016  All interpolated values are sanitised against
-        ``^[A-Za-z0-9.\\-+_ /:]{1,256}$`` before insertion.
+        ``^[A-Za-z0-9.\\-+_ /=:]{1,256}$`` before insertion.
         Values that do not pass the regex are replaced with
         ``<unavailable>``.
 NFR-007 Rendered human message is at most 4 lines.
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 # Safe-value regex for all interpolated fields (CHK016)
 # ---------------------------------------------------------------------------
 
-_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9.\-+_ /:]{1,256}$")
+_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9.\-+_ /=:]{1,256}$")
 _UNAVAILABLE = "<unavailable>"
 
 
@@ -213,4 +213,6 @@ def render_json(plan: Plan) -> dict[str, Any]:
     }
 
 
-__all__ = ["MESSAGES", "render_human", "render_json"]
+# MESSAGES: demoted — consumed only within this module; no cross-module
+# src/ from-import callers (WP01 harden-dead-symbol-gate-01KW0RJR).
+__all__ = ["render_human", "render_json"]

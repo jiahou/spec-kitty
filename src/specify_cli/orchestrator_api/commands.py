@@ -8,6 +8,8 @@ Error codes used:
   POLICY_METADATA_REQUIRED    -- --policy missing on a run-affecting command
   POLICY_VALIDATION_FAILED    -- policy JSON invalid or contains secrets
   MISSION_NOT_FOUND           -- mission slug does not resolve to a kitty-specs dir
+  STATUS_READ_PATH_NOT_FOUND  -- coord topology with a stale/unaddressable primary surface
+                                 (fail-closed read-path guard fired; carries coord/primary candidates)
   WP_NOT_FOUND                -- WP ID does not exist in the mission
   TRANSITION_REJECTED         -- transition not allowed by state machine
   WP_ALREADY_CLAIMED          -- WP claimed by a different actor
@@ -30,9 +32,11 @@ from contextlib import suppress
 from datetime import datetime, UTC
 from pathlib import Path
 from dataclasses import dataclass
+from typing import NoReturn
 
 import typer
 
+from mission_runtime import CommitTarget
 from specify_cli.core.contract_gate import validate_outbound_payload
 from specify_cli.git.commit_helpers import (
     SafeCommitBackstopError,
@@ -183,6 +187,8 @@ app = typer.Typer(
 
 # Boy Scout (DIRECTIVE_025): deduplicated CLI help strings.
 _HELP_MISSION_SLUG = "Mission slug"
+# Deduplicated genuine-not-found message (Sonar S1192: emitted by 8 endpoints).
+_MISSION_NOT_FOUND_MESSAGE = "Mission '{mission}' not found in kitty-specs/"
 _HELP_WP_ID = "Work package ID"
 _HELP_ACTOR = "Actor identity"
 _HELP_POLICY = "Policy metadata JSON (required)"
@@ -213,8 +219,13 @@ def _emit(envelope: dict) -> None:
     print(json.dumps(envelope))
 
 
-def _fail(command: str, error_code: str, message: str, data: dict | None = None) -> None:
-    """Print failure envelope and exit non-zero."""
+def _fail(command: str, error_code: str, message: str, data: dict | None = None) -> NoReturn:
+    """Print failure envelope and exit non-zero.
+
+    Typed ``NoReturn`` (FR-004 / S5747): this always raises ``typer.Exit``, so
+    mypy proves any code after a ``_fail(...)`` call is unreachable — callers
+    need no sentinel ``raise`` to satisfy their return type.
+    """
     envelope = make_envelope(
         command=command,
         success=False,
@@ -242,22 +253,104 @@ def _resolve_mission_dir(main_repo_root: Path, mission_slug: str) -> Path | None
 
     For modern missions (coord-branch topology), returns the coordination
     worktree path. For legacy missions, returns the primary checkout path.
-    Falls back to None when neither exists.
-    """
-    from specify_cli.missions._read_path_resolver import (
-        resolve_mission_read_path,
-        StatusReadPathNotFound,
-    )
-    from specify_cli.lanes.branch_naming import mid8_from_slug
+    Falls back to ``None`` only when the mission genuinely does not exist.
 
-    mid8 = mid8_from_slug(mission_slug)
+    This is now a thin consumer of the ONE guarded read-side seam
+    :func:`resolve_handle_to_read_path` (WP01 / IC-01 / NFR-004): the seam owns
+    the prototype cascade this endpoint pioneered — ``assert_safe_path_segment``
+    → primary-``meta.json`` probe → the single sanctioned ``resolve_declared_mid8``
+    cascade (NFR-005) → fail-closed coord-declared gate → the existence-gated
+    :func:`resolve_mission_read_path`. The orchestrator's old inline duplicate of
+    that cascade is GONE; only this ``.exists() → None`` adapter (the endpoint's
+    own "absent ⇒ None, not a path" contract) remains here.
+
+    Read-path SAFETY (FR-011 / M3, #2016) and the M5 fail-closed semantics are
+    UNCHANGED — they are exactly the seam's invariants (the seam was lifted from
+    this very prototype). ``require_exists`` is left at its default ``False`` so
+    the seam returns the best-known candidate; this adapter decides absence by a
+    single ``.exists()`` stat, preserving the historical ``Path | None`` contract.
+
+    Typed-error fidelity (FR-001 / M2): :class:`StatusReadPathNotFound` from the
+    seam's fail-closed gate is NOT caught here — it propagates so the calling
+    endpoint surfaces the resolver's typed ``error_code`` (+ ``coord_candidate`` /
+    ``primary_candidate``) instead of flattening every miss to
+    ``MISSION_NOT_FOUND``.
+    """
+    from specify_cli.missions._read_path_resolver import resolve_handle_to_read_path
+
+    mission_dir = resolve_handle_to_read_path(main_repo_root, mission_slug)
+    return mission_dir if mission_dir.exists() else None
+
+
+def _resolve_mission_dir_or_fail(command: str, main_repo_root: Path, mission_slug: str) -> Path:
+    """Resolve the mission status dir, emitting the correct failure envelope on a miss.
+
+    Single seam consumed by all 8 read endpoints (avoids 8 divergent patches):
+
+    * a typed :class:`StatusReadPathNotFound` (coord topology + stale/unaddressable
+      primary) surfaces the resolver's real ``error_code`` plus the
+      ``coord_candidate`` / ``primary_candidate`` paths — the M2 fidelity fix; the
+      external envelope *shape* is unchanged, only the code/data fidelity is raised
+      (C-IC02 applied to the external surface).
+    * a genuine absence (no such mission, no coord topology) keeps the historical
+      ``MISSION_NOT_FOUND`` envelope.
+
+    ``_fail`` is typed ``NoReturn`` (always raises ``typer.Exit``), so mypy proves
+    the post-call paths unreachable — no sentinel ``raise`` is needed to satisfy
+    the ``Path`` return type.
+    """
+    from specify_cli.missions._read_path_resolver import StatusReadPathNotFound
 
     try:
-        mission_dir = resolve_mission_read_path(main_repo_root, mission_slug, mid8)
-    except StatusReadPathNotFound:
-        return None
+        mission_dir = _resolve_mission_dir(main_repo_root, mission_slug)
+    except StatusReadPathNotFound as exc:
+        _fail(
+            command,
+            exc.error_code,
+            str(exc),
+            data={
+                "message": str(exc),
+                "mission_slug": exc.mission_slug,
+                "mid8": exc.mid8,
+                "coord_candidate": str(exc.coord_candidate),
+                "primary_candidate": str(exc.primary_candidate),
+            },
+        )
+    if mission_dir is None:
+        _fail(command, "MISSION_NOT_FOUND", _MISSION_NOT_FOUND_MESSAGE.format(mission=mission_slug))
+    return mission_dir
 
-    return mission_dir if mission_dir.exists() else None
+
+def _planning_read_dir(main_repo_root: Path, mission_slug: str) -> Path:
+    """Return the PRIMARY-surface mission dir for planning-artifact reads (#2118).
+
+    PRIMARY-partition artifacts — ``lanes.json`` (``LANE_STATE``) and the WP
+    ``tasks/`` files (``WORK_PACKAGE_TASK``) — live with their mission on the
+    primary ``target_branch`` for EVERY topology since the write-surface-coherence
+    work (#2090): planning never transits the coordination branch. The coord-aware
+    :func:`_resolve_mission_dir` returns the *coordination worktree*, which carries
+    ONLY status artifacts (``status.events.jsonl`` / ``status.json``) +
+    coordination-owned ones (``analysis-report.md``). Reading ``lanes.json`` or
+    ``tasks/`` off that surface under coordination topology silently no-ops — the
+    dependency graph comes back empty and the orchestrator stalls with every WP
+    stuck at ``lane=planned`` (#2118).
+
+    This routes PRIMARY-partition reads through the canonical per-kind read seam
+    :func:`resolve_planning_read_dir`, the read-side twin of the write-side
+    partition (``mission_runtime.is_primary_artifact_kind``): a PRIMARY kind
+    resolves the topology-blind primary dir, so both ``LANE_STATE`` and
+    ``WORK_PACKAGE_TASK`` co-resolve here. STATUS reads (``read_events`` /
+    ``reduce`` / ``materialize`` / status-event writes) MUST keep the coord-aware
+    :func:`_resolve_mission_dir` — the append-only event log stays on coordination
+    for coord-topology missions. This mirrors the meta.json treatment already in
+    :func:`_resolve_merge_target_branch`.
+    """
+    from mission_runtime import MissionArtifactKind
+    from specify_cli.missions._read_path_resolver import resolve_planning_read_dir
+
+    return resolve_planning_read_dir(
+        main_repo_root, mission_slug, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+    )
 
 
 def _mission_identity_payload(mission_dir: Path) -> dict[str, str]:
@@ -312,17 +405,25 @@ def _resolve_wp_file(tasks_dir: Path, wp_id: str) -> Path | None:
 
 
 def _resolve_merge_target_branch(main_repo_root: Path, mission_slug: str, target: str | None) -> str:
-    if target is not None:
-        return target
+    """Resolve the branch ``merge-mission`` integrates into.
 
-    from specify_cli.core.paths import get_feature_target_branch
+    Order: explicit ``--target`` > meta ``merge_target_branch`` > meta
+    ``target_branch`` > repo default.
 
-    return get_feature_target_branch(main_repo_root, mission_slug)
+    The mission target lives in the PRIMARY-checkout meta.json (like
+    ``coordination_branch``), so it is read via ``primary_feature_dir_for_mission``
+    — NOT the topology-aware candidate. Under coordination topology that candidate
+    resolves to the coordination worktree, whose mission dir has no meta.json; the
+    prior code read that surface, missed the mission's ``target_branch``, and
+    silently fell back to the repo default (main) — merging into the wrong branch.
+    """
+    from specify_cli.core.paths import resolve_merge_target_branch
+
+    return resolve_merge_target_branch(main_repo_root, mission_slug, target)[0]
 
 
 def _build_merge_preflight(
     main_repo_root: Path,
-    mission_dir: Path,
     mission_slug: str,
     target: str | None,
 ) -> _MergePreflightResult:
@@ -357,7 +458,9 @@ def _build_merge_preflight(
             errors.append(f"Target branch '{resolved_target}' does not exist locally or on origin.")
 
     try:
-        require_lanes_json(mission_dir)
+        # lanes.json is a PRIMARY-partition artifact — read from the primary
+        # surface, NOT the coord worktree mission_dir (#2118).
+        require_lanes_json(_planning_read_dir(main_repo_root, mission_slug))
     except (MissingLanesError, CorruptLanesError) as exc:
         errors.append(str(exc))
 
@@ -419,7 +522,9 @@ def _execute_lane_merge(
     from specify_cli.policy.config import load_policy_config
     from specify_cli.policy.merge_gates import evaluate_merge_gates
 
-    lanes_manifest = require_lanes_json(mission_dir)
+    # lanes.json is PRIMARY-partition — read from the primary surface, not the
+    # coord worktree mission_dir (#2118).
+    lanes_manifest = require_lanes_json(_planning_read_dir(main_repo_root, mission_slug))
     lanes_manifest.target_branch = target_branch
     merge_strategy = MergeStrategy(strategy)
 
@@ -470,8 +575,14 @@ def _execute_lane_merge(
         run_command(["git", "push", "origin", lanes_manifest.target_branch], cwd=main_repo_root)
 
     if remove_worktree:
+        from specify_cli.lanes.branch_naming import worktree_path
+
         for lane in lanes_manifest.lanes:
-            wt_path = main_repo_root / ".worktrees" / f"{mission_slug}-{lane.lane_id}"
+            # Legacy lane-worktree grammar ({slug}-{lane}, no mid8) ⇒ mission_id=None
+            # reproduces the historical name byte-identically (FR-005).
+            wt_path = worktree_path(
+                main_repo_root, mission_slug, mission_id=None, lane_id=lane.lane_id
+            )
             if wt_path.exists():
                 run_command(
                     ["git", "worktree", "remove", str(wt_path), "--force"],
@@ -570,26 +681,23 @@ def mission_state(
 ) -> None:
     """Return the full state of a mission (all WPs, lanes, dependencies)."""
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(
-            "mission-state",
-            "MISSION_NOT_FOUND",
-            f"Mission '{mission}' not found in kitty-specs/",
-        )
-        return
+    mission_dir = _resolve_mission_dir_or_fail("mission-state", main_repo_root, mission)
 
     from specify_cli.status import reduce
     from specify_cli.status import read_events
     from specify_cli.core.dependency_graph import build_dependency_graph
 
+    # STATUS reads stay on the coord-aware dir; PRIMARY reads (dep graph from WP
+    # frontmatter, tasks/ enumeration) come from the primary surface (#2118).
+    planning_dir = _planning_read_dir(main_repo_root, mission)
+
     # Query endpoint: reduce from event log without rewriting status.json.
     snapshot = reduce(read_events(mission_dir))
-    dep_graph = build_dependency_graph(mission_dir)
+    dep_graph = build_dependency_graph(planning_dir)
 
     # Build the full WP set from task files + dep graph + snapshot
     # so that untouched WPs (no events yet) still appear as "planned"
-    tasks_dir = mission_dir / "tasks"
+    tasks_dir = planning_dir / "tasks"
     task_file_wp_ids: set[str] = set()
     if tasks_dir.exists():
         for p in tasks_dir.iterdir():
@@ -635,22 +743,18 @@ def list_ready(
 ) -> None:
     """List WPs that are ready to start (planned and all deps approved or done)."""
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(
-            "list-ready",
-            "MISSION_NOT_FOUND",
-            f"Mission '{mission}' not found in kitty-specs/",
-        )
-        return
+    mission_dir = _resolve_mission_dir_or_fail("list-ready", main_repo_root, mission)
 
     from specify_cli.status import reduce
     from specify_cli.status import read_events
     from specify_cli.core.dependency_graph import build_dependency_graph, dependency_readiness_for_wp
 
     # Query endpoint: reduce from event log without rewriting status.json.
+    # STATUS read off the coord-aware dir; the dependency graph (WP frontmatter,
+    # PRIMARY-partition) off the primary surface (#2118 — an empty dep graph here
+    # is exactly what stalls the orchestrator under coordination topology).
     snapshot = reduce(read_events(mission_dir))
-    dep_graph = build_dependency_graph(mission_dir)
+    dep_graph = build_dependency_graph(_planning_read_dir(main_repo_root, mission))
     wp_states = snapshot.work_packages
     wp_lanes = {
         dep_id: wp_state_for(state.get("lane", Lane.PLANNED)).lane
@@ -694,6 +798,134 @@ def list_ready(
 # ── Command 4: start-implementation ────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class _StartWorkspace:
+    """The workspace resolved for a WP at start-implementation.
+
+    For a lane WP (lanes.json present and the WP is assigned to a lane) the lane
+    fields are populated and ``workspace_path`` is a real lane worktree. For a
+    legacy / non-lane mission (no lanes.json, or a planning-artifact WP) the lane
+    fields stay ``None`` and ``workspace_path`` is the historical bare path —
+    preserving the prior contract for those missions.
+    """
+
+    workspace_path: str
+    lane_id: str | None = None
+    lane_branch: str | None = None
+    lane_base_ref: str | None = None
+
+
+def _lane_base_ref(main_repo_root: Path, mission: str, manifest: object) -> str:
+    """The ref the lane was parented on — the base for the commit gate.
+
+    Uses the canonical placement authority (`resolve_placement_only`) — the same
+    one the native review gate consults — which resolves to the coordination
+    branch under coord topology. On the coord path this PR targets, both gates
+    therefore agree on the base. The fallback ordering differs for legacy
+    missions: this gate falls back to the manifest's mission_branch then the repo
+    default, whereas the native gate prefers the workspace context's base_branch;
+    the commit-existence check (`rev-list <base>..HEAD` count > 0) is robust to
+    that difference as long as the base is an ancestor of HEAD, which holds for
+    both.
+    """
+    from mission_runtime import (
+        ActionContextError,
+        MissionArtifactKind,
+        resolve_placement_only,
+    )
+
+    try:
+        # base-ref read under coord topology — coord kind preserves G-2
+        # (write-surface-coherence WP02 / T031 site 4): the lane-base gate compares
+        # against the coordination BASE ref under coord topology. STATUS_STATE keeps
+        # the coord ref; a primary kind would read the primary ref as the base and
+        # corrupt the gate's `rev-list <base>..HEAD` ancestry check.
+        return str(
+            resolve_placement_only(
+                main_repo_root, mission, kind=MissionArtifactKind.STATUS_STATE
+            ).ref
+        )
+    except ActionContextError:
+        # Never return an empty ref: the commit gate runs `git rev-list <base>..HEAD`,
+        # and an empty base silently degrades to an unreliable HEAD..HEAD. Fall back to
+        # the manifest's mission_branch, or the repo default branch as a last resort.
+        from specify_cli.core.git_ops import resolve_primary_branch
+
+        return str(
+            getattr(manifest, "mission_branch", "") or resolve_primary_branch(main_repo_root)
+        )
+
+
+def _resolve_start_workspace(
+    cmd: str, main_repo_root: Path, mission: str, mission_dir: Path, wp: str
+) -> _StartWorkspace:
+    """Resolve (allocating if needed) the workspace for ``wp``.
+
+    When the mission has a lanes manifest and ``wp`` is assigned to a lane, this
+    mirrors spec-kitty's native implement flow: it allocates (or reuses) the lane
+    worktree on its lane branch — parented on the coordination branch, with
+    approved dependency-lane tips merged into the base — so ``merge-mission`` has
+    a real lane branch to integrate and dependent WPs see their dependencies'
+    code. Idempotent: re-invoking reuses the existing lane worktree and re-merges
+    any newly-approved dependency tips.
+
+    When there is no lanes.json (legacy / non-lane missions) or ``wp`` is not in
+    any lane (planning-artifact WP), it falls back to the historical bare-path
+    behaviour so those missions keep working unchanged.
+
+    A genuine allocation failure for a lane WP (dirty reuse, dependency-merge
+    conflict) fails closed with ``LANE_ALLOCATION_FAILED``.
+    """
+    from specify_cli.lanes.branch_naming import worktree_path as _wt_path
+    from specify_cli.lanes.persistence import read_lanes_json
+
+    # lanes.json is PRIMARY-partition — read from the primary surface (#2118).
+    manifest = read_lanes_json(_planning_read_dir(main_repo_root, mission))
+    lane = manifest.lane_for_wp(wp) if manifest is not None else None
+    if manifest is None or lane is None:
+        # Legacy WP-based worktree form ({mission}-{wp}, no mid8): the seam's
+        # mission_id=None grammar reproduces the historical name byte-identically.
+        return _StartWorkspace(
+            workspace_path=str(_wt_path(main_repo_root, mission, mission_id=None, lane_id=wp))
+        )
+
+    from specify_cli.lanes.worktree_allocator import (
+        DependencyLaneMergeConflictError,
+        DirtyWorktreeError,
+        LaneNotFoundError,
+        allocate_lane_worktree,
+    )
+
+    try:
+        worktree_path, lane_branch = allocate_lane_worktree(
+            repo_root=main_repo_root,
+            mission_slug=mission,
+            wp_id=wp,
+            lanes_manifest=manifest,
+        )
+    except (
+        LaneNotFoundError,
+        DirtyWorktreeError,
+        DependencyLaneMergeConflictError,
+        RuntimeError,
+    ) as exc:
+        _fail(
+            cmd,
+            "LANE_ALLOCATION_FAILED",
+            str(exc),
+            {**_mission_identity_payload(mission_dir), "wp_id": wp},
+        )
+
+    # _fail is NoReturn (always raises typer.Exit), so this is reached only on the
+    # success path, where worktree_path / lane_branch are bound.
+    return _StartWorkspace(
+        workspace_path=str(worktree_path),
+        lane_id=lane.lane_id,
+        lane_branch=lane_branch,
+        lane_base_ref=_lane_base_ref(main_repo_root, mission, manifest),
+    )
+
+
 @app.command(name="start-implementation")
 def start_implementation(
     mission: str = typer.Option(..., "--mission", help=_HELP_MISSION_SLUG),
@@ -718,12 +950,9 @@ def start_implementation(
     policy_dict = policy_to_dict(policy_obj)
 
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(cmd, "MISSION_NOT_FOUND", f"Mission '{mission}' not found in kitty-specs/")
-        return
+    mission_dir = _resolve_mission_dir_or_fail(cmd, main_repo_root, mission)
 
-    wp_path = _resolve_wp_file(mission_dir / "tasks", wp)
+    wp_path = _resolve_wp_file(_planning_read_dir(main_repo_root, mission) / "tasks", wp)
     if wp_path is None:
         _fail(cmd, "WP_NOT_FOUND", f"Work package '{wp}' not found in {mission}")
         return
@@ -767,7 +996,12 @@ def start_implementation(
     from specify_cli.status import TransitionError
     from specify_cli.status import WorkPackageClaimConflict, start_implementation_status
 
-    workspace_path = str(main_repo_root / ".worktrees" / f"{mission}-{wp}")
+    # Allocate the REAL lane worktree (lane branch + dependency-lane tips merged)
+    # when the mission has lanes, mirroring the native implement flow so
+    # merge-mission has a lane branch to integrate. Legacy / non-lane missions
+    # keep the historical bare path.
+    start_ws = _resolve_start_workspace(cmd, main_repo_root, mission, mission_dir, wp)
+    workspace_path = start_ws.workspace_path
     prompt_path = str(wp_path)
 
     try:
@@ -809,6 +1043,12 @@ def start_implementation(
         "policy_metadata_recorded": True,
         "no_op": start_result.no_op,
     }
+    if start_ws.lane_id is not None:
+        # Lane WP: carry the lane identity the orchestrator needs to commit and
+        # gate. Omitted for legacy / non-lane missions (unchanged contract).
+        data["lane_id"] = start_ws.lane_id
+        data["lane_branch"] = start_ws.lane_branch
+        data["lane_base_ref"] = start_ws.lane_base_ref
     validate_outbound_payload(data, "orchestrator_api")
     envelope = make_envelope(
         command=cmd,
@@ -845,12 +1085,9 @@ def start_review(
     policy_dict = policy_to_dict(policy_obj)
 
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(cmd, "MISSION_NOT_FOUND", f"Mission '{mission}' not found in kitty-specs/")
-        return
+    mission_dir = _resolve_mission_dir_or_fail(cmd, main_repo_root, mission)
 
-    wp_path = _resolve_wp_file(mission_dir / "tasks", wp)
+    wp_path = _resolve_wp_file(_planning_read_dir(main_repo_root, mission) / "tasks", wp)
     if wp_path is None:
         _fail(cmd, "WP_NOT_FOUND", f"Work package '{wp}' not found in {mission}")
         return
@@ -909,6 +1146,49 @@ def start_review(
 
 
 # ── Command 6: transition ──────────────────────────────────────────────────
+
+
+def _enforce_for_review_commit_gate(
+    cmd: str, main_repo_root: Path, mission: str, mission_dir: Path, wp: str, force: bool
+) -> None:
+    """Reject an in_progress->for_review transition that has no commit on the lane.
+
+    Applies the SAME "commits beyond base" check the native ``move-task`` gate
+    uses (``lanes._git.lane_has_commit_beyond_base``) so "done without a commit"
+    is impossible through the orchestrator-api too. No-ops when bypassed
+    (``--force``) or when the gate does not apply (no lanes.json, or the WP is
+    not in any lane — e.g. planning-artifact WPs). Fails closed with
+    ``TRANSITION_REJECTED`` when a lane WP has no implementation commit.
+    """
+    if force:
+        return
+    from specify_cli.lanes._git import lane_has_commit_beyond_base
+    from specify_cli.lanes.branch_naming import lane_branch_name
+    from specify_cli.lanes.branch_naming import worktree_path as _wt_path
+    from specify_cli.lanes.persistence import read_lanes_json
+
+    # lanes.json is PRIMARY-partition — read from the primary surface (#2118).
+    manifest = read_lanes_json(_planning_read_dir(main_repo_root, mission))
+    if manifest is None:
+        return
+    lane = manifest.lane_for_wp(wp)
+    if lane is None:
+        return
+
+    worktree = _wt_path(main_repo_root, mission, mission_id=None, lane_id=lane.lane_id)
+    base_ref = _lane_base_ref(main_repo_root, mission, manifest)
+    if not worktree.exists() or not lane_has_commit_beyond_base(worktree, base_ref):
+        _fail(
+            cmd,
+            "TRANSITION_REJECTED",
+            (
+                f"{wp} cannot move to for_review: no implementation commit on lane "
+                f"{lane.lane_id} ({lane_branch_name(mission, lane.lane_id)}) beyond "
+                f"{base_ref}. Commit the work in the lane worktree first, or pass "
+                "--force if there is genuinely nothing to commit."
+            ),
+            {**_mission_identity_payload(mission_dir), "wp_id": wp, "lane_id": lane.lane_id},
+        )
 
 
 @app.command(name="transition")
@@ -972,15 +1252,15 @@ def transition(
         evidence = parsed_evidence
 
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(cmd, "MISSION_NOT_FOUND", f"Mission '{mission}' not found in kitty-specs/")
-        return
+    mission_dir = _resolve_mission_dir_or_fail(cmd, main_repo_root, mission)
 
-    wp_path = _resolve_wp_file(mission_dir / "tasks", wp)
+    wp_path = _resolve_wp_file(_planning_read_dir(main_repo_root, mission) / "tasks", wp)
     if wp_path is None:
         _fail(cmd, "WP_NOT_FOUND", f"Work package '{wp}' not found in {mission}")
         return
+
+    if to_lane == Lane.FOR_REVIEW:
+        _enforce_for_review_commit_gate(cmd, main_repo_root, mission, mission_dir, wp, force)
 
     from specify_cli.coordination.status_transition import emit_status_transition_transactional
     from specify_cli.status import TransitionError
@@ -1030,6 +1310,50 @@ def transition(
 # ── Command 7: append-history ──────────────────────────────────────────────
 
 
+def _resolve_history_commit_args(
+    main_repo_root: Path, mission: str
+) -> tuple[Path, CommitTarget]:
+    """Resolve (worktree_root, target) for committing a WP prompt-file edit.
+
+    The WP prompt file is a ``WORK_PACKAGE_TASK`` — a PRIMARY artifact kind
+    (write-surface-coherence WP03 / T013). So it commits to the primary
+    ``target_branch`` for every topology, via the kind-aware
+    :func:`resolve_placement_only`, NOT through the coordination worktree: the
+    planning→coord transit is removed (FR-003 / C-005). The WP prompt edit is
+    committed directly from the primary checkout.
+
+    For flat/flattened (or unresolvable) missions the prior behaviour is kept:
+    commit from the primary checkout on its current branch.
+    """
+    from mission_runtime import (
+        ActionContextError,
+        MissionArtifactKind,
+        resolve_placement_only,
+    )
+
+    try:
+        # WORK_PACKAGE_TASK is a primary kind: the placement resolves to the
+        # primary target branch for every topology (no coord transit). The WP
+        # prompt edit therefore commits directly to the primary checkout.
+        placement = resolve_placement_only(
+            main_repo_root, mission, kind=MissionArtifactKind.WORK_PACKAGE_TASK
+        )
+    except ActionContextError:
+        placement = None
+
+    if placement is not None:
+        return main_repo_root, placement
+
+    current_branch = subprocess.check_output(
+        ["git", "-C", str(main_repo_root), "branch", "--show-current"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stderr=subprocess.PIPE,
+    ).strip()
+    return main_repo_root, CommitTarget(ref=current_branch)
+
+
 @app.command(name="append-history")
 def append_history(
     mission: str = typer.Option(..., "--mission", help=_HELP_MISSION_SLUG),
@@ -1041,12 +1365,24 @@ def append_history(
     cmd = "append-history"
 
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(cmd, "MISSION_NOT_FOUND", f"Mission '{mission}' not found in kitty-specs/")
-        return
+    # Existence/identity gate via the coord-aware read seam (typed miss envelope).
+    _resolve_mission_dir_or_fail(cmd, main_repo_root, mission)
 
-    wp_path = _resolve_wp_file(mission_dir / "tasks", wp)
+    # FR-003 / T013: the WP prompt file is a WORK_PACKAGE_TASK (primary kind), so
+    # it is authored and committed on the PRIMARY checkout — never the coordination
+    # worktree (the planning→coord transit is removed, C-005). Resolve the WP file
+    # through the canonical per-kind read seam (``_planning_read_dir`` →
+    # ``resolve_planning_read_dir``, the same seam the sibling planning reads use),
+    # NOT a raw handle-blind ``primary_feature_dir_for_mission`` call: that primitive
+    # composes the handle verbatim, so a bare ``mid8`` / full ULID / numeric handle
+    # would land on a DIVERGENT dir than where the WP prompt actually lives (the
+    # #2136/#2164 write/placement divergence). The seam folds the handle to its
+    # canonical ``<slug>-<mid8>`` dir for every form (and propagates
+    # ``MissionSelectorAmbiguous`` — no silent pick). The kind is PRIMARY so the
+    # resolved dir is the primary surface — a coord-anchored path would trip
+    # SAFE_COMMIT_PATH_POLICY (.worktrees/ staging).
+    primary_mission_dir = _planning_read_dir(main_repo_root, mission)
+    wp_path = _resolve_wp_file(primary_mission_dir / "tasks", wp)
     if wp_path is None:
         _fail(cmd, "WP_NOT_FOUND", f"Work package '{wp}' not found in {mission}")
         return
@@ -1067,17 +1403,13 @@ def append_history(
     try:
         wp_path.write_text(build_document(fm, new_body, padding), encoding="utf-8")
 
-        current_branch = subprocess.check_output(
-            ["git", "-C", str(main_repo_root), "branch", "--show-current"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stderr=subprocess.PIPE,
-        ).strip()
+        commit_worktree_root, commit_target = _resolve_history_commit_args(
+            main_repo_root, mission
+        )
         safe_commit(
             repo_root=main_repo_root,
-            worktree_root=main_repo_root,
-            destination_ref=current_branch,
+            worktree_root=commit_worktree_root,
+            target=commit_target,
             message=f"hist: append activity log entry for {mission}/{wp}",
             paths=(wp_path,),
         )
@@ -1114,7 +1446,7 @@ def append_history(
     entry_id = "hist-" + uuid.uuid4().hex
 
     data = {
-        **_mission_identity_payload(mission_dir),
+        **_mission_identity_payload(primary_mission_dir),
         "wp_id": wp,
         "history_entry_id": entry_id,
     }
@@ -1139,16 +1471,15 @@ def accept_mission(
     cmd = "accept-mission"
 
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(cmd, "MISSION_NOT_FOUND", f"Mission '{mission}' not found in kitty-specs/")
-        return
+    mission_dir = _resolve_mission_dir_or_fail(cmd, main_repo_root, mission)
 
     from specify_cli.status import materialize
     from specify_cli.core.dependency_graph import build_dependency_graph
 
+    # STATUS read off the coord-aware dir; dependency graph (WP frontmatter,
+    # PRIMARY-partition) off the primary surface (#2118).
     snapshot = materialize(mission_dir)
-    dep_graph = build_dependency_graph(mission_dir)
+    dep_graph = build_dependency_graph(_planning_read_dir(main_repo_root, mission))
 
     # Check all WPs (from dep_graph) are approved/done; WPs with no events are implicitly planned.
     all_wp_ids = set(dep_graph.keys()) | set(snapshot.work_packages.keys())
@@ -1171,8 +1502,18 @@ def accept_mission(
         return
 
     from specify_cli.acceptance import collect_feature_summary
+    from specify_cli.upgrade.pre30_guard import Pre30LayoutError
 
-    summary = collect_feature_summary(main_repo_root, mission)
+    try:
+        summary = collect_feature_summary(main_repo_root, mission)
+    except Pre30LayoutError as exc:
+        # #1057 / squad Blocker 1: pre-3.0 lane-directory missions hard-reject
+        # rather than producing a vacuous all-done summary. A mission whose layout
+        # the runtime no longer reads is not acceptable until migrated, so it maps
+        # to MISSION_NOT_READY; the full `spec-kitty upgrade` instruction rides in
+        # the message field (keeping the orchestrator JSON envelope contract).
+        _fail(cmd, "MISSION_NOT_READY", str(exc), _mission_identity_payload(mission_dir))
+        return
     workflow_evidence_issues = [
         issue for issue in summary.activity_issues if issue.startswith("Workflow run evidence required:")
     ]
@@ -1243,12 +1584,9 @@ def merge_mission(
         return
 
     main_repo_root = _get_main_repo_root()
-    mission_dir = _resolve_mission_dir(main_repo_root, mission)
-    if mission_dir is None:
-        _fail(cmd, "MISSION_NOT_FOUND", f"Mission '{mission}' not found in kitty-specs/")
-        return
+    mission_dir = _resolve_mission_dir_or_fail(cmd, main_repo_root, mission)
 
-    preflight = _build_merge_preflight(main_repo_root, mission_dir, mission, target)
+    preflight = _build_merge_preflight(main_repo_root, mission, target)
     if preflight.errors:
         _fail(
             cmd,

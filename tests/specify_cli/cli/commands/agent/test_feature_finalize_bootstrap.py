@@ -14,12 +14,15 @@ WP01 additions (T009):
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import typer
 
+from specify_cli.coordination.commit_router import CommitRouterResult
+from specify_cli.core.commit_guard import GuardCapability
 from specify_cli.status.bootstrap import BootstrapResult
 
 
@@ -27,7 +30,7 @@ from specify_cli.status.bootstrap import BootstrapResult
 # Fixtures
 # ---------------------------------------------------------------------------
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
 MODULE = "specify_cli.cli.commands.agent.mission"
 CORE_MODULE = "specify_cli.core.mission_creation"
@@ -100,16 +103,35 @@ def _make_bootstrap_result(
 
 # Common set of patches needed to run finalize_tasks without real git/filesystem
 def _common_patches(tmp_path: Path, mission_slug: str = "060-test-feature"):
-    """Return a dict of patch targets -> mock values for finalize_tasks."""
+    """Return a dict of patch targets -> mock values for finalize_tasks.
+
+    WP02 (T027): finalize_tasks now routes git commits through
+    ``commit_for_mission`` rather than calling ``safe_commit`` directly.  WP05
+    (T014) removed the vestigial ``{MODULE}.safe_commit`` re-export shim, so the
+    old ``{MODULE}.safe_commit`` patch (never asserted as a spy) is dropped: the
+    canonical commit boundary is now
+    ``specify_cli.coordination.commit_router.commit_for_mission`` which is patched
+    here to prevent real git I/O in unit tests. ``ProtectionPolicy.resolve`` is
+    patched in the router so it does not attempt real git operations against
+    ``tmp_path``.
+    """
     feature_dir = tmp_path / "kitty-specs" / mission_slug
+    _fake_commit_result = CommitRouterResult(
+        status="committed",
+        placement_ref="main",
+        commit_hash="abc1234",
+    )
     return {
         f"{MODULE}.locate_project_root": MagicMock(return_value=tmp_path),
         f"{MODULE}._find_feature_directory": MagicMock(return_value=feature_dir),
         f"{MODULE}._resolve_planning_branch": MagicMock(return_value="main"),
         f"{MODULE}._ensure_branch_checked_out": MagicMock(),
-        f"{MODULE}.safe_commit": MagicMock(return_value=True),
+        # WP02 / T027: commit_for_mission is the canonical commit seam.
+        "specify_cli.coordination.commit_router.commit_for_mission": MagicMock(
+            return_value=_fake_commit_result
+        ),
         f"{MODULE}.run_command": MagicMock(return_value=(0, "abc1234", "")),
-        f"{CORE_MODULE}.emit_mission_created": MagicMock(),
+        "specify_cli.status.fire_dossier_sync": MagicMock(),
         f"{MODULE}.emit_wp_created": MagicMock(),
         f"{MODULE}.get_emitter": MagicMock(
             return_value=MagicMock(generate_causation_id=MagicMock(return_value="test-id")),
@@ -160,7 +182,9 @@ class TestFinalizeTasksCallsBootstrap:
             tmp_path / "kitty-specs" / mission_slug,
             mission_slug,
             dry_run=False,
-            allow_protected_branch_in_test_mode=True,
+            # Production finalize asserts STANDARD: the seed commit is refused
+            # on a protected destination, never waived (PR #1850 fix).
+            capability=GuardCapability.STANDARD,
         )
 
 
@@ -230,7 +254,12 @@ class TestValidateOnlyDryRun:
             for p in ctx_patches.values():
                 p.stop()
 
-        output = capsys.readouterr().out
+        # Rich auto-highlights numerics with ANSI color codes (e.g.
+        # ``\x1b[1;36m1\x1b[0m``), so the digits in the summary line are not
+        # byte-contiguous with the surrounding words. Strip ANSI before the
+        # substring check to pin the contract (the summary text is rendered)
+        # without coupling to rich's highlighting.
+        output = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
         assert "Bootstrap:" in output
         assert "1 WPs would be seeded, 1 already initialized" in output
 
@@ -453,17 +482,19 @@ def _setup_lane_based_feature(tmp_path: Path, mission_slug: str = "061-lane-feat
     tasks_dir.mkdir(parents=True)
 
     (feature_dir / "spec.md").write_text(
-        "---\ntitle: Lane Feature\n---\n\n## Requirements\n\n"
-        "- FR-001: First requirement\n- FR-002: Second requirement\n",
+        "---\ntitle: Lane Feature\n---\n\n## Requirements\n\n- FR-001: First requirement\n- FR-002: Second requirement\n",
         encoding="utf-8",
     )
     (feature_dir / "tasks.md").write_text(
         "# Tasks\n\n## WP01\n\nNo dependencies.\n\n## WP02\n\nNo dependencies.\n",
         encoding="utf-8",
     )
-    (feature_dir / "meta.json").write_text(
-        json.dumps({"mission_slug": mission_slug}), encoding="utf-8"
-    )
+    (feature_dir / "meta.json").write_text(json.dumps({"mission_slug": mission_slug}), encoding="utf-8")
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "alpha.py").write_text("# alpha\n", encoding="utf-8")
+    (src_dir / "beta.py").write_text("# beta\n", encoding="utf-8")
 
     # Two independent WPs owning disjoint files → compute_lanes yields lanes.
     for wp_id, owned, refs in [
@@ -492,9 +523,7 @@ class TestFinalizeScaffoldsAcceptanceMatrix:
 
         patches = _common_patches(tmp_path, mission_slug)
         patches[f"{MODULE}._find_feature_directory"] = MagicMock(return_value=feature_dir)
-        patches[f"{MODULE}.bootstrap_canonical_state"] = MagicMock(
-            return_value=_make_bootstrap_result()
-        )
+        patches[f"{MODULE}.bootstrap_canonical_state"] = MagicMock(return_value=_make_bootstrap_result())
 
         from specify_cli.cli.commands.agent.mission import finalize_tasks
 
@@ -530,9 +559,7 @@ class TestFinalizeScaffoldsAcceptanceMatrix:
 
         patches = _common_patches(tmp_path, mission_slug)
         patches[f"{MODULE}._find_feature_directory"] = MagicMock(return_value=feature_dir)
-        patches[f"{MODULE}.bootstrap_canonical_state"] = MagicMock(
-            return_value=_make_bootstrap_result()
-        )
+        patches[f"{MODULE}.bootstrap_canonical_state"] = MagicMock(return_value=_make_bootstrap_result())
 
         from specify_cli.cli.commands.agent.mission import finalize_tasks
 
@@ -547,9 +574,7 @@ class TestFinalizeScaffoldsAcceptanceMatrix:
             for p in ctx_patches.values():
                 p.stop()
 
-        assert not (feature_dir / "acceptance-matrix.json").exists(), (
-            "validate-only must not write the acceptance-matrix scaffold"
-        )
+        assert not (feature_dir / "acceptance-matrix.json").exists(), "validate-only must not write the acceptance-matrix scaffold"
 
     def test_explicit_frontmatter_dependencies_beat_tasks_md_parser(
         self,
@@ -599,9 +624,7 @@ class TestFinalizeScaffoldsAcceptanceMatrix:
         mission_slug = "060-test-feature"
         feature_dir = _setup_feature(tmp_path, mission_slug)
         (feature_dir / "tasks.md").write_text(
-            "# Tasks\n\n"
-            "## WP01\n\n**Dependencies**: WP02\n\n"
-            "## WP02\n\n**Dependencies**: WP01\n",
+            "# Tasks\n\n## WP01\n\n**Dependencies**: WP02\n\n## WP02\n\n**Dependencies**: WP01\n",
             encoding="utf-8",
         )
 
@@ -764,7 +787,12 @@ class TestFinalizeScaffoldsAcceptanceMatrix:
         pytest.fail("No JSON error payload found for incomplete WP coverage")
 
     def test_finalize_commits_status_and_snapshot_artifacts(self, tmp_path: Path) -> None:
-        """Commit set must include bootstrap status artifacts and dossier snapshot."""
+        """Commit set must include bootstrap status artifacts and dossier snapshot.
+
+        WP02 (T027): commits now route through ``commit_for_mission``.  The spy
+        is attached to that boundary (capturing the ``files`` kwarg tuple) rather
+        than to the old ``safe_commit`` direct call.
+        """
         mission_slug = "060-test-feature"
         feature_dir = _setup_feature(tmp_path, mission_slug)
         captured_files: list[Path] = []
@@ -773,20 +801,26 @@ class TestFinalizeScaffoldsAcceptanceMatrix:
             feature_path: Path,
             slug: str,
             dry_run: bool,
-            allow_protected_branch_in_test_mode: bool = False,
+            capability: GuardCapability = GuardCapability.STANDARD,
         ) -> BootstrapResult:
             assert feature_path == feature_dir
             assert slug == mission_slug
             assert dry_run is False
-            assert allow_protected_branch_in_test_mode is True
+            # Production finalize asserts STANDARD (PR #1850 fix).
+            assert capability is GuardCapability.STANDARD
             (feature_path / "status.events.jsonl").write_text('{"event":"seeded"}\n', encoding="utf-8")
             (feature_path / "status.json").write_text("{}", encoding="utf-8")
             return _make_bootstrap_result()
 
-        def _safe_commit_spy(**kwargs: object) -> bool:
+        def _commit_for_mission_spy(**kwargs: object) -> CommitRouterResult:
             nonlocal captured_files
-            captured_files = list(kwargs["paths"])  # type: ignore[index]
-            return True
+            # ``files`` is a tuple[Path, ...] keyword arg.
+            captured_files = list(kwargs.get("files", ()))  # type: ignore[arg-type]
+            return CommitRouterResult(
+                status="committed",
+                placement_ref="main",
+                commit_hash="abc1234",
+            )
 
         def _write_snapshot(feature_path: Path, slug: str, repo_root: Path) -> None:
             assert feature_path == feature_dir
@@ -798,7 +832,8 @@ class TestFinalizeScaffoldsAcceptanceMatrix:
 
         patches = _common_patches(tmp_path, mission_slug)
         patches[f"{MODULE}.bootstrap_canonical_state"] = MagicMock(side_effect=_bootstrap_side_effect)
-        patches[f"{MODULE}.safe_commit"] = _safe_commit_spy
+        # Override the common commit_for_mission mock with the spy.
+        patches["specify_cli.coordination.commit_router.commit_for_mission"] = _commit_for_mission_spy
 
         from specify_cli.cli.commands.agent.mission import finalize_tasks
 
@@ -1168,9 +1203,7 @@ def _write_overlap_feature(
         encoding="utf-8",
     )
     (feature_dir / "tasks.md").write_text(tasks_md, encoding="utf-8")
-    (feature_dir / "meta.json").write_text(
-        json.dumps({"mission_slug": mission_slug}), encoding="utf-8"
-    )
+    (feature_dir / "meta.json").write_text(json.dumps({"mission_slug": mission_slug}), encoding="utf-8")
     for wp_id, owned, surface, deps, scope in wps:
         lines = [
             "---",
@@ -1202,9 +1235,7 @@ def _run_finalize_validate_only(
     """Run finalize-tasks --validate-only with the REAL ownership validator."""
     patches = _common_patches(tmp_path, mission_slug)
     del patches[f"{MODULE}.validate_ownership"]  # exercise the real validator
-    patches[f"{MODULE}.bootstrap_canonical_state"] = MagicMock(
-        return_value=_make_bootstrap_result()
-    )
+    patches[f"{MODULE}.bootstrap_canonical_state"] = MagicMock(return_value=_make_bootstrap_result())
     from specify_cli.cli.commands.agent.mission import finalize_tasks
 
     started = [patch(target, value) for target, value in patches.items()]
@@ -1230,9 +1261,7 @@ def _run_finalize_validate_only(
 class TestOwnershipOverlapAcceptance:
     """Overlap fails for narrow WPs regardless of lane/dependency structure."""
 
-    def test_independent_wps_overlap_fails(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_independent_wps_overlap_fails(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """Two independent (different-lane) narrow WPs on the same files fail."""
         _write_overlap_feature(
             tmp_path,
@@ -1249,10 +1278,19 @@ class TestOwnershipOverlapAcceptance:
         assert isinstance(errors, list)
         assert any("WP01" in e and "WP02" in e for e in errors)
 
-    def test_dependent_wps_overlap_still_fails(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """WP02→WP01 dependency (one lane) does NOT exempt narrow overlap."""
+    def test_dependent_wps_overlap_collapses_into_one_lane(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """WP02→WP01 dependency makes overlap legitimate: it collapses, not fails.
+
+        Contract pinned by #2087/#2088 ("make ownership overlap lane-aware",
+        ``ownership/validation.py`` ``validate_no_overlap``): two WPs joined by a
+        directed dependency path own the same files legitimately because their
+        execution is forced into a sequential order. The no-overlap guard targets
+        *parallel* (dependency-unordered) WPs only — see ``test_independent_wps_
+        overlap_fails`` for the failing counterpart. Rather than erroring, the
+        dependent overlapping pair is collapsed into a single lane and validation
+        passes. This test keeps teeth by asserting the collapse is *recorded*
+        (a ``write_scope_overlap`` event), not silently dropped.
+        """
         _write_overlap_feature(
             tmp_path,
             wps=[
@@ -1262,16 +1300,31 @@ class TestOwnershipOverlapAcceptance:
             tasks_md="# Tasks\n\n## WP01\n\nNo dependencies.\n\n## WP02\n\nDepends on WP01.\n",
         )
         results = _run_finalize_validate_only(tmp_path, capsys)
-        failures = [r for r in results if r.get("error") == "Ownership validation failed"]
-        assert failures, (
-            "a dependency hierarchy must NOT exempt overlapping narrow WPs; "
-            f"got {results}"
+        assert not [r for r in results if r.get("error") == "Ownership validation failed"], (
+            f"dependency-ordered overlap is legitimate and must NOT fail ownership validation; got {results}"
+        )
+        passed = [r for r in results if r.get("result") == "validation_passed"]
+        assert passed, f"expected validation_passed for dependency-ordered overlap; got {results}"
+        validation = passed[0].get("validation")
+        assert isinstance(validation, dict)
+        lanes_preview = validation.get("lanes_preview")
+        assert isinstance(lanes_preview, dict)
+        collapse_report = lanes_preview.get("collapse_report")
+        assert isinstance(collapse_report, dict)
+        events = collapse_report.get("events")
+        assert isinstance(events, list)
+        assert any(isinstance(e, dict) and e.get("rule") == "write_scope_overlap" for e in events), (
+            f"dependent overlap must be recorded as a write_scope_overlap collapse, not silently dropped; got {results}"
         )
 
-    def test_codebase_wide_is_the_only_exemption(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_codebase_wide_is_the_only_exemption(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """A codebase-wide WP overlapping a narrow WP passes (end-to-end #1753)."""
+        # Create the literal-path file so the glob-match validator doesn't
+        # raise a hard error for a non-existent path (FR-006 / WP04).
+        bar_py = tmp_path / "src" / "foo" / "bar.py"
+        bar_py.parent.mkdir(parents=True, exist_ok=True)
+        bar_py.write_text("# placeholder\n", encoding="utf-8")
+
         _write_overlap_feature(
             tmp_path,
             wps=[
@@ -1281,9 +1334,5 @@ class TestOwnershipOverlapAcceptance:
             tasks_md="# Tasks\n\n## WP01\n\nNo dependencies.\n\n## WP02\n\nDepends on WP01.\n",
         )
         results = _run_finalize_validate_only(tmp_path, capsys)
-        assert not [
-            r for r in results if r.get("error") == "Ownership validation failed"
-        ], f"codebase-wide WP must be exempt from overlap; got {results}"
-        assert any(
-            r.get("result") == "validation_passed" for r in results
-        ), f"expected validation_passed; got {results}"
+        assert not [r for r in results if r.get("error") == "Ownership validation failed"], f"codebase-wide WP must be exempt from overlap; got {results}"
+        assert any(r.get("result") == "validation_passed" for r in results), f"expected validation_passed; got {results}"

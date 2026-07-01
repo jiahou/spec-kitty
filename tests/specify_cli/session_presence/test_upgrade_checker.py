@@ -16,7 +16,7 @@ import pytest
 import specify_cli.session_presence.upgrade_check as upgrade_check_module
 from specify_cli.session_presence.upgrade_check import TTL_SECONDS, UpgradeChecker
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
 
 @pytest.fixture
@@ -133,6 +133,17 @@ class TestCheckInBackground:
             checker = UpgradeChecker()
             result = checker.check_in_background()
         assert result is None
+
+    def test_background_probe_uses_pypi_json_not_uv_pip_index(self, patched_cache: Path) -> None:
+        calls: list[list[str]] = []
+
+        with patch("subprocess.Popen", side_effect=lambda argv, **_: calls.append(argv)):
+            UpgradeChecker().check_in_background()
+
+        assert calls
+        script = calls[0][2]
+        assert "https://pypi.org/pypi/spec-kitty-cli/json" in script
+        assert "uv pip index" not in script
 
     def test_mkdir_failure_does_not_raise(
         self, patched_cache: Path, monkeypatch: pytest.MonkeyPatch

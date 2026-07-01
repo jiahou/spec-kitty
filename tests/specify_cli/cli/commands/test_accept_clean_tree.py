@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import typer
 
 from specify_cli.acceptance.matrix import (
     AcceptanceCriterion,
@@ -79,7 +80,7 @@ def _create_lane_feature(
     # SPECIFY_REPO_ROOT env var set by the test) so mission resolution works
     # regardless of where pytest happens to run.
     (repo_root / ".kittify").mkdir()
-    for required_dir in ("src", "tests", "contracts", "docs"):
+    for required_dir in ("src", "tests", "docs"):
         path = repo_root / required_dir
         path.mkdir()
         (path / ".gitkeep").write_text("")
@@ -87,6 +88,8 @@ def _create_lane_feature(
     feature_dir = repo_root / "kitty-specs" / _SLUG
     tasks_dir = feature_dir / "tasks"
     tasks_dir.mkdir(parents=True)
+    # contracts/ is a mission artifact → under the feature dir, not repo root (#2115)
+    (feature_dir / "contracts").mkdir(parents=True, exist_ok=True)
 
     meta = {
         "mission_number": "099",
@@ -211,7 +214,7 @@ def test_accept_leaves_clean_tree_with_materialized_matrix(
     # Successful (non-json) accept returns normally; no Exit is raised.
     accept(
         mission=_SLUG,
-        feature=None,
+
         mode="auto",
         actor="tester",
         test=[],
@@ -252,7 +255,7 @@ def test_accept_clean_tree_without_negative_invariant(
 
     accept(
         mission=_SLUG,
-        feature=None,
+
         mode="auto",
         actor="tester",
         test=[],
@@ -265,6 +268,41 @@ def test_accept_clean_tree_without_negative_invariant(
 
     porcelain = _porcelain(repo_root)
     assert porcelain == "", f"accept left a dirty working tree:\n{porcelain}"
+
+
+def test_accept_fails_when_residual_commit_fails_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful accept must not hide residual commit failure."""
+    repo_root = (tmp_path / "repo").resolve()
+    repo_root.mkdir()
+    _create_lane_feature(repo_root, with_negative_invariant=True)
+    monkeypatch.setenv("SPECIFY_REPO_ROOT", str(repo_root))
+    monkeypatch.chdir(repo_root)
+
+    def fail_residual_commit(_repo_root: Path, _mission_slug: str) -> bool:
+        raise RuntimeError("forced residual failure")
+
+    monkeypatch.setattr(
+        "specify_cli.cli.commands.accept._commit_residual_acceptance_artifacts",
+        fail_residual_commit,
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        accept(
+            mission=_SLUG,
+
+            mode="auto",
+            actor="tester",
+            test=[],
+            json_output=True,
+            lenient=False,
+            no_commit=False,
+            diagnose=False,
+            allow_fail=False,
+        )
+
+    assert exc_info.value.exit_code == 1
 
 
 def test_residual_acceptance_commit_is_scoped_to_mission_paths(

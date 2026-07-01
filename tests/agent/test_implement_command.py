@@ -34,7 +34,10 @@ def _bypass_charter_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     from specify_cli.charter_runtime.preflight.result import CharterPreflightResult
 
     result = CharterPreflightResult(passed=True, checks=[])
-    monkeypatch.setenv("SPEC_KITTY_TEST_MODE", "1")
+    # Fixtures run implement on a protected ``main`` branch; the documented
+    # operator escape hatch is the ONE sanctioned waiver (SPEC_KITTY_TEST_MODE
+    # no longer waives the pre-check — PR #1850 guard-bypass fix).
+    monkeypatch.setenv("SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS", "1")
     monkeypatch.setattr(
         "specify_cli.charter_runtime.preflight.hook.run_preflight_or_abort",
         lambda *_args, **_kwargs: result,
@@ -181,7 +184,7 @@ class TestImplementCommand:
             ),
         ):
             with pytest.raises(typer.Exit):
-                implement("WP01", feature="010-feature", recover=False)
+                implement("WP01", mission="010-feature", recover=False)
 
     def test_implement_json_output_is_clean(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         feature_dir = tmp_path / "kitty-specs" / "010-feature"
@@ -230,7 +233,7 @@ class TestImplementCommand:
                 is_reuse=False,
             )
 
-            implement("WP01", feature="010-feature", json_output=True, recover=False)
+            implement("WP01", mission="010-feature", json_output=True, recover=False)
 
         payload = json.loads(capsys.readouterr().out.strip())
         assert payload["workspace"] == ".worktrees/010-feature-lane-a"
@@ -272,7 +275,7 @@ class TestImplementCommand:
             ),
         ):
             with pytest.raises(typer.Exit):
-                implement("WP01", feature="010-feature", json_output=True, recover=False)
+                implement("WP01", mission="010-feature", json_output=True, recover=False)
 
         payload = json.loads(capsys.readouterr().out.strip())
         assert payload["status"] == "error"
@@ -328,7 +331,7 @@ class TestImplementCommand:
                 is_reuse=True,
             )
 
-            implement("WP02", feature="010-feature", recover=False)
+            implement("WP02", mission="010-feature", recover=False)
 
             kwargs = mock_create_lane_workspace.call_args.kwargs
             assert kwargs["wp_id"] == "WP02"
@@ -376,7 +379,7 @@ class TestImplementCommand:
             ) as mock_create_lane_workspace,
         ):
             with pytest.raises(typer.Exit):
-                implement("WP02", feature="010-feature", auto_commit=True, recover=False)
+                implement("WP02", mission="010-feature", auto_commit=True, recover=False)
 
         assert mock_commit_planning.call_count == 0
         assert mock_create_lane_workspace.call_count == 0
@@ -407,6 +410,11 @@ class TestImplementCommand:
         )
         _seed_planned(feature_dir, "WP01")
 
+        # Stub the policy resolver so the protection decision is deterministic
+        # and the resolver is the ONLY read-I/O boundary (NFR-003).
+        mock_policy = MagicMock()
+        mock_policy.is_protected.return_value = False  # non-protected lane branch
+
         with (
             patch("specify_cli.cli.commands.implement.find_repo_root", return_value=tmp_path),
             patch(
@@ -422,9 +430,9 @@ class TestImplementCommand:
                 return_value="kitty/mission-010-feature-01ABCDEF",
             ),
             patch(
-                "specify_cli.cli.commands.implement.protected_branches",
-                return_value=frozenset({"main"}),
-            ),
+                "specify_cli.cli.commands.implement.ProtectionPolicy.resolve",
+                return_value=mock_policy,
+            ) as mock_resolver,
             patch(
                 "specify_cli.cli.commands.implement._ensure_planning_artifacts_committed_git",
             ) as mock_commit_planning,
@@ -467,9 +475,11 @@ class TestImplementCommand:
                 resolution_kind="lane_workspace",
             )
 
-            implement("WP01", feature="010-feature", auto_commit=True, recover=False)
+            implement("WP01", mission="010-feature", auto_commit=True, recover=False)
 
         mock_commit_planning.assert_called_once()
+        # NFR-003: the resolver must have been invoked (not vacuous)
+        assert mock_resolver.called, "ProtectionPolicy.resolve must be invoked for the protection decision"
 
     def test_implement_status_emit_uses_transport_execution_mode(self, tmp_path: Path) -> None:
         feature_dir = tmp_path / "kitty-specs" / "010-feature"
@@ -531,7 +541,7 @@ class TestImplementCommand:
                 resolution_kind="lane_workspace",
             )
 
-            implement("WP01", feature="010-feature", auto_commit=False, recover=False)
+            implement("WP01", mission="010-feature", auto_commit=False, recover=False)
 
         assert captured["execution_mode"] == "worktree"
         assert captured["workspace_context"].startswith("worktree:")
@@ -600,8 +610,220 @@ class TestImplementCommand:
                 resolution_kind="repo_root",
             )
 
-            implement("WP02", feature="010-feature", auto_commit=False, recover=False)
+            implement("WP02", mission="010-feature", auto_commit=False, recover=False)
 
             kwargs = mock_create_lane_workspace.call_args.kwargs
             assert kwargs["lanes_manifest"] is None
             assert kwargs["resolved_workspace"].execution_mode == "planning_artifact"
+
+
+class TestImplementCoordTopologyLanesJson:
+    """Regression tests for #1991: lanes.json read from coord worktree.
+
+    finalize-tasks writes lanes.json to the coordination branch and deletes
+    the primary-checkout copy via _stage_finalize_artifacts_in_coord_worktree.
+    The implement validate block must read it from the coord-aware surface
+    (_lanes_feature_dir), not from the meta-anchored primary feature_dir.
+    """
+
+    def test_lanes_json_read_from_coord_dir_not_primary(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """lanes.json in coord dir only — implement must NOT fail with MissingLanesError."""
+        mission_slug = "010-feature"
+
+        # Primary checkout: meta.json + WP file + status — NO lanes.json
+        primary_dir = tmp_path / "kitty-specs" / mission_slug
+        create_meta_json(primary_dir)
+        wp_file = primary_dir / "tasks" / "WP01-setup.md"
+        wp_file.parent.mkdir(parents=True)
+        wp_file.write_text(
+            "---\nwork_package_id: WP01\ndependencies: []\n"
+            "execution_mode: code_change\nowned_files:\n  - src/wp01/**\n"
+            "authoritative_surface: src/wp01/\n---\n# WP01",
+            encoding="utf-8",
+        )
+        _seed_planned(primary_dir, "WP01")
+
+        # Coord dir: lanes.json + status — NO meta.json (mirrors real coord topology)
+        coord_dir = tmp_path / ".worktrees" / f"{mission_slug}-coord" / "kitty-specs" / mission_slug
+        coord_dir.mkdir(parents=True)
+        create_lanes_json(coord_dir, wp_ids=("WP01",))
+        _seed_planned(coord_dir, "WP01")
+
+        # Status surface points to coord (finalize-tasks seeds events there)
+        class _FakeStatusSurface:
+            read_dir = coord_dir
+
+        # Non-planning ResolvedWorkspace — causes require_lanes_json to be called
+        from specify_cli.workspace.context import ResolvedWorkspace
+
+        fake_workspace = ResolvedWorkspace(
+            mission_slug=mission_slug,
+            wp_id="WP01",
+            execution_mode="code_change",
+            mode_source="frontmatter",
+            resolution_kind="lane_workspace",
+            workspace_name=f"{mission_slug}-lane-a",
+            worktree_path=tmp_path / ".worktrees" / f"{mission_slug}-lane-a",
+            branch_name=f"kitty/mission-{mission_slug}-lane-a",
+            lane_id="lane-a",
+            lane_wp_ids=["WP01"],
+            context=None,
+        )
+
+        mock_gate = MagicMock()
+        mock_gate.passed = True
+        mock_gate.change_mode = None
+
+        with (
+            patch("specify_cli.cli.commands.implement.find_repo_root", return_value=tmp_path),
+            patch(
+                "specify_cli.cli.commands.implement.detect_feature_context",
+                return_value=("010", mission_slug),
+            ),
+            # Both coord-aware resolvers return coord_dir — triggers meta.json
+            # fallback so feature_dir lands on primary, but _lanes_feature_dir
+            # stays on coord_dir (the fix for #1991).
+            patch(
+                "specify_cli.cli.commands.implement.resolve_feature_dir_for_mission",
+                return_value=coord_dir,
+            ),
+            patch(
+                "specify_cli.cli.commands.implement.candidate_feature_dir_for_mission",
+                return_value=coord_dir,
+            ),
+            patch(
+                "specify_cli.cli.commands.implement.resolve_feature_target_branch",
+                return_value="main",
+            ),
+            patch("specify_cli.cli.commands.implement._ensure_planning_artifacts_committed_git"),
+            patch("specify_cli.cli.commands.implement._resolve_placement_ref", return_value=None),
+            patch(
+                "specify_cli.coordination.surface_resolver.resolve_status_surface_with_anchor",
+                return_value=_FakeStatusSurface(),
+            ),
+            patch(
+                "specify_cli.bulk_edit.gate.ensure_occurrence_classification_ready",
+                return_value=mock_gate,
+            ),
+            patch(
+                "specify_cli.next.runtime_bridge.build_operational_context_for_claim",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "specify_cli.cli.commands.implement.resolve_workspace_for_wp",
+                return_value=fake_workspace,
+            ),
+            # Fail at workspace creation with a sentinel — not a lanes.json error
+            patch(
+                "specify_cli.cli.commands.implement.create_lane_workspace",
+                side_effect=RuntimeError("__workspace_create_sentinel__"),
+            ),
+        ):
+            with pytest.raises(typer.Exit):
+                implement("WP01", mission=mission_slug, json_output=True, recover=False)
+
+        payload = json.loads(capsys.readouterr().out.strip())
+        error = payload.get("error", "")
+
+        # KEY assertion: the pre-fix error must NOT appear
+        assert "lanes.json is required" not in error, (
+            f"Implement read lanes.json from the primary dir (deleted by finalize-tasks) "
+            f"instead of the coord dir — #1991 regression. Got: {error!r}"
+        )
+        # We reached the workspace-create step, which confirms lanes.json was found
+        assert "__workspace_create_sentinel__" in error, (
+            f"Expected to pass lanes.json validation and reach workspace creation. Got: {error!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T013 — NFR-003 spy: ProtectionPolicy.resolve reads I/O once at the boundary;
+# is_protected() and commit_guard.evaluate() make ZERO further I/O reads.
+# ---------------------------------------------------------------------------
+
+
+class TestNFR003ProtectionPolicySingleBoundaryRead:
+    """NFR-003: the protection decision I/O boundary is ProtectionPolicy.resolve (T013).
+
+    Verifies that:
+    - ``_load_kittify_config`` is called exactly ONCE (the config read) inside ``resolve``
+    - ``_remote_default_branch`` is called at most ONCE inside ``resolve`` (only on absent key path)
+    - Neither ``is_protected`` nor ``commit_guard.evaluate`` trigger additional I/O reads
+    """
+
+    def test_protection_decision_io_confined_to_resolve_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive _protected_branch_status_commit_error and assert single-boundary I/O (T013)."""
+        from specify_cli.cli.commands.implement import _protected_branch_status_commit_error
+        from specify_cli.git import protection_policy as _pp_module
+
+        # The autouse fixture sets SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS=1.
+        # For this test we need the hatch OFF so we can observe the real protection decision.
+        monkeypatch.delenv("SPEC_KITTY_ALLOW_PROTECTED_BRANCH_COMMITS", raising=False)
+
+        # Spy: track calls to the two internal I/O helpers inside ProtectionPolicy.resolve
+        kittify_read_count: list[int] = [0]
+        remote_read_count: list[int] = [0]
+
+        _real_load_kittify_config = _pp_module._load_kittify_config
+        _real_remote_default_branch = _pp_module._remote_default_branch
+
+        def _spy_load_kittify_config(repo_root: Path) -> dict:  # type: ignore[type-arg]
+            kittify_read_count[0] += 1
+            return _real_load_kittify_config(repo_root)
+
+        def _spy_remote_default_branch(repo_root: Path) -> str | None:
+            remote_read_count[0] += 1
+            return _real_remote_default_branch(repo_root)
+
+        with (
+            patch.object(_pp_module, "_load_kittify_config", _spy_load_kittify_config),
+            patch.object(_pp_module, "_remote_default_branch", _spy_remote_default_branch),
+        ):
+            # Call the decision function — "main" should be protected (no .kittify/config.yaml
+            # override, so the default set includes "main"; hatch is OFF).
+            result = _protected_branch_status_commit_error("main", tmp_path)
+
+        # Config read happens exactly ONCE at the resolve boundary — not per is_protected call
+        assert kittify_read_count[0] == 1, (
+            f"_load_kittify_config called {kittify_read_count[0]} times; "
+            "expected exactly 1 (boundary-resolved value, NFR-003)"
+        )
+        # Remote read happens at most ONCE (only on the absent-key path)
+        assert remote_read_count[0] <= 1, (
+            f"_remote_default_branch called {remote_read_count[0]} times; "
+            "expected at most 1 (boundary-resolved value, NFR-003)"
+        )
+        # The decision itself: "main" is in the default protected set, no hatch active
+        assert result is not None, "Expected a refusal message for protected branch 'main'"
+
+    def test_is_protected_makes_no_io_after_resolve(
+        self, tmp_path: Path
+    ) -> None:
+        """is_protected() is pure after resolve — zero filesystem/env reads (T013)."""
+        from specify_cli.git.protection_policy import ProtectionPolicy
+        from specify_cli.git import protection_policy as _pp_module
+
+        io_call_count: list[int] = [0]
+
+        def _counting_load(repo_root: Path) -> dict:  # type: ignore[type-arg]
+            io_call_count[0] += 1
+            return {}
+
+        with patch.object(_pp_module, "_load_kittify_config", _counting_load):
+            policy = ProtectionPolicy.resolve(tmp_path)
+            count_after_resolve = io_call_count[0]
+            # Call is_protected multiple times — must NOT trigger further I/O
+            policy.is_protected("main")
+            policy.is_protected("master")
+            policy.is_protected("some-branch")
+
+        assert io_call_count[0] == count_after_resolve, (
+            f"is_protected triggered {io_call_count[0] - count_after_resolve} additional I/O read(s); "
+            "expected zero (NFR-003: value object is I/O-free after resolve)"
+        )

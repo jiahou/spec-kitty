@@ -3,13 +3,147 @@
 from __future__ import annotations
 
 from specify_cli.core.constants import KITTY_SPECS_DIR
-import json
+import logging
 import os
+import re
 from pathlib import Path
+from typing import Any, cast
 
 from .constants import KITTIFY_DIR, WORKTREES_DIR
 
+logger = logging.getLogger(__name__)
+
 _GITDIR_PREFIX = "gitdir:"
+
+# ---------------------------------------------------------------------------
+# Canonical safe-path-segment validator (FR-001 / D-1)
+#
+# Grammar decision (research.md D-1 / WP01 T001 dot-policy):
+#   - Reconciles three divergent validators:
+#       merge.py    ^[A-Za-z0-9_-]+$         (no dots)
+#       transaction ^[A-Za-z0-9][A-Za-z0-9._-]*$  (interior dots ok)
+#       aggregate   ^[A-Za-z0-9_-]+$         (no dots)
+#   - Adopts the INTERIOR-DOT-ALLOWED form so transaction.py's real accepts
+#     (mission_id/mid8) survive without change.
+#   - Rejects: empty/whitespace, ".", "..", any "/" or "\", non-ASCII, leading
+#     ".", and any value whose stripped form contains ".." as a substring.
+#   - This WIDENS merge.py's slug acceptance to allow interior dots; that is
+#     intentional — no caller relies on merge.py rejecting a dotted slug
+#     (WP01 verified: merge.py callers only receive CLI-created slugs that
+#     never emit interior dots; the widening is safe and non-breaking).
+# ---------------------------------------------------------------------------
+_SAFE_PATH_SEGMENT_RE: re.Pattern[str] = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+
+
+def assert_safe_path_segment(value: str) -> str:
+    """Return ``value`` if it is a single safe path segment; else raise ValueError.
+
+    Rejects empty/whitespace-only, ``"."``, ``".."``, any ``"/"`` or ``"\\"``
+    (path separators), non-ASCII input, values beginning with ``"."`` (hidden-file
+    style — leading-dot rejected as traversal risk), and any value whose stripped
+    form contains ``".."`` as a substring (dotted-traversal guard: ``"..foo"``,
+    ``"foo.."``, ``"a..b"`` — a grammar that only special-cases the two literal
+    tokens would wrongly accept these).
+
+    The grammar is the reconciled canonical form that admits every real-format
+    mission-slug value (full 26-char ULID, ``<slug>-<mid8>`` directory names,
+    numeric-prefix slugs, bare mid8) while preserving the traversal guard —
+    proven by the NFR-006 union test.
+
+    This is a **general safe-segment validator** (not slug-only): it is also used
+    by WP02 for ``mission_id`` and ``mid8`` values, which carry the same format
+    constraints.
+
+    Args:
+        value: The path segment to validate.
+
+    Returns:
+        ``value`` unchanged when valid.
+
+    Raises:
+        ValueError: When ``value`` is not a safe single path segment.
+    """
+    stripped = value.strip() if value else value
+
+    # Reject empty or whitespace-only
+    if not stripped:
+        raise ValueError(
+            f"Not a safe path segment: {value!r} — value must not be empty or whitespace-only."
+        )
+
+    # Reject leading or trailing whitespace — a value that differs from its
+    # stripped form is ambiguous and would silently produce wrong path segments.
+    if value != stripped:
+        raise ValueError(
+            f"Not a safe path segment: {value!r} — value must not contain leading or trailing whitespace."
+        )
+
+    # Reject any ".." substring (covers ..foo, foo.., a..b, and literal ..)
+    if ".." in stripped:
+        raise ValueError(
+            f"Not a safe path segment: {value!r} — value must not contain '..' (traversal guard)."
+        )
+
+    # Reject leading dot (covers .hidden, .dot-only, etc.)
+    if stripped.startswith("."):
+        raise ValueError(
+            f"Not a safe path segment: {value!r} — value must not begin with '.' (traversal guard)."
+        )
+
+    # Reject path separators (/ and \) — catches a/b, a\b, /absolute, trailing/
+    if "/" in stripped or "\\" in stripped:
+        raise ValueError(
+            f"Not a safe path segment: {value!r} — value must not contain path separators."
+        )
+
+    # Reject non-ASCII and enforce the segment grammar
+    if not _SAFE_PATH_SEGMENT_RE.fullmatch(stripped):
+        raise ValueError(
+            f"Not a safe path segment: {value!r} — value must match the canonical segment grammar "
+            f"(ASCII alphanumerics, hyphens, underscores, and interior dots only; "
+            f"must begin with an alphanumeric character)."
+        )
+
+    return value
+
+
+def safe_mission_slug(slug: str | None, fallback: str) -> str:
+    """Return *slug* when it is a safe single path segment, else *fallback*.
+
+    The mission slug carried on a status snapshot originates from UNTRUSTED
+    event-record content (``StatusEvent.mission_slug``, copied verbatim from a
+    ``status.events.jsonl`` row). Any sink that joins that slug into a path and
+    creates/writes a directory (the ``derived/<slug>/`` view writers) must never
+    let a crafted ``"../../../../tmp/evil"`` slug escape the derived root.
+
+    This is the fail-closed chokepoint: an unsafe slug downgrades to *fallback*
+    (the trusted ``feature_dir.name``), logging a warning. The downgrade is
+    display-only — the slug is used solely as a path segment and a display label,
+    so substituting the trusted directory name has no correctness cost.
+
+    Args:
+        slug: The candidate slug (may be ``None`` or empty).
+        fallback: The trusted replacement (e.g. ``feature_dir.name``).
+
+    Returns:
+        ``slug`` when valid; otherwise ``fallback``.
+    """
+    if not slug:
+        return fallback
+    try:
+        assert_safe_path_segment(slug)
+    except ValueError as exc:
+        logger.warning(
+            "Refusing to use unsafe mission_slug %r as a path segment (traversal guard); "
+            "falling back to trusted %r: %s",
+            slug,
+            fallback,
+            exc,
+        )
+        return fallback
+    return slug
 
 
 def _is_worktree_gitdir(gitdir: Path) -> bool:
@@ -54,7 +188,14 @@ def locate_project_root(start: Path | None = None) -> Path | None:
     pointer back to the main repository.
 
     Resolution order:
-    1. SPECIFY_REPO_ROOT environment variable (highest priority)
+    1. SPECIFY_REPO_ROOT environment variable (highest priority). When set and
+       the named path is an existing directory, it is authoritative — it is
+       honoured even if the path has no ``.kittify/`` directory (#1965).
+       Missing or non-directory paths are ignored and resolution falls through
+       to the walk-up. This makes the env var a deterministic override for
+       CI/CD and tests; real ``.kittify/`` projects are unaffected because both
+       branches flow through ``get_main_repo_root`` on the same directory
+       (C-003).
     2. Walk up directory tree, detecting worktree .git files and following to main repo
     3. Fall back to .kittify/ marker search
 
@@ -73,12 +214,18 @@ def locate_project_root(start: Path | None = None) -> Path | None:
         >>> root = locate_project_root(Path(".worktrees/my-feature"))
         >>> assert ".worktrees" not in str(root)
     """
-    # Tier 1: Check environment variable (allows override for CI/CD)
+    # Tier 1: Check environment variable (authoritative override for CI/CD).
+    # When the named directory exists it wins outright — a missing ``.kittify/``
+    # is NOT a disqualifier (#1965). The ``is_dir()`` guard is retained so a
+    # non-existent or file-valued path falls through to the walk-up instead of
+    # returning a bogus root. Real ``.kittify/`` projects are unaffected: both
+    # this branch and the walk-up resolve the same directory via
+    # ``get_main_repo_root`` (C-003 regression-guarded).
     if env_root := os.getenv("SPECIFY_REPO_ROOT"):
         env_path = Path(env_root).resolve()
-        if env_path.exists() and (env_path / KITTIFY_DIR).is_dir():
+        if env_path.is_dir():
             return get_main_repo_root(env_path)
-        # Invalid env var - fall through to other methods
+        # Missing or non-directory env var path - fall through to other methods
 
     # Tier 2: Walk up directory tree, handling worktree .git files
     current = (start or Path.cwd()).resolve()
@@ -217,6 +364,79 @@ def check_broken_symlink(path: Path) -> bool:
     return path.is_symlink() and not path.exists()
 
 
+class WorkspaceRootNotFound(Exception):
+    """Raised when a canonical mission repo root cannot be resolved.
+
+    Owned here because :mod:`specify_cli.core.paths` is the single
+    worktree-pointer parser (IC-04): the canonical-root resolver and its
+    error type live together. ``specify_cli.workspace.root_resolver``
+    re-exports this name for backwards compatibility with existing callers.
+    """
+
+    def __init__(self, cwd: Path | str) -> None:
+        self.cwd = Path(cwd)
+        super().__init__(f"No git repository found at or above {self.cwd}")
+
+
+def resolve_canonical_root(cwd: Path | None = None) -> Path:
+    """Return the canonical mission repo root for ``cwd``.
+
+    This is the single worktree-pointer parser (IC-04): every consumer that
+    asks "given some CWD (which may be a worktree), what is the canonical
+    main-repo root?" resolves through here.  ``workspace/root_resolver``'s
+    historical duplicate parser was collapsed into this function.
+
+    Resolution rules (walking ancestors from ``cwd``):
+
+    1. ``.git`` is a *directory*: this is a regular repo (or the main repo of
+       a worktree set); return that ancestor.
+    2. ``.git`` is a *file* with a ``gitdir:`` pointer of the
+       ``.git/worktrees/<name>`` topology: follow the pointer back to the
+       main repo working tree (reusing :func:`get_main_repo_root`).
+    3. ``.git`` is a malformed/non-worktree pointer file (submodule /
+       separate-git-dir): stop at this ancestor when it carries the canonical
+       ``.kittify`` marker — mirroring :func:`locate_project_root`'s boundary
+       check so the two root authorities agree on the submodule case (FR-007).
+       Otherwise keep walking so an enclosing repo is still found if one exists.
+    4. No git marker anywhere up the tree: raise :class:`WorkspaceRootNotFound`.
+
+    Args:
+        cwd: Starting directory. Defaults to :func:`Path.cwd`.
+
+    Returns:
+        Absolute, resolved path to the canonical repo root.
+
+    Raises:
+        WorkspaceRootNotFound: when ``cwd`` is not inside a git repo.
+    """
+    start = (cwd or Path.cwd()).resolve()
+
+    for candidate in [start, *start.parents]:
+        git_path = candidate / ".git"
+
+        if git_path.is_dir():
+            # Regular repo (or main repo of a worktree set).
+            return candidate.resolve()
+
+        if git_path.is_file():
+            if _read_worktree_gitdir(git_path) is None:
+                # Malformed or non-worktree pointer (submodule / separate-git-dir).
+                # Mirror locate_project_root's boundary check: if this ancestor
+                # carries the canonical .kittify marker it is a self-contained
+                # spec-kitty project (e.g. a submodule with its own .kittify), so
+                # stop here rather than walking UP into an enclosing parent repo
+                # (FR-007). The two root authorities must agree on this case.
+                if (candidate / KITTIFY_DIR).is_dir():
+                    return candidate.resolve()
+                # No canonical marker — keep walking so an enclosing repo is still
+                # resolved.
+                continue
+            # Real worktree pointer — follow it back to the main checkout.
+            return get_main_repo_root(candidate)
+
+    raise WorkspaceRootNotFound(start)
+
+
 def get_main_repo_root(current_path: Path) -> Path:
     """
     Get the main repository root, even if called from a worktree.
@@ -270,6 +490,34 @@ class StatusReadUnsupported(RuntimeError):
     ``assert_worktree_supported()`` at their entry point.  The error message
     names the command and describes the constraint so the operator can act.
     """
+
+
+class MissionMetaReadError(RuntimeError):
+    """Raised when meta.json exists but cannot be decoded.
+
+    Distinguishes a *read failure* (corrupt JSON or I/O error) from a
+    *field-absent* read (meta.json present and valid but the requested key is
+    absent — callers handle that case via the documented default branch).
+
+    Never raised when meta.json is simply missing; a missing file is the
+    field-absent case and callers receive ``None`` from
+    :func:`read_target_branch_from_meta`.
+
+    (FR-005 / #2139 — fail-closed doctrine; precedent: #2065)
+
+    Attributes:
+        meta_path: The path of the file that could not be decoded.
+        cause: The underlying exception (``ValueError`` wrapping
+               ``JSONDecodeError`` or ``OSError``).
+    """
+
+    def __init__(self, meta_path: Path, cause: Exception) -> None:
+        self.meta_path = meta_path
+        self.cause = cause
+        super().__init__(
+            f"Cannot read {meta_path}: {cause}"
+            " — fail-closed (meta.json exists but is corrupt or unreadable)"
+        )
 
 
 def _is_detached_worktree(start: Path | None = None) -> bool:
@@ -376,12 +624,76 @@ def assert_worktree_supported(command_name: str, start: Path | None = None) -> N
         )
 
 
+def _load_meta_fail_closed(feature_dir: Path) -> dict[str, Any] | None:
+    """Load meta.json fail-closed on corruption.
+
+    This is the single place that owns the field-absent vs read-failure
+    decision.  Every target-branch reader delegates here.
+
+    Returns:
+        ``None`` when meta.json is absent (caller treats as field-absent).
+        The parsed mapping when meta.json is present and valid.
+
+    Raises:
+        MissionMetaReadError: When meta.json exists but is corrupt or
+            unreadable.  Never raised for a missing file.
+    """
+    # Deferred import: core.paths is loaded very early; mission_metadata imports
+    # back from core (e.g. safe_mission_slug), so a module-level import would
+    # create a circular import.
+    from specify_cli.mission_metadata import load_meta  # noqa: PLC0415
+
+    meta_path = feature_dir / "meta.json"
+    try:
+        # allow_missing=True  → None when file is absent (field-absent case)
+        # on_malformed="raise" → ValueError when file exists but is corrupt
+        # cast: load_meta is typed dict[str, Any] | None; cast silences the
+        # "Returning Any" mypy inference that occurs because load_meta's body
+        # absorbs the Any from json.loads without a narrow annotation.
+        return cast("dict[str, Any] | None", load_meta(feature_dir, allow_missing=True, on_malformed="raise"))
+    except ValueError as exc:
+        raise MissionMetaReadError(meta_path, exc) from exc
+
+
+def read_target_branch_from_meta(feature_dir: Path) -> str | None:
+    """Read ``target_branch`` from ``feature_dir/meta.json``.
+
+    The single authority for the field-absent vs read-failure distinction
+    (FR-005 / #2139 — fail-closed doctrine; precedent: #2065).  All
+    ``target_branch`` readers in this codebase are thin adapters over this
+    function.
+
+    Args:
+        feature_dir: Mission directory containing (or expected to contain)
+            ``meta.json``.
+
+    Returns:
+        The ``target_branch`` value as a string, or ``None`` when the field
+        is absent or meta.json does not exist.  Callers MUST apply the
+        documented default (usually the primary branch) when ``None`` is
+        returned.
+
+    Raises:
+        MissionMetaReadError: When meta.json exists but is corrupt or
+            unreadable.  Callers MUST NOT silently swallow this — the error
+            must propagate so corruption is visible (fail-closed doctrine).
+    """
+    data = _load_meta_fail_closed(feature_dir)
+    if not data:
+        return None
+    value = data.get("target_branch")
+    return str(value) if value else None
+
+
 def get_feature_target_branch(repo_root: Path, mission_slug: str) -> str:
     """Get target branch for a feature by reading meta.json directly.
 
-    Reads the ``target_branch`` field from ``kitty-specs/<slug>/meta.json``.
-    Falls back to the primary branch (usually ``main``) if the file is missing
-    or malformed.
+    Thin adapter over :func:`read_target_branch_from_meta`.
+
+    Reads the ``target_branch`` field from the primary meta.json.  Returns the
+    documented default (primary branch) when the field is absent or meta.json
+    does not exist.  Raises :class:`MissionMetaReadError` when meta.json
+    exists but is corrupt or unreadable (fail-closed).
 
     Args:
         repo_root: Repository root path (may be worktree — resolved to main).
@@ -390,21 +702,84 @@ def get_feature_target_branch(repo_root: Path, mission_slug: str) -> str:
     Returns:
         Target branch name (e.g., ``"main"`` or ``"2.x"``).
     """
+    # Anchor the meta.json read on the PRIMARY surface — NOT the topology-aware
+    # candidate. Under coordination topology that candidate resolves to the
+    # coordination worktree, whose mission dir has no meta.json; reading it found
+    # nothing and silently fell back to the repo default (main), so the resolved
+    # commit/branch surface was the protected primary instead of the mission's
+    # ``target_branch`` (the finalize-tasks / implement-loop refusal-to-main bug,
+    # WP00 / FR-004). This mirrors ``resolve_merge_target_branch`` below exactly.
     from specify_cli.core.git_ops import resolve_primary_branch
-    from specify_cli.missions.feature_dir_resolver import candidate_feature_dir_for_mission
+    from specify_cli.missions._read_path_resolver import (
+        _canonicalize_primary_read_handle,
+        primary_feature_dir_for_mission,
+    )
 
     main_root = get_main_repo_root(repo_root)
-    meta_file = candidate_feature_dir_for_mission(main_root, mission_slug) / "meta.json"
-    fallback = resolve_primary_branch(main_root)
+    feature_dir = primary_feature_dir_for_mission(
+        main_root,
+        _canonicalize_primary_read_handle(main_root, mission_slug),
+    )
+    fallback = str(resolve_primary_branch(main_root))
+    branch = read_target_branch_from_meta(feature_dir)
+    return branch if branch is not None else fallback
 
-    if not meta_file.exists():
-        return fallback
 
-    try:
-        data = json.loads(meta_file.read_text(encoding="utf-8"))
-        return str(data.get("target_branch", fallback))
-    except (json.JSONDecodeError, KeyError, OSError):
-        return fallback
+def resolve_merge_target_branch(
+    repo_root: Path, mission_slug: str | None, explicit_target: str | None
+) -> tuple[str, str]:
+    """Resolve the branch a mission merges into, with provenance.
+
+    Thin adapter over :func:`_load_meta_fail_closed`.
+
+    The single source of truth shared by ``spec-kitty merge`` and
+    ``orchestrator-api merge-mission`` so the two never disagree.
+
+    Order: explicit ``--target`` > primary-meta ``merge_target_branch`` >
+    primary-meta ``target_branch`` > repo default.
+
+    The merge target lives in the PRIMARY-checkout meta.json (like
+    ``coordination_branch``), so it is read via ``primary_feature_dir_for_mission``
+    — NOT the topology-aware candidate. Under coordination topology that candidate
+    resolves to the coordination worktree, whose mission dir has no meta.json;
+    reading it found nothing and silently fell back to the repo default (main),
+    merging the mission into the wrong branch.
+
+    Returns ``(branch, source)`` where ``source`` is ``"flag"``, ``"meta.json"``,
+    or ``"primary_branch"``.
+
+    Raises:
+        MissionMetaReadError: When meta.json exists but is corrupt or
+            unreadable (fail-closed).
+    """
+    if explicit_target is not None:
+        return explicit_target, "flag"
+
+    # Deferred imports: core.paths is imported very early; these pull in the
+    # missions/git layers that import back into core — module-level imports would
+    # form a circular import.
+    from specify_cli.core.git_ops import resolve_primary_branch
+    from specify_cli.missions._read_path_resolver import (
+        _canonicalize_primary_read_handle,
+        primary_feature_dir_for_mission,
+    )
+
+    main_root = get_main_repo_root(repo_root)
+    fallback = str(resolve_primary_branch(main_root))
+    if not mission_slug:
+        return fallback, "primary_branch"
+
+    feature_dir = primary_feature_dir_for_mission(
+        main_root,
+        _canonicalize_primary_read_handle(main_root, mission_slug),
+    )
+    data = _load_meta_fail_closed(feature_dir)
+    if data:
+        for key in ("merge_target_branch", "target_branch"):
+            value = data.get(key)
+            if value:  # non-null, non-empty
+                return str(value), "meta.json"
+    return fallback, "primary_branch"
 
 
 def require_explicit_feature(feature: str | None, *, command_hint: str = "") -> str:
@@ -480,14 +855,20 @@ def require_explicit_feature(feature: str | None, *, command_hint: str = "") -> 
 
 
 __all__ = [
+    "assert_safe_path_segment",
     "locate_project_root",
     "is_worktree_context",
     "resolve_with_context",
     "check_broken_symlink",
     "get_main_repo_root",
+    "resolve_canonical_root",
+    "WorkspaceRootNotFound",
     "get_status_read_root",
     "StatusReadUnsupported",
     "assert_worktree_supported",
+    "MissionMetaReadError",
+    "read_target_branch_from_meta",
     "get_feature_target_branch",
+    "resolve_merge_target_branch",
     "require_explicit_feature",
 ]

@@ -6,40 +6,56 @@ serialises to JSON or renders to the console. Kept in their own module so
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from specify_cli.task_utils import TaskCliError
 
-from specify_cli.cli.commands.charter._app import METADATA_FILENAME, logger
+from specify_cli.cli.commands.charter._app import METADATA_FILENAME
 from specify_cli.cli.commands.charter._common import (
     _display_path,
     _resolve_charter_path,
 )
 from specify_cli.cli.commands.charter._synthesis import _collect_evidence_result
 
-# Patch shim: ``ensure_charter_bundle_fresh`` is looked up on the package at
-# call time so legacy ``patch("…charter.ensure_charter_bundle_fresh", …)``
-# fixtures still apply post-split.
-import specify_cli.cli.commands.charter as _charter_pkg
+
+def _normalize_last_sync(value: Any) -> str | None:
+    """Coerce a metadata timestamp to a JSON-safe ISO string (FR-005).
+
+    ``YAML(typ="safe")`` parses an *unquoted* ISO timestamp in ``metadata.yaml``
+    to a ``datetime``/``date`` object, which is not JSON-serializable and
+    crashed ``charter status --json`` (``Object of type datetime is not JSON
+    serializable``). Normalize to an ISO 8601 string at the collector boundary
+    so the payload carries a stable string-typed ``last_sync`` contract.
+
+    ``datetime`` is a subclass of ``date``, so the single ``isinstance`` check
+    covers both. Already-string (quoted) timestamps and ``None`` pass through
+    unchanged.
+    """
+    if value is None:
+        return None
+    if isinstance(value, date):  # covers datetime (date subclass) and date
+        return value.isoformat()
+    return str(value)
 
 
 def _collect_charter_sync_status(repo_root: Path) -> dict[str, Any]:
+    """Read charter sync status without writing to disk.
+
+    FR-010 / C-IC07: this is a read-only status collector. It MUST NOT call
+    ``ensure_charter_bundle_fresh`` (which writes the charter bundle) or
+    ``GlossaryEntityPageRenderer.generate_all()`` (which writes entity pages).
+    Staleness is determined read-only via ``is_stale``; the canonical root is
+    derived read-only as ``repo_root`` (no regeneration required to obtain it).
+    """
     try:
         from charter.hasher import is_stale
 
-        sync_result = _charter_pkg.ensure_charter_bundle_fresh(repo_root)
-        # Generate glossary entity pages (non-blocking; silent on failure)
-        try:
-            from glossary.entity_pages import GlossaryEntityPageRenderer
-            GlossaryEntityPageRenderer(repo_root).generate_all()
-        except Exception as _ep_exc:  # noqa: BLE001 — entity-page generation is optional; failure is logged and ignored
-            logger.debug("entity page generation failed (non-fatal): %s", _ep_exc)
-        canonical_root = (
-            sync_result.canonical_root
-            if sync_result and sync_result.canonical_root
-            else repo_root
-        )
+        # Read-only root derivation: use repo_root directly (no write side-effect).
+        # The write commands (charter sync / charter generate) legitimately call
+        # ensure_charter_bundle_fresh; the status READ path does not.
+        canonical_root = repo_root
         charter_path = _resolve_charter_path(canonical_root)
         output_dir = charter_path.parent
         metadata_path = output_dir / METADATA_FILENAME
@@ -78,8 +94,8 @@ def _collect_charter_sync_status(repo_root: Path) -> dict[str, Any]:
             yaml = YAML(typ="safe")
             metadata = yaml.load(metadata_path.read_text(encoding="utf-8")) or {}
             if isinstance(metadata, dict):
-                last_sync = metadata.get("timestamp_utc") or metadata.get(
-                    "extracted_at"
+                last_sync = _normalize_last_sync(
+                    metadata.get("timestamp_utc") or metadata.get("extracted_at")
                 )
 
         return {
@@ -148,7 +164,7 @@ def _collect_manifest_status(repo_root: Path) -> tuple[dict[str, Any], Any | Non
     provenance_root = repo_root / ".kittify" / "charter" / "provenance"
     live_artifact_count = sum(
         len(list((doctrine_root / subdir).glob("*.yaml")))
-        for subdir in ("directives", "tactics", "styleguides")
+        for subdir in ("directive", "tactic", "styleguide")
     )
     live_provenance_count = len(list(provenance_root.glob("*.yaml")))
 

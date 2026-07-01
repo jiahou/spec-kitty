@@ -3,9 +3,9 @@
 # DO NOT EDIT MANUALLY
 
 spec_kitty:
-  version: 3.2.0rc42
+  version: 3.2.4
   initialized_at: '2026-04-07T09:10:40.826207'
-  last_upgraded_at: '2026-06-10T23:21:15.315351'
+  last_upgraded_at: '2026-06-11T05:07:36.243731'
   schema_version: 3
 environment:
   python_version: 3.14.0
@@ -293,3 +293,7 @@ migrations:
     result: success
     notes: Wrote spec-kitty orientation to .claude/CLAUDE.md; Registered spec-kitty
       session-start SessionStart hook
+  - id: 0_9_3_surface_repair_wiring
+    applied_at: '2026-06-15T06:30:20.619977'
+    result: success
+    notes: 'surface_repair_wiring: probed 214 tool surface(s)'

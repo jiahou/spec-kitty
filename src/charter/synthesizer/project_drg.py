@@ -30,6 +30,8 @@ from ruamel.yaml import YAML
 
 from doctrine.drg.models import DRGEdge, DRGGraph, DRGNode, NodeKind, Relation
 
+from charter.synthesizer._constants import GRAPH_FILENAME as _GRAPH_FILENAME
+
 from .errors import ProjectDRGValidationError
 from .path_guard import PathGuard
 from .request import SynthesisTarget
@@ -44,7 +46,6 @@ _KIND_TO_NODE_KIND: dict[str, NodeKind] = {
     "tactic": NodeKind.TACTIC,
     "styleguide": NodeKind.STYLEGUIDE,
 }
-_GRAPH_FILENAME = "graph" + ".yaml"
 
 
 def _node_kind_for(kind: str) -> NodeKind:
@@ -338,9 +339,13 @@ def apply_post_condition(
         # Atomic mutations: delete stale graph and atomically replace the
         # manifest. POSIX guarantees the ``replace`` is atomic; if the
         # unlink succeeds but the replace fails the manifest is unchanged
-        # on disk -- never half-written.
+        # on disk -- never half-written. The unlink stays IN PLACE within this
+        # guarded sequence (FR-007); only the bare expression is consolidated
+        # into the shared helper.
         if desired_built_in_only:
-            graph_path.unlink(missing_ok=True)
+            from .graph_residue import unlink_stale_project_graph  # noqa: PLC0415
+
+            unlink_stale_project_graph(graph_path.parent)
         guard.replace(tmp_path, manifest_path, caller="project_drg.apply_post_condition")
     except Exception:
         # Clean up the staged temp file on failure.

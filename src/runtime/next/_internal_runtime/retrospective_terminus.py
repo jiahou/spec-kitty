@@ -24,6 +24,7 @@ from pathlib import Path
 from runtime.next._internal_runtime.retrospective_hook import (
     before_mark_done,
 )
+from specify_cli.lanes.branch_naming import resolve_mid8
 from specify_cli.retrospective.events import (
     CompletedPayload,
     FailedPayload,
@@ -37,7 +38,7 @@ from specify_cli.retrospective.schema import (
     ActorRef,
     RetrospectiveRecord,
 )
-from specify_cli.retrospective.writer import write_record
+from specify_cli.retrospective.writer import canonical_record_path, write_record
 
 logger = logging.getLogger(__name__)
 
@@ -64,21 +65,23 @@ def _now_utc() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _mid8(mission_id: str) -> str:
-    """Return first 8 characters of mission_id."""
-    return mission_id[:8]
-
-
 def _mission_slug_from_feature_dir(feature_dir: Path) -> str:
     """Derive a mission slug from the feature_dir name (best effort)."""
     return feature_dir.name
 
 
 def _record_path_str(record: RetrospectiveRecord, repo_root: Path) -> str:
-    """Return canonical record path as string for event payload."""
-    canonical = (
-        repo_root / ".kittify" / "missions" / record.mission.mission_id / "retrospective.yaml"
-    )
+    """Return canonical record path as string for the event payload.
+
+    FR-001/003 (#2119): the emitted payload path MUST equal the ACTUAL write home
+    (``kitty-specs/<slug>/retrospective.yaml``), not the legacy gitignored
+    ``.kittify/missions/<id>/`` string. Route through the SINGLE durable-home
+    authority (:func:`resolve_retrospective_home`) so the payload re-homes in
+    lock-step with the record — never re-splitting the brain. The handle is
+    canonicalized inside the authority (FR-011 write leg) so a bare slug still
+    reports the canonical durable home.
+    """
+    canonical = canonical_record_path(repo_root, record.mission.mission_slug)
     return str(canonical)
 
 
@@ -134,8 +137,10 @@ def run_terminus(
         cause retrospective.failed to be emitted and before_mark_done to be
         called (which will then raise MissionCompletionBlocked).
     """
-    mid = _mid8(mission_id)
     mission_slug = _mission_slug_from_feature_dir(feature_dir)
+    # Canonical mid8 resolver (FR-001): the terminus always holds a full ULID
+    # ``mission_id``, so this is byte-identical to the deleted ``_mid8`` shadow.
+    mid = resolve_mid8(mission_slug, mission_id=mission_id)
 
     # ------------------------------------------------------------------
     # 1. Resolve mode.

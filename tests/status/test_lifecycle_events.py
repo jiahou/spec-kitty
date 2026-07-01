@@ -9,11 +9,21 @@ gate added for #1069.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.unit]
+pytestmark = [pytest.mark.integration, pytest.mark.git_repo]
+
+
+def _git_init(path: Path) -> None:
+    """Minimal git init for test fixtures that need a real git root."""
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(path)],
+        check=True,
+        capture_output=True,
+    )
 
 
 import specify_cli.status.lifecycle_events as lifecycle
@@ -41,12 +51,14 @@ from specify_cli.status.lifecycle_events import (
 
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
+    _git_init(tmp_path)
     (tmp_path / ".kittify").mkdir()
     return tmp_path
 
 
 @pytest.fixture()
 def feature_dir(tmp_path: Path) -> Path:
+    _git_init(tmp_path)
     fd = tmp_path / "kitty-specs" / "demo-mission"
     fd.mkdir(parents=True)
     return fd
@@ -611,14 +623,43 @@ def test_lifecycle_saas_outbox_skips_when_disabled(
 
 
 def test_lifecycle_repo_root_resolution_handles_supported_logs(repo: Path) -> None:
+    """FR-001 adoption: ``_repo_root_for_lifecycle_log`` routes to
+    ``resolve_canonical_root`` so it is CWD-invariant (D-12).
+
+    Any log path INSIDE a git repo resolves to the canonical root.  The old
+    structural path-name filter (project vs mission log pattern check) is
+    replaced by the public resolver, so ``unknown_log`` (a path inside the
+    same git repo) also resolves correctly.  A path not inside any git repo,
+    and ``None``, still returns ``None`` (fail-closed).
+    """
     project_log = project_event_log_path(repo)
     mission_log = repo / "kitty-specs" / "demo-mission" / "status.events.jsonl"
-    unknown_log = repo / "other" / "status.events.jsonl"
+    # Any path inside the same git repo resolves to the canonical root.
+    other_log = repo / "other" / "status.events.jsonl"
 
     assert lifecycle._repo_root_for_lifecycle_log(None) is None
     assert lifecycle._repo_root_for_lifecycle_log(project_log) == repo
     assert lifecycle._repo_root_for_lifecycle_log(mission_log) == repo
-    assert lifecycle._repo_root_for_lifecycle_log(unknown_log) is None
+    # After adoption: other paths inside the git repo also resolve (no path-name filter).
+    assert lifecycle._repo_root_for_lifecycle_log(other_log) == repo
+
+
+def test_lifecycle_repo_root_resolution_fails_closed_outside_git(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path the resolver cannot anchor to a git root returns ``None``.
+
+    Fail-closed branch: when ``resolve_canonical_root`` raises
+    ``WorkspaceRootNotFound`` (path not inside any git repo), the helper
+    swallows it and returns ``None`` rather than guessing a root.
+    """
+    from specify_cli.workspace.root_resolver import WorkspaceRootNotFound
+
+    def _raise(_start: Path) -> Path:
+        raise WorkspaceRootNotFound("no git root")
+
+    monkeypatch.setattr(lifecycle, "resolve_canonical_root", _raise)
+    assert lifecycle._repo_root_for_lifecycle_log(repo / "anywhere.jsonl") is None
 
 
 def test_lifecycle_saas_builder_skips_non_materializable_inputs(
@@ -655,7 +696,8 @@ def test_lifecycle_saas_builder_skips_non_materializable_inputs(
     from specify_cli.identity.project import ProjectIdentity
 
     monkeypatch.setattr(
-        "specify_cli.identity.project.ensure_identity",
+        # #2263 WP02: lifecycle SaaS fan-out resolves identity read-only.
+        "specify_cli.identity.project.resolve_identity",
         lambda _repo_root: ProjectIdentity(),
     )
     assert (
@@ -702,6 +744,16 @@ def test_lifecycle_saas_outbox_queues_when_scoped(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     queued: list[dict[str, object]] = []
+
+    # Mint + persist a real project identity (as ``spec-kitty init`` does).
+    # Post-#2263 the SaaS lifecycle fan-out resolves identity WITHOUT
+    # persisting, so an uninitialized repo yields ``project_uuid=None`` and the
+    # handler early-returns before queuing. A real project always carries a
+    # minted identity, which is what the outbox path requires to enqueue.
+    from specify_cli.identity.project import ensure_identity
+
+    (tmp_path / ".kittify").mkdir(exist_ok=True)
+    ensure_identity(tmp_path)
 
     class _Queue:
         def queue_event(self, event: dict[str, object]) -> bool:
