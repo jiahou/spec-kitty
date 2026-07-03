@@ -30,8 +30,12 @@ _SRC = Path(bn.__file__).resolve().parents[1]  # .../src/specify_cli
 _CONTEXT_PY = _SRC / "workspace" / "context.py"
 _ORCH_PY = _SRC / "orchestrator_api" / "commands.py"
 _TASKS_PY = _SRC / "cli" / "commands" / "agent" / "tasks.py"
+# Wave 2 degod (#2305) relocated the routed tasks.py bodies into sibling
+# modules; the seam scan follows the code so its coverage is preserved.
+_TASKS_SHARED_PY = _SRC / "cli" / "commands" / "agent" / "tasks_shared.py"
+_TASKS_MOVE_TASK_PY = _SRC / "cli" / "commands" / "agent" / "tasks_move_task.py"
 
-_ALL_ROUTED = (_CONTEXT_PY, _ORCH_PY, _TASKS_PY)
+_ALL_ROUTED = (_CONTEXT_PY, _ORCH_PY, _TASKS_PY, _TASKS_SHARED_PY, _TASKS_MOVE_TASK_PY)
 
 
 def _legacy_row() -> GoldenRow:
@@ -173,31 +177,40 @@ def test_no_worktree_name_guess_fstring(path: Path) -> None:
         )
 
 
-def test_tasks_no_inline_endswith_mid8_dedup() -> None:
-    """tasks.py:844 inline ``endswith(f"-{mid8}")`` dedup is gone (delegates to seam)."""
-    text = _TASKS_PY.read_text(encoding="utf-8")
+@pytest.mark.parametrize("path", _ALL_ROUTED, ids=lambda p: p.name)
+def test_no_inline_endswith_mid8_dedup(path: Path) -> None:
+    """The inline ``endswith(f"-{mid8}")`` dedup stays gone in every routed file.
+
+    Negative invariant (refactor-stable): fails only if the forbidden pattern
+    is reintroduced — anywhere on the routed surface, including the modules
+    the degod waves relocated code into.
+    """
+    text = path.read_text(encoding="utf-8")
     assert 'endswith(f"-{mid8}")' not in text, (
-        "inline idempotent mid8-compose still present in tasks.py — "
+        f"inline idempotent mid8-compose present in {path.name} — "
         "delegate to lanes.branch_naming.mission_dir_name"
     )
 
 
-@pytest.mark.quarantine  # seam-scan drift: orchestrator module no longer contains 'resolve_mid8' literal (Wave-0 orphan-bind triage, #2034/#2283)
-def test_routed_files_import_the_seam() -> None:
-    """Each routed file references the seam composer it must delegate to."""
-    ctx = _CONTEXT_PY.read_text(encoding="utf-8")
-    assert "worktree_path" in ctx
-    orch = _ORCH_PY.read_text(encoding="utf-8")
-    assert "worktree_path" in orch
-    assert "resolve_mid8" in orch
-    tasks = _TASKS_PY.read_text(encoding="utf-8")
-    assert "worktree_path" in tasks
-    assert "mission_dir_name" in tasks
-    assert "resolve_mid8" in tasks
+def test_positive_literal_scans_removed() -> None:
+    """Doctrine note (operator ruling, 2026-07-03; PR #2308).
 
+    Two positive literal-presence scans that used to live here
+    (``test_routed_files_import_the_seam``,
+    ``test_tasks_mission_selector_code_untouched``) were DELETED, not
+    re-pinned: a scan asserting "literal X appears in file Y" reds on every
+    legitimate relocation (it red twice across degod waves) — arch tests must
+    pin refactor-stable invariants. Surviving coverage:
 
-def test_tasks_mission_selector_code_untouched() -> None:
-    """The #1797 ``--mission`` selector surface stays intact (no ``--feature`` primary)."""
-    text = _TASKS_PY.read_text(encoding="utf-8")
-    # Canonical selector resolver is still imported/used.
-    assert "resolve_mission_handle" in text
+    * no-inline-compose: ``test_no_worktree_name_guess_fstring`` (negative AST
+      invariant over ``_ALL_ROUTED``, incl. the relocated sibling modules);
+    * the #1797 ``--mission``-only selector contract:
+      ``tests/contract/test_feature_alias_scope.py`` rejects ``--feature`` at
+      the parser, behaviorally, for ``agent tasks`` among 18 commands;
+    * selector routing through the canonical resolver: the seam interception
+      batteries (``test_tasks_shared_seam.py``) prove it at call time.
+
+    This placeholder documents the deletion rationale in-tree and asserts the
+    surviving negative scan still covers every routed file.
+    """
+    assert len(_ALL_ROUTED) >= 5  # context, orchestrator, tasks + relocated siblings
