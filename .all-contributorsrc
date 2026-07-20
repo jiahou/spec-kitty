@@ -549,6 +549,60 @@
       "contributions": [
         "doc"
       ]
+    },
+    {
+      "login": "cursoragent",
+      "name": "Cursor Agent",
+      "avatar_url": "https://avatars.githubusercontent.com/u/199161495?v=4",
+      "profile": "https://github.com/cursoragent",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "jiahou",
+      "name": "Jia Hou",
+      "avatar_url": "https://avatars.githubusercontent.com/u/5040281?v=4",
+      "profile": "https://github.com/jiahou",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "MahadSaney",
+      "name": "Mahad Mohamed",
+      "avatar_url": "https://avatars.githubusercontent.com/u/270675292?v=4",
+      "profile": "https://github.com/MahadSaney",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "MOES-Media",
+      "name": "Jeroen Nouws",
+      "avatar_url": "https://avatars.githubusercontent.com/u/34285209?v=4",
+      "profile": "https://github.com/MOES-Media",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "rayjohnson",
+      "name": "Ray Johnson",
+      "avatar_url": "https://avatars.githubusercontent.com/u/3476280?v=4",
+      "profile": "https://github.com/rayjohnson",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "shashankcm95",
+      "name": "Shashank C M",
+      "avatar_url": "https://avatars.githubusercontent.com/u/54543139?v=4",
+      "profile": "https://shashank-cm.dev/",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitType": "docs"
